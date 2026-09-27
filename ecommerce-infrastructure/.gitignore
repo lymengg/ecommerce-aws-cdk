@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Compiled output and CDK artefacts
+dist/
+cdk.out/
+*.tsbuildinfo
+
+# Build artefacts that are generated from TypeScript sources
+*.js
+*.d.ts
+*.js.map
+!jest.config.js
+
+# Local environment files - may contain account ids, never secrets
+.env
+.env.*
+!.env.example
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

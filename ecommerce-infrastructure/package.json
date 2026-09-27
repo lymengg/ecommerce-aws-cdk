@@ -1,0 +1,33 @@
+{
+  "name": "ecommerce-infrastructure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AWS CDK infrastructure for the e-commerce platform - Phase 1: network foundation",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "typecheck": "tsc --noEmit",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "cdk": "cdk",
+    "synth": "cdk synth"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.270.0",
+    "constructs": "10.8.1",
+    "source-map-support": "0.5.21"
+  },
+  "devDependencies": {
+    "@types/jest": "30.0.0",
+    "@types/node": "24.13.5",
+    "aws-cdk": "2.1142.0",
+    "jest": "30.5.2",
+    "ts-jest": "29.4.12",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3"
+  }
+}

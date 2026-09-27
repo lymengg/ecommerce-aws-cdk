@@ -1,0 +1,175 @@
+import * as fs from 'fs';
+import * as path from 'path';
+
+import { App, RemovalPolicy } from 'aws-cdk-lib';
+
+import {
+  DEFAULT_ENVIRONMENT,
+  ENVIRONMENT_NAMES,
+  EnvironmentName,
+  assertValidEnvironmentConfig,
+  getEnvironmentConfig,
+  resolveEnvironmentName,
+  resolveImageTag,
+} from '../lib/config';
+
+const CONFIG_SOURCE_DIRECTORY = path.join(__dirname, '..', 'lib', 'config');
+
+describe('environment configuration', () => {
+  test.each(ENVIRONMENT_NAMES)('%s is valid and internally consistent', (environment: EnvironmentName) => {
+    const config = getEnvironmentConfig(environment);
+
+    expect(config.environment).toBe(environment);
+    expect(config.region).toMatch(/^[a-z]{2}-[a-z]+-\d$/);
+    expect(config.vpcCidr).toMatch(/^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/);
+    expect(config.maxAzs).toBeGreaterThanOrEqual(2);
+    expect(config.natGateways).toBeGreaterThanOrEqual(0);
+    expect(config.natGateways).toBeLessThanOrEqual(config.maxAzs);
+  });
+
+  test('uses a non overlapping CIDR block per environment', () => {
+    const cidrBlocks = ENVIRONMENT_NAMES.map((environment) => getEnvironmentConfig(environment).vpcCidr);
+
+    expect(new Set(cidrBlocks).size).toBe(cidrBlocks.length);
+  });
+
+  test('trades NAT gateway redundancy for cost in dev and the other way round in production', () => {
+    const dev = getEnvironmentConfig('dev');
+    const prod = getEnvironmentConfig('prod');
+
+    expect(dev.natGateways).toBe(1);
+    expect(dev.natGateways).toBeLessThan(dev.maxAzs);
+    expect(prod.natGateways).toBe(prod.maxAzs);
+  });
+
+  test('keeps production and development configuration separate', () => {
+    expect(getEnvironmentConfig('dev').removalPolicy).toBe(RemovalPolicy.DESTROY);
+    expect(getEnvironmentConfig('prod').removalPolicy).toBe(RemovalPolicy.RETAIN);
+    expect(getEnvironmentConfig('dev').flowLogs.enabled).toBe(false);
+    expect(getEnvironmentConfig('prod').flowLogs.enabled).toBe(true);
+  });
+
+  test('never hardcodes an AWS account id in source', () => {
+    const sources = fs
+      .readdirSync(CONFIG_SOURCE_DIRECTORY)
+      .filter((file) => file.endsWith('.ts'))
+      .map((file) => fs.readFileSync(path.join(CONFIG_SOURCE_DIRECTORY, file), 'utf8'));
+
+    for (const source of sources) {
+      expect(source).not.toMatch(/\b\d{12}\b/);
+    }
+  });
+
+  test('does not carry secrets', () => {
+    for (const environment of ENVIRONMENT_NAMES) {
+      expect(JSON.stringify(getEnvironmentConfig(environment))).not.toMatch(/secret|password|accesskey/i);
+    }
+  });
+
+  test('rejects a configuration that would not produce a usable VPC', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() => assertValidEnvironmentConfig({ ...dev, vpcCidr: '10.0.0.0' })).toThrow(/not a valid IPv4 CIDR/);
+    expect(() => assertValidEnvironmentConfig({ ...dev, maxAzs: 0 })).toThrow(/maxAzs must be a positive integer/);
+    expect(() => assertValidEnvironmentConfig({ ...dev, maxAzs: 2, natGateways: 3 })).toThrow(
+      /natGateways must be between 0 and maxAzs/,
+    );
+    expect(() => assertValidEnvironmentConfig({ ...dev, region: ' ' })).toThrow(/region must not be empty/);
+  });
+});
+
+describe('application configuration', () => {
+  test.each(ENVIRONMENT_NAMES)('%s runs a single, validly sized, non-latest task', (environment: EnvironmentName) => {
+    const application = getEnvironmentConfig(environment).application;
+
+    expect(application.desiredCount).toBe(1);
+    expect(application.containerPort).toBe(8080);
+    expect(application.healthCheckPath).toBe('/actuator/health');
+    expect(application.imageTag).not.toBe('latest');
+  });
+
+  test('rejects a Fargate cpu/memory pair ECS would refuse at deploy time', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, application: { ...dev.application, cpu: 300 } }),
+    ).toThrow(/application.cpu must be one of/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, application: { ...dev.application, cpu: 512, memoryLimitMiB: 512 } }),
+    ).toThrow(/not a valid Fargate memory size/);
+  });
+
+  test('rejects an invalid port, health check path, desired count or image tag', () => {
+    const dev = getEnvironmentConfig('dev');
+    const application = dev.application;
+
+    expect(() => assertValidEnvironmentConfig({ ...dev, application: { ...application, containerPort: 0 } })).toThrow(
+      /containerPort/,
+    );
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, application: { ...application, healthCheckPath: 'health' } }),
+    ).toThrow(/healthCheckPath/);
+    expect(() => assertValidEnvironmentConfig({ ...dev, application: { ...application, desiredCount: -1 } })).toThrow(
+      /desiredCount/,
+    );
+    expect(() => assertValidEnvironmentConfig({ ...dev, application: { ...application, imageTag: 'latest' } })).toThrow(
+      /immutable tag/,
+    );
+    expect(() => assertValidEnvironmentConfig({ ...dev, application: { ...application, imageTag: ' ' } })).toThrow(
+      /must not be empty/,
+    );
+  });
+});
+
+describe('image tag resolution', () => {
+  test('reads the image tag from CDK context', () => {
+    const app = new App({ context: { imageTag: 'v9.9.9' } });
+
+    expect(resolveImageTag(getEnvironmentConfig('dev'), app)).toBe('v9.9.9');
+  });
+
+  test('falls back to the configured image tag', () => {
+    delete process.env.IMAGE_TAG;
+    const config = getEnvironmentConfig('dev');
+
+    expect(resolveImageTag(config, new App())).toBe(config.application.imageTag);
+  });
+
+  test('rejects latest instead of silently deploying a mutable image', () => {
+    const app = new App({ context: { imageTag: 'latest' } });
+
+    expect(() => resolveImageTag(getEnvironmentConfig('dev'), app)).toThrow(/immutable tag/);
+  });
+});
+
+describe('environment resolution', () => {
+  test('reads the environment from CDK context', () => {
+    const app = new App({ context: { environment: 'prod' } });
+
+    expect(resolveEnvironmentName(app)).toBe('prod');
+  });
+
+  test('is case insensitive', () => {
+    const app = new App({ context: { environment: 'UAT' } });
+
+    expect(resolveEnvironmentName(app)).toBe('uat');
+  });
+
+  test('falls back to the default environment', () => {
+    delete process.env.ENVIRONMENT;
+
+    expect(resolveEnvironmentName()).toBe(DEFAULT_ENVIRONMENT);
+  });
+
+  test('rejects an unknown environment instead of guessing', () => {
+    const app = new App({ context: { environment: 'staging' } });
+
+    expect(() => resolveEnvironmentName(app)).toThrow(/Unknown environment "staging"/);
+  });
+
+  test('returns the configuration of the resolved environment', () => {
+    const app = new App({ context: { environment: 'uat' } });
+
+    expect(getEnvironmentConfig(resolveEnvironmentName(app)).environment).toBe('uat');
+  });
+});

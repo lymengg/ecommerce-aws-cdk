@@ -1,0 +1,12 @@
+# Build output - rebuilt inside the image, never sent to the Docker daemon.
+target/
+
+# Version control and editor metadata.
+.git
+.gitignore
+.idea/
+.vscode/
+*.iml
+
+# Documentation.
+*.md

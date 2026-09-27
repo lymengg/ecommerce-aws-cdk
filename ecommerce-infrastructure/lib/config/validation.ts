@@ -1,0 +1,96 @@
+import { EnvironmentConfig } from './types';
+
+/** Minimal IPv4 CIDR validation: dotted quad plus prefix length. */
+const IPV4_CIDR = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+
+/** Inclusive integer range, used to spell out the larger Fargate memory tiers compactly. */
+function range(start: number, end: number, step: number): number[] {
+  const values: number[] = [];
+  for (let value = start; value <= end; value += step) {
+    values.push(value);
+  }
+  return values;
+}
+
+/**
+ * The cpu/memory combinations Fargate actually accepts, in CPU units and MiB. A task definition
+ * outside this table is rejected by ECS at deploy time, which is far too late to find out.
+ */
+const FARGATE_TASK_SIZES: Readonly<Record<number, readonly number[]>> = {
+  256: [512, 1024, 2048],
+  512: [1024, 2048, 3072, 4096],
+  1024: [2048, 3072, 4096, 5120, 6144, 7168, 8192],
+  2048: range(4096, 16384, 1024),
+  4096: range(8192, 30720, 1024),
+  8192: range(16384, 61440, 4096),
+  16384: range(32768, 122880, 8192),
+};
+
+/**
+ * Validates an environment configuration so a mistake fails immediately, with a message naming the
+ * environment, instead of producing a template that only breaks halfway through a deployment.
+ */
+export function assertValidEnvironmentConfig(config: EnvironmentConfig): void {
+  const fail = (message: string): never => {
+    throw new Error(`Invalid configuration for environment "${config.environment}": ${message}`);
+  };
+
+  if (!IPV4_CIDR.test(config.vpcCidr)) {
+    fail(`vpcCidr "${config.vpcCidr}" is not a valid IPv4 CIDR block.`);
+  }
+  if (!Number.isInteger(config.maxAzs) || config.maxAzs < 1) {
+    fail(`maxAzs must be a positive integer, got ${config.maxAzs}.`);
+  }
+  if (!Number.isInteger(config.natGateways) || config.natGateways < 0 || config.natGateways > config.maxAzs) {
+    fail(`natGateways must be between 0 and maxAzs (${config.maxAzs}), got ${config.natGateways}.`);
+  }
+  if (config.region.trim() === '') {
+    fail('region must not be empty.');
+  }
+
+  assertValidApplicationConfig(config.application, fail);
+}
+
+/**
+ * Validates the application tier configuration. The Fargate cpu/memory pair is checked against the
+ * combinations ECS accepts, and `latest` is rejected because the task definition must reference an
+ * immutable image tag.
+ */
+function assertValidApplicationConfig(
+  application: EnvironmentConfig['application'],
+  fail: (message: string) => never,
+): void {
+  if (!Number.isInteger(application.desiredCount) || application.desiredCount < 0) {
+    fail(`application.desiredCount must be a non-negative integer, got ${application.desiredCount}.`);
+  }
+
+  const allowedMemory = FARGATE_TASK_SIZES[application.cpu];
+  if (allowedMemory === undefined) {
+    fail(
+      `application.cpu must be one of ${Object.keys(FARGATE_TASK_SIZES).join(', ')} Fargate CPU units, ` +
+        `got ${application.cpu}.`,
+    );
+  } else if (!allowedMemory.includes(application.memoryLimitMiB)) {
+    fail(
+      `application.memoryLimitMiB ${application.memoryLimitMiB} is not a valid Fargate memory size for ` +
+        `${application.cpu} CPU units. Expected one of: ${allowedMemory.join(', ')}.`,
+    );
+  }
+
+  if (
+    !Number.isInteger(application.containerPort) ||
+    application.containerPort < 1 ||
+    application.containerPort > 65535
+  ) {
+    fail(`application.containerPort must be between 1 and 65535, got ${application.containerPort}.`);
+  }
+  if (!application.healthCheckPath.startsWith('/')) {
+    fail(`application.healthCheckPath must start with "/", got "${application.healthCheckPath}".`);
+  }
+  if (application.imageTag.trim() === '') {
+    fail('application.imageTag must not be empty.');
+  }
+  if (application.imageTag.toLowerCase() === 'latest') {
+    fail('application.imageTag must be an immutable tag; "latest" is not allowed.');
+  }
+}
