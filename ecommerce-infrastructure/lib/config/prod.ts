@@ -1,5 +1,7 @@
 import { RemovalPolicy } from 'aws-cdk-lib';
+import { InstanceClass, InstanceSize, InstanceType } from 'aws-cdk-lib/aws-ec2';
 import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
 
 import { EnvironmentConfig } from './types';
 
@@ -10,9 +12,10 @@ import { EnvironmentConfig } from './types';
  *   of the NAT capacity instead of all outbound connectivity. The higher NAT and data transfer
  *   cost is accepted here on purpose.
  * - Flow Logs enabled with a longer retention window for security investigations.
- * - `RemovalPolicy.RETAIN` for everything that supports it. Stateful resources added in later
- *   phases (RDS, ElastiCache, S3) additionally need deletion protection and backups, which is
- *   documented in the README.
+ * - `RemovalPolicy.RETAIN` for everything that supports it, including the database and the secret
+ *   holding its credentials.
+ * - The database is Multi-AZ with a month of backups and deletion protection. This is the one place
+ *   where the extra cost of a standby buys something that cannot be added later.
  */
 export const prodConfig: EnvironmentConfig = {
   environment: 'prod',
@@ -37,5 +40,20 @@ export const prodConfig: EnvironmentConfig = {
     healthCheckPath: '/actuator/health',
     imageTag: 'v0.1.0',
     logRetention: RetentionDays.THREE_MONTHS,
+  },
+  // Multi-AZ doubles the instance cost, which is exactly the trade production is meant to make: a
+  // single AZ failure becomes a failover instead of an outage. `RemovalPolicy.RETAIN` keeps the
+  // instance (and its data) if the stack is ever deleted, and deletion protection stops that from
+  // happening by accident in the first place.
+  database: {
+    databaseName: 'ecommerce',
+    masterUsername: 'ecommerce',
+    engineVersion: PostgresEngineVersion.VER_16,
+    instanceType: InstanceType.of(InstanceClass.BURSTABLE4_GRAVITON, InstanceSize.SMALL),
+    allocatedStorageGb: 50,
+    backupRetentionDays: 30,
+    multiAz: true,
+    deletionProtection: true,
+    removalPolicy: RemovalPolicy.RETAIN,
   },
 };

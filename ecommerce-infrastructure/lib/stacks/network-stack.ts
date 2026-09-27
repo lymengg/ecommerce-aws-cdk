@@ -40,8 +40,12 @@ export interface NetworkStackProps extends StackProps {
  * Creates the VPC, public and private subnets spread over the configured Availability Zones, the
  * internet and NAT gateways with the route tables that connect them, and the three tier security
  * groups that later phases attach their resources to. It deliberately creates no compute, database
- * or load balancer resources: those are Phase 2 and will be added as separate stacks that consume
- * this stack's outputs.
+ * or load balancer resources: those are Phase 2 and Phase 3 and live in separate stacks that
+ * consume this stack's outputs.
+ *
+ * Phase 3 added the isolated `database` subnet group. It is the smallest change that gives the
+ * database tier a network of its own - the public and private application subnets are untouched, so
+ * nothing built in Phase 1 or Phase 2 moved.
  */
 export class NetworkStack extends Stack {
   /** The VPC every later stack places its resources in. */
@@ -55,6 +59,12 @@ export class NetworkStack extends Stack {
 
   /** Private subnets, one per Availability Zone. Host application and data resources. */
   public readonly privateSubnets: ISubnet[];
+
+  /**
+   * Isolated private subnets, one per Availability Zone, with no route off the VPC. Host the
+   * database tier, which never needs to reach anything outside its own subnet.
+   */
+  public readonly databaseSubnets: ISubnet[];
 
   constructor(scope: Construct, id: string, props: NetworkStackProps) {
     super(scope, id, props);
@@ -91,11 +101,23 @@ export class NetworkStack extends Stack {
           subnetType: SubnetType.PRIVATE_WITH_EGRESS,
           cidrMask: SUBNET_CIDR_MASK,
         },
+        {
+          // PRIVATE_ISOLATED: no route to the internet gateway and no NAT Gateway route either.
+          // This is the only subnet type with no outbound path at all, which is exactly what the
+          // database tier wants: an RDS instance has no business initiating connections anywhere,
+          // and a compromised instance cannot reach the internet to exfiltrate a dump. The private
+          // application subnets are reused for the ECS tasks instead of placing them here, because
+          // the tasks do need outbound access for image pulls.
+          name: 'database',
+          subnetType: SubnetType.PRIVATE_ISOLATED,
+          cidrMask: SUBNET_CIDR_MASK,
+        },
       ],
     });
 
     this.publicSubnets = this.vpc.publicSubnets;
     this.privateSubnets = this.vpc.privateSubnets;
+    this.databaseSubnets = this.vpc.isolatedSubnets;
 
     this.securityGroups = new TierSecurityGroups(this, 'SecurityGroups', { vpc: this.vpc });
 
@@ -142,6 +164,12 @@ export class NetworkStack extends Stack {
       value: Fn.join(',', this.privateSubnets.map((subnet) => subnet.subnetId)),
       description: 'Comma separated ids of the private subnets, one per Availability Zone',
       exportName: `${exportPrefix}-private-subnet-ids`,
+    });
+
+    new CfnOutput(this, 'DatabaseSubnetIds', {
+      value: Fn.join(',', this.databaseSubnets.map((subnet) => subnet.subnetId)),
+      description: 'Comma separated ids of the isolated database subnets, one per Availability Zone',
+      exportName: `${exportPrefix}-database-subnet-ids`,
     });
 
     new CfnOutput(this, 'AlbSecurityGroupId', {

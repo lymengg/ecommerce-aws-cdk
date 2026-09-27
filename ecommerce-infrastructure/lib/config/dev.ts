@@ -1,5 +1,7 @@
 import { RemovalPolicy } from 'aws-cdk-lib';
+import { InstanceClass, InstanceSize, InstanceType } from 'aws-cdk-lib/aws-ec2';
 import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
 
 import { EnvironmentConfig } from './types';
 
@@ -10,6 +12,9 @@ import { EnvironmentConfig } from './types';
  *   deliberate cost decision for dev only; uat and prod are redundant.
  * - Flow Logs disabled to keep CloudWatch ingestion cost at zero.
  * - Resources are destroyable so `cdk destroy` leaves nothing behind.
+ * - The database is a single small instance with a one day backup window. It is still encrypted,
+ *   still private and still has automated backups, because those are not things to get wrong while
+ *   learning.
  */
 export const devConfig: EnvironmentConfig = {
   environment: 'dev',
@@ -34,5 +39,19 @@ export const devConfig: EnvironmentConfig = {
     healthCheckPath: '/actuator/health',
     imageTag: 'v0.1.0',
     logRetention: RetentionDays.ONE_WEEK,
+  },
+  // A single db.t4g.micro with 20 GiB of gp3 storage: the smallest burstable Graviton instance RDS
+  // offers, which is plenty for a demo workload. `deletionProtection` is off and the removal policy
+  // is DESTROY so `cdk destroy` really does remove everything, including the generated credentials.
+  database: {
+    databaseName: 'ecommerce',
+    masterUsername: 'ecommerce',
+    engineVersion: PostgresEngineVersion.VER_16,
+    instanceType: InstanceType.of(InstanceClass.BURSTABLE4_GRAVITON, InstanceSize.MICRO),
+    allocatedStorageGb: 20,
+    backupRetentionDays: 1,
+    multiAz: false,
+    deletionProtection: false,
+    removalPolicy: RemovalPolicy.DESTROY,
   },
 };

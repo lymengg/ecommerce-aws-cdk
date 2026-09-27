@@ -5,7 +5,7 @@ import { Cluster } from 'aws-cdk-lib/aws-ecs';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
-import { LoadBalancedApi } from '../constructs/load-balanced-api';
+import { DatabaseConnection, LoadBalancedApi } from '../constructs/load-balanced-api';
 import { applyPlatformTags } from '../tags';
 
 export interface ApplicationStackProps extends StackProps {
@@ -23,18 +23,26 @@ export interface ApplicationStackProps extends StackProps {
 
   /** The Phase 1 application security group, carried by the ECS tasks. */
   readonly applicationSecurityGroup: ISecurityGroup;
+
+  /**
+   * Where the database is and how to authenticate against it. Read from the Phase 3 database stack
+   * so this stack never defines a database resource itself.
+   */
+  readonly database: DatabaseConnection;
 }
 
 /**
- * Phase 2 application compute for the e-commerce platform.
+ * Phase 2 application compute for the e-commerce platform, wired to the Phase 3 database.
  *
  * Creates the ECS cluster and - through {@link LoadBalancedApi} - the Fargate task definition, the
  * ECS service and the internet-facing Application Load Balancer that fronts it. It consumes the
- * Phase 1 network and the Phase 2 registry by reference rather than redefining them, so the VPC,
- * subnets, security groups and repository remain defined in exactly one place.
+ * Phase 1 network, the Phase 2 registry and the Phase 3 database by reference rather than
+ * redefining them, so the VPC, subnets, security groups, repository and instance remain defined in
+ * exactly one place.
  *
- * No database, cache, queue or auto scaling is created here: the API serves in-memory data and the
- * service runs a single task, both deliberate constraints of this phase.
+ * The database connection details travel as environment variables and the credentials are injected
+ * from Secrets Manager by the ECS agent, so this stack - like every other - contains no credential.
+ * No cache, queue or auto scaling is created here: those are later phases.
  */
 export class ApplicationStack extends Stack {
   /** The ECS cluster the service runs in. */
@@ -46,7 +54,7 @@ export class ApplicationStack extends Stack {
   constructor(scope: Construct, id: string, props: ApplicationStackProps) {
     super(scope, id, props);
 
-    const { config, vpc, repository } = props;
+    const { config, vpc, repository, database } = props;
     const namePrefix = `ecommerce-${config.environment}`;
     const serviceName = `${namePrefix}-api`;
 
@@ -73,6 +81,7 @@ export class ApplicationStack extends Stack {
       serviceName,
       albSecurityGroup,
       applicationSecurityGroup: props.applicationSecurityGroup,
+      database,
       removalPolicy: config.removalPolicy,
     });
 

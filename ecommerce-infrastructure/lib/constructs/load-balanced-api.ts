@@ -9,6 +9,7 @@ import {
   LogDrivers,
   PropagatedTagSource,
   Protocol as EcsProtocol,
+  Secret as EcsSecret,
 } from 'aws-cdk-lib/aws-ecs';
 import {
   ApplicationListener,
@@ -20,12 +21,34 @@ import {
 } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
 import { LogGroup } from 'aws-cdk-lib/aws-logs';
+import { ISecret } from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 import { ApplicationConfig } from '../config/types';
 
 /** Port the load balancer accepts public HTTP traffic on. HTTPS is added in a later phase. */
 const LISTENER_PORT = 80;
+
+/**
+ * Everything the container needs to reach the database (Phase 3).
+ *
+ * The host, port and database name are configuration, not secrets, so they travel as ordinary
+ * environment variables. Only the user name and password come from Secrets Manager, and they are
+ * injected by ECS at container start rather than passed as values.
+ */
+export interface DatabaseConnection {
+  /** RDS endpoint host name. */
+  readonly host: string;
+
+  /** RDS endpoint port. */
+  readonly port: string;
+
+  /** Name of the database the application connects to. */
+  readonly databaseName: string;
+
+  /** Secret holding the `username` and `password` fields. */
+  readonly secret: ISecret;
+}
 
 export interface LoadBalancedApiProps {
   /** The Phase 1 VPC. The load balancer lands in its public subnets, the tasks in its private ones. */
@@ -55,15 +78,22 @@ export interface LoadBalancedApiProps {
   /** The Phase 1 application security group. The ECS tasks carry it, so the ALB can reach them. */
   readonly applicationSecurityGroup: ISecurityGroup;
 
+  /** Where the container finds the database and the secret holding its credentials (Phase 3). */
+  readonly database: DatabaseConnection;
+
   /** Removal policy for resources that support one: the log group. */
   readonly removalPolicy: RemovalPolicy;
 }
 
 /**
  * The Phase 2 application tier: a Spring Boot API running as a single Fargate task behind an
- * internet-facing Application Load Balancer.
+ * internet-facing Application Load Balancer, now reading and writing PostgreSQL (Phase 3).
  *
  *   Internet -> ALB (public subnets) -> target group -> ECS service (private subnets) -> Fargate task
+ *                                                                                          |
+ *                                                                       TCP 5432 (application SG)
+ *                                                                                          v
+ *                                                                            RDS (isolated subnets)
  *
  * The load balancer is the only internet-facing resource; the task itself has no public address and
  * is reachable only from the load balancer's security group. Everything is wired with L2 constructs,
@@ -98,7 +128,8 @@ export class LoadBalancedApi extends Construct {
   constructor(scope: Construct, id: string, props: LoadBalancedApiProps) {
     super(scope, id);
 
-    const { vpc, cluster, repository, config, serviceName, albSecurityGroup, applicationSecurityGroup } = props;
+    const { vpc, cluster, repository, config, serviceName, albSecurityGroup, applicationSecurityGroup, database } =
+      props;
 
     this.logGroup = new LogGroup(this, 'LogGroup', {
       logGroupName: `/ecs/${serviceName}`,
@@ -106,9 +137,9 @@ export class LoadBalancedApi extends Construct {
       removalPolicy: props.removalPolicy,
     });
 
-    this.executionRole = this.createExecutionRole(repository);
+    this.executionRole = this.createExecutionRole(repository, database);
     this.taskRole = this.createTaskRole();
-    this.taskDefinition = this.createTaskDefinition(serviceName, repository, config);
+    this.taskDefinition = this.createTaskDefinition(serviceName, repository, config, database);
 
     this.loadBalancer = new ApplicationLoadBalancer(this, 'LoadBalancer', {
       loadBalancerName: `${serviceName}-alb`,
@@ -160,32 +191,42 @@ export class LoadBalancedApi extends Construct {
   }
 
   /**
-   * The task execution role. ECS assumes it, not the application, to perform the two infrastructure
-   * actions it needs before the container even starts: pulling the image from ECR and creating the
-   * CloudWatch log stream. Both grants are scoped to the specific repository and log group, so the
-   * role has no wildcard resource and no managed policy.
+   * The task execution role. ECS assumes it, not the application, to perform the infrastructure
+   * actions it needs before the container even starts: pulling the image from ECR, creating the
+   * CloudWatch log stream and reading the database credentials out of Secrets Manager to inject
+   * them into the container. Every grant is scoped to the specific repository, log group and
+   * secret, so the role has no wildcard resource and no managed policy.
+   *
+   * Reading the secret belongs here rather than on the task role: the value is fetched by the ECS
+   * agent during startup, so the running application never holds a credential it could leak.
    */
-  private createExecutionRole(repository: IRepository): Role {
+  private createExecutionRole(repository: IRepository, database: DatabaseConnection): Role {
     const role = new Role(this, 'TaskExecutionRole', {
       assumedBy: new ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'ECS task execution role: pull the image from ECR and write container logs',
+      description: 'ECS task execution role: pull the image, write container logs, read the DB secret',
     });
 
     repository.grantPull(role);
     this.logGroup.grantWrite(role);
+    // Grants secretsmanager:GetSecretValue and DescribeSecret on this one secret. No KMS statement
+    // is added because the secret is encrypted with the AWS managed key, so there is nothing extra
+    // to grant.
+    database.secret.grantRead(role);
 
     return role;
   }
 
   /**
-   * The task role, assumed by the application code itself. Phase 2 has no database, queue or bucket,
-   * so it carries no permissions at all: a compromised container has no AWS credentials worth using.
-   * It exists now so later phases attach permissions to a role that is already wired into the task.
+   * The task role, assumed by the application code itself. The application talks to PostgreSQL over
+   * JDBC and to nothing else - it does not call a single AWS API - so the role carries no
+   * permissions at all: a compromised container has no AWS credentials worth using. The database
+   * password reaches the container through the execution role instead, which never runs application
+   * code.
    */
   private createTaskRole(): Role {
     return new Role(this, 'TaskRole', {
       assumedBy: new ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'Application task role: no AWS permissions in Phase 2 (in-memory data only)',
+      description: 'Application task role: no AWS permissions (the API only speaks SQL)',
     });
   }
 
@@ -193,6 +234,7 @@ export class LoadBalancedApi extends Construct {
     serviceName: string,
     repository: IRepository,
     config: ApplicationConfig,
+    database: DatabaseConnection,
   ): FargateTaskDefinition {
     const taskDefinition = new FargateTaskDefinition(this, 'TaskDefinition', {
       family: `${serviceName}-task`,
@@ -209,7 +251,20 @@ export class LoadBalancedApi extends Construct {
       portMappings: [{ containerPort: config.containerPort, protocol: EcsProtocol.TCP }],
       // SERVER_PORT makes the container listen on the same port the target group and task definition
       // use, so changing the port in configuration changes it in all three places at once.
-      environment: { SERVER_PORT: String(config.containerPort) },
+      environment: {
+        SERVER_PORT: String(config.containerPort),
+        // Connection details are configuration, not credentials, so they are plain variables.
+        DB_HOST: database.host,
+        DB_PORT: database.port,
+        DB_NAME: database.databaseName,
+      },
+      // Credentials are injected by the ECS agent from Secrets Manager as the container starts and
+      // are never visible in the task definition, the console or the image. Spring Boot reads them
+      // as ordinary environment variables (see application.properties).
+      secrets: {
+        DB_USERNAME: EcsSecret.fromSecretsManager(database.secret, 'username'),
+        DB_PASSWORD: EcsSecret.fromSecretsManager(database.secret, 'password'),
+      },
       essential: true,
     });
 

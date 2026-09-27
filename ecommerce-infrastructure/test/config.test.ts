@@ -121,6 +121,76 @@ describe('application configuration', () => {
   });
 });
 
+describe('database configuration', () => {
+  test.each(ENVIRONMENT_NAMES)('%s describes a valid, protected PostgreSQL instance', (environment: EnvironmentName) => {
+    const database = getEnvironmentConfig(environment).database;
+
+    expect(database.databaseName).toMatch(/^[a-z][a-z0-9_]*$/);
+    expect(database.masterUsername).toMatch(/^[a-z][a-z0-9_]*$/);
+    expect(database.masterUsername).not.toBe('postgres');
+    expect(database.masterUsername).not.toBe('admin');
+    expect(database.allocatedStorageGb).toBeGreaterThanOrEqual(20);
+    expect(database.backupRetentionDays).toBeGreaterThanOrEqual(1);
+    expect(database.backupRetentionDays).toBeLessThanOrEqual(35);
+    expect(database.engineVersion.postgresMajorVersion).toBe('16');
+  });
+
+  test('keeps development cheap and production resilient', () => {
+    const dev = getEnvironmentConfig('dev').database;
+    const prod = getEnvironmentConfig('prod').database;
+
+    expect(dev.multiAz).toBe(false);
+    expect(dev.deletionProtection).toBe(false);
+    expect(dev.removalPolicy).toBe(RemovalPolicy.DESTROY);
+
+    expect(prod.multiAz).toBe(true);
+    expect(prod.deletionProtection).toBe(true);
+    expect(prod.removalPolicy).toBe(RemovalPolicy.RETAIN);
+    expect(prod.backupRetentionDays).toBeGreaterThan(dev.backupRetentionDays);
+  });
+
+  test('never carries a database password', () => {
+    for (const environment of ENVIRONMENT_NAMES) {
+      const database = getEnvironmentConfig(environment).database;
+
+      expect(JSON.stringify(database)).not.toMatch(/password/i);
+      expect(Object.keys(database)).not.toContain('masterUserPassword');
+    }
+  });
+
+  test('rejects a configuration RDS would refuse at deploy time', () => {
+    const dev = getEnvironmentConfig('dev');
+    const database = dev.database;
+
+    expect(() => assertValidEnvironmentConfig({ ...dev, database: { ...database, databaseName: '9bad' } })).toThrow(
+      /databaseName/,
+    );
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, database: { ...database, masterUsername: 'postgres' } }),
+    ).toThrow(/reserved by RDS/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, database: { ...database, allocatedStorageGb: 5 } }),
+    ).toThrow(/allocatedStorageGb/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, database: { ...database, backupRetentionDays: 0 } }),
+    ).toThrow(/backupRetentionDays/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, database: { ...database, backupRetentionDays: 36 } }),
+    ).toThrow(/backupRetentionDays/);
+  });
+
+  test('rejects deletion protection that could never be switched off', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() =>
+      assertValidEnvironmentConfig({
+        ...dev,
+        database: { ...dev.database, deletionProtection: true, removalPolicy: RemovalPolicy.DESTROY },
+      }),
+    ).toThrow(/deletionProtection cannot be enabled/);
+  });
+});
+
 describe('image tag resolution', () => {
   test('reads the image tag from CDK context', () => {
     const app = new App({ context: { imageTag: 'v9.9.9' } });

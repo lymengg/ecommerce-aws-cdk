@@ -1,7 +1,9 @@
 package com.ecommerce.api.controller;
 
-import com.ecommerce.api.model.Product;
+import com.ecommerce.api.dto.ProductRequest;
+import com.ecommerce.api.entity.Product;
 import com.ecommerce.api.service.ProductService;
+import jakarta.validation.Valid;
 import java.util.List;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -13,7 +15,13 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.server.ResponseStatusException;
 
-/** REST API for products. The controller only maps HTTP to the service; it holds no state. */
+/**
+ * REST API for products. The controller only maps HTTP to the service; it holds no state and no
+ * database logic.
+ *
+ * The endpoint paths and verbs are unchanged from Phase 2 - only the storage behind them moved from
+ * an in-memory map to PostgreSQL.
+ */
 @RestController
 @RequestMapping("/api/products")
 public class ProductController {
@@ -35,17 +43,15 @@ public class ProductController {
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND, "No product with id " + id));
     }
 
+    /**
+     * Creates a product and returns it with the id the database assigned.
+     *
+     * {@code @Valid} makes Bean Validation run before this method body: a missing name, a price of
+     * zero and a negative quantity are all rejected with a {@code 400} and never reach the service.
+     */
     @PostMapping
     @ResponseStatus(HttpStatus.CREATED)
-    public Product create(@RequestBody Product product) {
-        if (product.name() == null || product.name().isBlank()) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "name is required");
-        }
-        if (product.price() == null || product.price().signum() < 0) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "price must be zero or greater");
-        }
-
-        // Any id in the request body is ignored: the server owns id assignment.
-        return productService.create(product.name(), product.price());
+    public Product create(@Valid @RequestBody ProductRequest request) {
+        return productService.create(request);
     }
 }

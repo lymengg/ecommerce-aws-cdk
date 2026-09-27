@@ -1,5 +1,7 @@
 import { RemovalPolicy } from 'aws-cdk-lib';
+import { InstanceClass, InstanceSize, InstanceType } from 'aws-cdk-lib/aws-ec2';
 import { RetentionDays } from 'aws-cdk-lib/aws-logs';
+import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
 
 import { EnvironmentConfig } from './types';
 
@@ -11,6 +13,8 @@ import { EnvironmentConfig } from './types';
  * - Flow Logs enabled so traffic can be audited before the production rollout.
  * - Resources that support retention are retained on stack deletion; UAT data is not disposable
  *   by accident.
+ * - The database keeps the dev instance size but takes a week of backups and protects the instance
+ *   against deletion, so the data survives a test cycle and cannot be dropped by a stray command.
  */
 export const uatConfig: EnvironmentConfig = {
   environment: 'uat',
@@ -34,5 +38,18 @@ export const uatConfig: EnvironmentConfig = {
     healthCheckPath: '/actuator/health',
     imageTag: 'v0.1.0',
     logRetention: RetentionDays.ONE_MONTH,
+  },
+  // No Multi-AZ here: UAT accepts a slower failover in exchange for half the instance cost. What it
+  // does not accept is losing the data, so deletion protection is on and the instance is retained.
+  database: {
+    databaseName: 'ecommerce',
+    masterUsername: 'ecommerce',
+    engineVersion: PostgresEngineVersion.VER_16,
+    instanceType: InstanceType.of(InstanceClass.BURSTABLE4_GRAVITON, InstanceSize.MICRO),
+    allocatedStorageGb: 20,
+    backupRetentionDays: 7,
+    multiAz: false,
+    deletionProtection: true,
+    removalPolicy: RemovalPolicy.RETAIN,
   },
 };

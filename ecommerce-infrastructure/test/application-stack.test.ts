@@ -4,6 +4,7 @@ import { Template } from 'aws-cdk-lib/assertions';
 import { getEnvironmentConfig } from '../lib/config';
 import { EnvironmentName } from '../lib/config/types';
 import { ApplicationStack } from '../lib/stacks/application-stack';
+import { DatabaseStack } from '../lib/stacks/database-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
@@ -21,13 +22,14 @@ interface ResourceEntry {
 interface BuiltStacks {
   readonly template: Template;
   readonly network: NetworkStack;
+  readonly database: DatabaseStack;
   readonly application: ApplicationStack;
 }
 
 /**
- * Builds the Phase 1 network stack, the Phase 2 registry stack and the Phase 2 application stack in
- * one app, exactly as `bin/ecommerce.ts` does, so the cross-stack wiring is exercised rather than
- * stubbed.
+ * Builds the Phase 1 network stack, the Phase 2 registry stack, the Phase 3 database stack and the
+ * application stack in one app, exactly as `bin/ecommerce.ts` does, so the cross-stack wiring is
+ * exercised rather than stubbed.
  */
 function buildStacks(environment: EnvironmentName): BuiltStacks {
   const app = new App();
@@ -36,6 +38,12 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
   const registry = new EcrStack(app, `test-ecr-${environment}`, { env, config });
+  const database = new DatabaseStack(app, `test-database-${environment}`, {
+    env,
+    config,
+    vpc: network.vpc,
+    databaseSecurityGroup: network.securityGroups.database,
+  });
   const application = new ApplicationStack(app, `test-application-${environment}`, {
     env,
     config,
@@ -43,9 +51,15 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
     repository: registry.repository,
     albSecurityGroup: network.securityGroups.alb,
     applicationSecurityGroup: network.securityGroups.application,
+    database: {
+      host: database.instance.dbInstanceEndpointAddress,
+      port: database.instance.dbInstanceEndpointPort,
+      databaseName: config.database.databaseName,
+      secret: database.credentialsSecret,
+    },
   });
 
-  return { template: Template.fromStack(application), network, application };
+  return { template: Template.fromStack(application), network, database, application };
 }
 
 function resourcesOfType(template: Template, type: string): ResourceEntry[] {
@@ -137,7 +151,6 @@ describe('ApplicationStack task definition', () => {
     expect(container.Name).toBe('api');
     expect(container.Essential).toBe(true);
     expect(container.PortMappings).toEqual([{ ContainerPort: 8080, Protocol: 'tcp' }]);
-    expect(container.Environment).toEqual([{ Name: 'SERVER_PORT', Value: '8080' }]);
     expect(container.LogConfiguration.LogDriver).toBe('awslogs');
     expect(container.LogConfiguration.Options['awslogs-stream-prefix']).toBe('api');
     expect(json(container.LogConfiguration.Options['awslogs-group'])).toContain('ApiLogGroup');
@@ -150,6 +163,48 @@ describe('ApplicationStack task definition', () => {
     expect(taskDefinition.properties.ExecutionRoleArn).toBeDefined();
     expect(taskDefinition.properties.TaskRoleArn).toBeDefined();
     expect(taskDefinition.properties.ExecutionRoleArn).not.toEqual(taskDefinition.properties.TaskRoleArn);
+  });
+});
+
+describe('ApplicationStack database wiring', () => {
+  test('passes the database endpoint as plain environment variables', () => {
+    const template = buildStacks('dev').template;
+    const container = single(template, 'AWS::ECS::TaskDefinition').properties.ContainerDefinitions[0];
+    const environment = Object.fromEntries(
+      (container.Environment ?? []).map((entry: { Name: string; Value: unknown }) => [entry.Name, entry.Value]),
+    );
+
+    expect(environment.SERVER_PORT).toBe('8080');
+    expect(environment.DB_NAME).toBe('ecommerce');
+    // The host and port are tokens resolved from the database stack, never literals in this stack.
+    expect(json(environment.DB_HOST)).toContain('EndpointAddress');
+    expect(json(environment.DB_PORT)).toContain('EndpointPort');
+  });
+
+  test('injects the credentials from Secrets Manager instead of carrying them', () => {
+    const template = buildStacks('dev').template;
+    const container = single(template, 'AWS::ECS::TaskDefinition').properties.ContainerDefinitions[0];
+    const secrets = Object.fromEntries(
+      (container.Secrets ?? []).map((secret: { Name: string; ValueFrom: unknown }) => [
+        secret.Name,
+        secret.ValueFrom,
+      ]),
+    );
+
+    expect(Object.keys(secrets).sort()).toEqual(['DB_PASSWORD', 'DB_USERNAME']);
+    // ECS resolves `{{resolve:secretsmanager:<arn>:SecretString:<field>::}}` at container start.
+    expect(json(secrets.DB_USERNAME)).toContain(':username::');
+    expect(json(secrets.DB_PASSWORD)).toContain(':password::');
+    expect(json(secrets.DB_PASSWORD)).toContain('Credentials');
+    // No credential value ever appears in the template.
+    expect(json(container)).not.toContain('password=');
+  });
+
+  test('creates no database resource of its own', () => {
+    const template = buildStacks('dev').template;
+
+    template.resourceCountIs('AWS::RDS::DBInstance', 0);
+    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
   });
 });
 
@@ -171,7 +226,7 @@ describe('ApplicationStack CloudWatch logs', () => {
 });
 
 describe('ApplicationStack IAM', () => {
-  test('gives the execution role only image pull and log write permissions', () => {
+  test('gives the execution role only image pull, log write and database secret permissions', () => {
     const template = buildStacks('dev').template;
     const executionRole = roleByDescription(template, 'ECS task execution role');
     const policy = resourcesOfType(template, 'AWS::IAM::Policy').find(({ properties }) =>
@@ -193,13 +248,15 @@ describe('ApplicationStack IAM', () => {
         'ecr:GetAuthorizationToken',
         'logs:CreateLogStream',
         'logs:PutLogEvents',
+        'secretsmanager:GetSecretValue',
       ]),
     );
     expect(actions).not.toContain('*');
     expect(actions.some((action) => action.endsWith(':*'))).toBe(false);
+    expect(actions.some((action) => action.startsWith('kms:'))).toBe(false);
   });
 
-  test('scopes the image pull and log write grants to the specific repository and log group', () => {
+  test('scopes the image pull, log write and secret read grants to the specific resources', () => {
     const template = buildStacks('dev').template;
     const executionRole = roleByDescription(template, 'ECS task execution role');
     const policy = resourcesOfType(template, 'AWS::IAM::Policy').find(({ properties }) =>
@@ -217,6 +274,7 @@ describe('ApplicationStack IAM', () => {
 
     expect(json(statements)).toContain('Repository');
     expect(json(statements)).toContain('ApiLogGroup');
+    expect(json(statements)).toContain('Credentials');
   });
 
   test('gives the task role no permissions at all', () => {

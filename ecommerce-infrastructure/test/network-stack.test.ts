@@ -57,7 +57,7 @@ function securityGroupByDescription(template: Template, description: string): Re
   return match;
 }
 
-function subnetsOfType(template: Template, subnetType: 'Public' | 'Private'): ResourceEntry[] {
+function subnetsOfType(template: Template, subnetType: 'Public' | 'Private' | 'Isolated'): ResourceEntry[] {
   return resourcesOfType(template, 'AWS::EC2::Subnet').filter(({ properties }) =>
     (properties.Tags ?? []).some(
       (tag: { Key: string; Value: string }) => tag.Key === 'aws-cdk:subnet-type' && tag.Value === subnetType,
@@ -108,12 +108,13 @@ describe('NetworkStack VPC', () => {
 });
 
 describe('NetworkStack subnets', () => {
-  test('creates one public and one private subnet per Availability Zone', () => {
+  test('creates one public, one private and one isolated subnet per Availability Zone', () => {
     const template = buildTemplate('dev');
 
-    template.resourceCountIs('AWS::EC2::Subnet', 4);
+    template.resourceCountIs('AWS::EC2::Subnet', 6);
     expect(subnetsOfType(template, 'Public')).toHaveLength(2);
     expect(subnetsOfType(template, 'Private')).toHaveLength(2);
+    expect(subnetsOfType(template, 'Isolated')).toHaveLength(2);
   });
 
   test('spreads the subnets over two Availability Zones', () => {
@@ -124,7 +125,8 @@ describe('NetworkStack subnets', () => {
     const template = buildTemplate('prod');
 
     expect(availabilityZones(template)).toHaveLength(3);
-    template.resourceCountIs('AWS::EC2::Subnet', 6);
+    template.resourceCountIs('AWS::EC2::Subnet', 9);
+    expect(subnetsOfType(template, 'Isolated')).toHaveLength(3);
   });
 
   test('honours the configured Availability Zone count without a pinned account', () => {
@@ -133,7 +135,7 @@ describe('NetworkStack subnets', () => {
     const template = buildAgnosticTemplate('prod');
 
     expect(availabilityZones(template)).toHaveLength(3);
-    template.resourceCountIs('AWS::EC2::Subnet', 6);
+    template.resourceCountIs('AWS::EC2::Subnet', 9);
     template.resourceCountIs('AWS::EC2::NatGateway', 3);
   });
 
@@ -232,6 +234,37 @@ describe('NetworkStack NAT gateways', () => {
       expect(properties.DestinationCidrBlock).toBe('0.0.0.0/0');
       expect(natGatewayIds).toContain((properties.NatGatewayId as { Ref: string }).Ref);
     }
+  });
+});
+
+describe('NetworkStack database subnets', () => {
+  test('places the database subnets in isolated subnets with no route off the VPC', () => {
+    const template = buildTemplate('dev');
+    const isolatedSubnetIds = subnetsOfType(template, 'Isolated').map(({ logicalId }) => logicalId);
+
+    const isolatedRouteTableIds = resourcesOfType(template, 'AWS::EC2::SubnetRouteTableAssociation')
+      .filter(({ properties }) => isolatedSubnetIds.includes((properties.SubnetId as { Ref: string }).Ref))
+      .map(({ properties }) => (properties.RouteTableId as { Ref: string }).Ref);
+
+    // Every isolated subnet has its own route table...
+    expect(isolatedRouteTableIds).toHaveLength(2);
+
+    // ...and no route in the template belongs to any of them, so there is no path to the internet
+    // gateway, to a NAT gateway, or anywhere else outside the VPC.
+    for (const { properties } of resourcesOfType(template, 'AWS::EC2::Route')) {
+      expect(isolatedRouteTableIds).not.toContain((properties.RouteTableId as { Ref: string }).Ref);
+    }
+  });
+
+  test('still routes only the public and private subnets to the internet and NAT gateways', () => {
+    const template = buildTemplate('dev');
+    const defaultRoutes = resourcesOfType(template, 'AWS::EC2::Route').filter(
+      ({ properties }) => properties.DestinationCidrBlock === '0.0.0.0/0',
+    );
+
+    expect(routesTo(template, 'GatewayId')).toHaveLength(2);
+    expect(routesTo(template, 'NatGatewayId')).toHaveLength(2);
+    expect(defaultRoutes).toHaveLength(4);
   });
 });
 
@@ -380,6 +413,7 @@ describe('NetworkStack outputs', () => {
     template.hasOutput('VpcId', { Export: { Name: 'ecommerce-dev-vpc-id' } });
     template.hasOutput('PublicSubnetIds', { Export: { Name: 'ecommerce-dev-public-subnet-ids' } });
     template.hasOutput('PrivateSubnetIds', { Export: { Name: 'ecommerce-dev-private-subnet-ids' } });
+    template.hasOutput('DatabaseSubnetIds', { Export: { Name: 'ecommerce-dev-database-subnet-ids' } });
   });
 
   test('exports the security group ids for later stacks', () => {
@@ -399,6 +433,7 @@ describe('NetworkStack outputs', () => {
 
     expect(outputs.PublicSubnetIds.Value['Fn::Join'][1]).toHaveLength(2);
     expect(outputs.PrivateSubnetIds.Value['Fn::Join'][1]).toHaveLength(2);
+    expect(outputs.DatabaseSubnetIds.Value['Fn::Join'][1]).toHaveLength(2);
   });
 });
 

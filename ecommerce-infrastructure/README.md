@@ -11,8 +11,14 @@ security group model, VPC Flow Logs, and the stack outputs later phases consume.
 container image, stored in ECR and run as a single ECS Fargate task behind an internet-facing
 Application Load Balancer, with container logs in CloudWatch.
 
-No database, cache, queue, authentication, CI/CD or auto scaling exists yet. Those are Phase 3+ and
-are listed at the end of this document.
+**Phase 3** delivers the data layer: an Amazon RDS for PostgreSQL instance in dedicated private
+database subnets, reachable only from the ECS tasks, encrypted at rest, backed up automatically,
+with the master credentials generated and stored in AWS Secrets Manager and injected into the
+container by ECS. The Spring Boot API now reads and writes PostgreSQL through Spring Data JPA, and
+owns its schema with Flyway migrations.
+
+No cache, queue, authentication, CI/CD or auto scaling exists yet. Those are Phase 4+ and are listed
+at the end of this document.
 
 ---
 
@@ -23,25 +29,28 @@ are listed at the end of this document.
 3. [Stacks and deployment order](#stacks-and-deployment-order)
 4. [Core concepts: the network](#core-concepts-the-network)
 5. [Core concepts: the application tier](#core-concepts-the-application-tier)
-6. [The Spring Boot application](#the-spring-boot-application)
-7. [The container image](#the-container-image)
-8. [ECR: how an image is tagged and pushed](#ecr-how-an-image-is-tagged-and-pushed)
-9. [IAM: execution role versus task role](#iam-execution-role-versus-task-role)
-10. [Security group model](#security-group-model)
-11. [Environments and configuration](#environments-and-configuration)
-12. [Tags](#tags)
-13. [Stack outputs](#stack-outputs)
-14. [Removal policies and resource protection](#removal-policies-and-resource-protection)
-15. [Commands](#commands)
-16. [Testing](#testing)
-17. [Cost expectations](#cost-expectations)
-18. [Phase 3 and beyond](#phase-3-and-beyond)
+6. [Core concepts: the data tier](#core-concepts-the-data-tier)
+7. [The Spring Boot application](#the-spring-boot-application)
+8. [The container image](#the-container-image)
+9. [ECR: how an image is tagged and pushed](#ecr-how-an-image-is-tagged-and-pushed)
+10. [IAM: execution role versus task role](#iam-execution-role-versus-task-role)
+11. [Database credentials and Secrets Manager](#database-credentials-and-secrets-manager)
+12. [Security group model](#security-group-model)
+13. [Environments and configuration](#environments-and-configuration)
+14. [Tags](#tags)
+15. [Stack outputs](#stack-outputs)
+16. [Removal policies and resource protection](#removal-policies-and-resource-protection)
+17. [Commands](#commands)
+18. [Deployment and verification procedure](#deployment-and-verification-procedure)
+19. [Testing](#testing)
+20. [Cost expectations](#cost-expectations)
+21. [Phase 4 and beyond](#phase-4-and-beyond)
 
 ---
 
 ## Architecture
 
-The Phase 2 request path:
+The Phase 3 request path:
 
 ```
                               Internet
@@ -63,23 +72,29 @@ The Phase 2 request path:
                     └───────────┬────────────┘
                                 │
                                 ▼
-                    ┌────────────────────────┐
-                    │ Fargate Task           │
-                    │ Spring Boot API        │
-                    │ private subnet         │
+                    ┌────────────────────────┐        ┌────────────────────────┐
+                    │ Fargate Task           │        │ CloudWatch Logs        │
+                    │ Spring Boot API        │───────▶│ /ecs/ecommerce-<env>-api│
+                    │ private subnet         │        └────────────────────────┘
                     │ port 8080              │
                     │ security group: App    │
                     └───────────┬────────────┘
                                 │
+                                │ TCP 5432 (by security group reference)
                                 ▼
-                    ┌────────────────────────┐
-                    │ CloudWatch Logs        │
+                    ┌────────────────────────┐        ┌────────────────────────┐
+                    │ RDS for PostgreSQL     │◀───────│ Secrets Manager        │
+                    │ isolated DB subnets    │ master │ generated credentials  │
+                    │ encrypted, Multi-AZ*   │  pwd   └────────────────────────┘
+                    │ security group: Database│
                     └────────────────────────┘
+                             * prod only
 
         ECR ──────── container image ────────▶ Fargate Task
+        Secrets Manager ── injected at start ─▶ Fargate Task (execution role reads it)
 ```
 
-The whole platform, network and compute:
+The whole platform, network, compute and data:
 
 ```
                               Internet
@@ -100,8 +115,11 @@ The whole platform, network and compute:
         │   Private subnet              Private subnet    │
         │       │                           │             │
         │   Fargate task ───────────────────┘             │
-        │                                                 │
-        │        Future: RDS / Redis                      │
+        │       │                                         │
+        │   Database subnet             Database subnet   │
+        │   (isolated, no route)        (isolated, no route)│
+        │       │                           │             │
+        │   RDS PostgreSQL ─────────────────┘             │
         │                                                 │
         └─────────────────────────────────────────────────┘
 ```
@@ -113,7 +131,9 @@ Traffic paths created by the stacks:
 | Internet → public | Application Load Balancer  | Internet Gateway → public subnet route table      |
 | ALB → task        | ECS/Fargate task           | public subnet → private subnet, security groups only |
 | Private → Internet | NAT Gateway → Internet Gateway | public subnet → IGW (image pulls, patches)   |
+| Task → database   | RDS PostgreSQL             | private subnet → isolated subnet, security groups only |
 | Internet → private | **not possible**          | private route table has no route to the IGW       |
+| Database → anything | **not possible**         | isolated route tables have no route at all        |
 
 Security group chain:
 
@@ -134,7 +154,7 @@ aws-cdk/
 │   │   └── ecommerce.ts              # CDK app entry point: resolve env, build the stacks
 │   ├── lib/
 │   │   ├── config/
-│   │   │   ├── types.ts              # EnvironmentConfig + ApplicationConfig interfaces
+│   │   │   ├── types.ts              # EnvironmentConfig + ApplicationConfig + DatabaseConfig
 │   │   │   ├── validation.ts         # fail-fast validation of an environment config
 │   │   │   ├── dev.ts                # dev values
 │   │   │   ├── uat.ts                # uat values
@@ -143,16 +163,18 @@ aws-cdk/
 │   │   ├── constructs/
 │   │   │   ├── tier-security-groups.ts   # ALB / application / database security groups
 │   │   │   ├── vpc-flow-logs.ts          # optional flow logging + its least-privilege role
-│   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, target group, listener
+│   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB wiring, IAM
 │   │   ├── stacks/
-│   │   │   ├── network-stack.ts      # VPC, subnets, routing, security groups, outputs
+│   │   │   ├── network-stack.ts      # VPC, public/private/isolated subnets, routing, SGs
 │   │   │   ├── ecr-stack.ts          # container registry
+│   │   │   ├── database-stack.ts     # RDS PostgreSQL instance + Secrets Manager credentials
 │   │   │   └── application-stack.ts  # ECS cluster, service, ALB, IAM, logs
 │   │   └── tags.ts                   # the shared tag contract
 │   ├── test/
 │   │   ├── network-stack.test.ts     # network contract tests (CDK assertions)
 │   │   ├── ecr-stack.test.ts         # registry contract tests
-│   │   ├── application-stack.test.ts # compute contract tests
+│   │   ├── database-stack.test.ts    # database contract tests
+│   │   ├── application-stack.test.ts # compute + database wiring contract tests
 │   │   └── config.test.ts            # configuration tests
 │   ├── cdk.json
 │   ├── jest.config.js
@@ -163,11 +185,17 @@ aws-cdk/
 └── application/                      # the Spring Boot API
     ├── src/main/java/com/ecommerce/api/
     │   ├── EcommerceApiApplication.java
-    │   ├── controller/ProductController.java
-    │   ├── service/ProductService.java
-    │   └── model/Product.java
-    ├── src/main/resources/application.properties
-    ├── src/test/java/com/ecommerce/api/ProductApiTest.java
+    │   ├── controller/ProductController.java   # HTTP mapping only
+    │   ├── dto/ProductRequest.java             # validated create payload
+    │   ├── service/ProductService.java         # business operations + transactions
+    │   ├── repository/ProductRepository.java   # Spring Data JPA
+    │   └── entity/Product.java                 # JPA entity mapped to `products`
+    ├── src/main/resources/
+    │   ├── application.properties              # datasource from env, no credentials
+    │   └── db/migration/V1__create_products_table.sql   # Flyway migration
+    ├── src/test/java/com/ecommerce/api/
+    │   ├── ProductApiTest.java                 # HTTP + PostgreSQL (Testcontainers)
+    │   └── service/ProductServiceTest.java     # service unit tests (Mockito)
     ├── pom.xml
     ├── Dockerfile
     ├── .dockerignore
@@ -184,8 +212,9 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 
 | Stack | Name | Creates |
 | ----- | ---- | ------- |
-| Network | `ecommerce-network-<env>` | VPC, subnets, gateways, route tables, tier security groups, flow logs |
+| Network | `ecommerce-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
 | Registry | `ecommerce-ecr-<env>` | ECR repository |
+| Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
 | Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listener, log group, IAM roles |
 
 The registry is a **separate stack from the compute** on purpose. An ECS service cannot start until
@@ -194,9 +223,16 @@ to be creatable — and an image pushable — before the application stack is de
 registry separate also means recreating the compute never touches the images, and in uat/prod the
 registry can be retained while everything else is disposable.
 
-The application stack consumes the network stack's VPC and security groups and the registry stack's
-repository **by reference** (CDK cross-stack references), so the CDK CLI orders the stacks
-automatically and there is exactly one definition of each resource.
+The database is a **separate stack from the compute** for the opposite reason: their lifecycles are
+unrelated. The application is replaced on every deployment and can be recreated at will; the
+database holds the only state in the platform and outlives many deployments of the code that reads
+it. Keeping them apart means a `cdk deploy ecommerce-application-dev` never touches the instance,
+and the instance's removal policy and deletion protection are decided in one small stack.
+
+The application stack consumes the network stack's VPC and security groups, the registry stack's
+repository and the database stack's endpoint and credentials secret **by reference** (CDK cross-stack
+references), so the CDK CLI orders the stacks automatically and there is exactly one definition of
+each resource.
 
 > Cross-stack references use **weak** strength (`"@aws-cdk/core:defaultCrossStackReferences": "weak"`
 > in `cdk.json`). A weak reference reads the producer's output directly instead of locking an export
@@ -410,22 +446,149 @@ the environment, and the execution role is granted write access to exactly this 
 
 ---
 
+## Core concepts: the data tier
+
+### RDS for PostgreSQL
+
+**Amazon Relational Database Service (RDS)** runs a managed PostgreSQL server: AWS handles the
+operating system, the engine patching, the backups and (in Multi-AZ) the failover, and hands back a
+DNS endpoint. The alternative — PostgreSQL on an EC2 instance — means owning all of that yourself,
+which is exactly the kind of undifferentiated work a managed service should absorb.
+
+PostgreSQL is the engine because the application needs transactions, foreign keys and a real
+relational model, and because it is the default choice in this stack: Spring Data JPA, Flyway and
+the PostgreSQL JDBC driver all treat it as first class.
+
+The engine version is pinned to a **major** version (`16`). RDS then runs the current minor release
+of that major and applies minor upgrades during the maintenance window, while a major upgrade — the
+kind that can break compatibility — stays an explicit, reviewed change.
+
+### Isolated database subnets
+
+Phase 3 added a third subnet group to the VPC:
+
+| Subnet group | CDK type | Route off the VPC | Hosts |
+| ------------ | -------- | ----------------- | ----- |
+| `public` | `SubnetType.PUBLIC` | Internet Gateway | ALB, NAT Gateway |
+| `private` | `SubnetType.PRIVATE_WITH_EGRESS` | NAT Gateway | ECS tasks |
+| `database` | `SubnetType.PRIVATE_ISOLATED` | **none** | RDS |
+
+The database subnets have route tables with **no routes at all**. There is no path to the internet
+gateway and none to a NAT gateway, so an instance placed there cannot initiate a connection
+anywhere, full stop — which is what you want for the one component that holds the data. It is also
+why the ECS tasks stay in the `private` subnets rather than moving here: they do need outbound
+access for image pulls.
+
+Adding a subnet group is the smallest change that gives the database its own network. The Phase 1
+public and private subnets are untouched, so nothing deployed earlier moved.
+
+### DB subnet group
+
+RDS refuses to create an instance without a **DB subnet group**: a named list of at least two
+subnets in different Availability Zones. CDK builds one from the isolated subnets automatically, and
+RDS uses it to decide where the instance (and, in Multi-AZ, its standby) lives.
+
+### Encryption at rest
+
+`storageEncrypted: true` encrypts the instance's storage, its automated backups and its snapshots
+with the RDS managed KMS key (`aws/rds`). This is **not** configurable per environment: an
+unencrypted database is a finding, not a cost saving, and encryption at rest cannot be added
+retroactively without a rebuild.
+
+### Automated backups
+
+`backupRetentionDays` sets the recovery window: RDS takes a daily snapshot and keeps the
+transaction logs needed to restore to any point inside that window. Retention is 1 day in dev, 7 in
+uat and 30 in prod, and the configuration validator refuses 0 — running a managed database without
+backups throws away the main reason for paying for it. `deleteAutomatedBackups` follows the removal
+policy so `cdk destroy` in dev leaves nothing billing behind, while uat/prod keep their recovery
+window.
+
+### Multi-AZ
+
+`multiAz: true` runs a synchronously replicated standby in a second Availability Zone and fails over
+to it automatically if the primary is lost. It doubles the instance cost and it is enabled in
+production only. This is not read replication: no read traffic is served from the standby, and no
+replica configuration is involved.
+
+### Deletion protection and removal policy
+
+Two different guards, often confused:
+
+- **`deletionProtection`** refuses a `DeleteDBInstance` call until it is switched off. It stops a
+  person or a pipeline from deleting the instance, and it is `false` in dev, `true` in uat/prod.
+- **`removalPolicy`** decides what CloudFormation does when the *stack* is deleted: `DESTROY`
+  deletes the instance, `RETAIN` leaves it (and its data) behind. It is `DESTROY` in dev and
+  `RETAIN` in uat/prod.
+
+The configuration validator rejects the combination `deletionProtection: true` with
+`removalPolicy: DESTROY`, because a stack that can never be deleted is a trap rather than a
+safeguard.
+
+### Secrets Manager
+
+**AWS Secrets Manager** stores the master credentials. The database stack creates a secret whose
+value is generated by CloudFormation at deploy time:
+
+```json
+{ "username": "ecommerce", "password": "<generated, 30 characters, no punctuation>" }
+```
+
+The generated value never appears in the template, in source control or in a terminal — CloudFormation
+resolves `GenerateSecretString` server-side and the instance's `MasterUserPassword` is a
+`{{resolve:secretsmanager:...}}` dynamic reference. The secret is created without an explicit name,
+so destroying and recreating an environment never collides with a secret that is still inside its
+recovery window; it is found by its tags and by the exported ARN.
+
+### Secret injection into the container
+
+The application never receives the password as a value that a human or a log line can see. ECS
+supports **secret injection**: the task definition references the secret and the JSON field to read,
+and the ECS agent fetches it while starting the container, exporting it as an environment variable:
+
+```
+Secrets Manager ──(execution role: GetSecretValue)──▶ ECS agent ──▶ container env (DB_USERNAME, DB_PASSWORD)
+```
+
+This is why the secret read permission belongs on the **execution** role and not the task role: the
+value is fetched before the application starts, and the running application never holds a
+credential it could leak.
+
+The connection *details* — host, port, database name — are not secrets, so they travel as ordinary
+environment variables set from the database stack's outputs.
+
+---
+
 ## The Spring Boot application
 
-`application/` is a minimal Spring Boot API. It uses **Java 21** (the current LTS) and **Spring Boot
-4.1.1**, with Spring Web, Spring Boot Actuator and Spring Boot Test.
+`application/` is a Spring Boot API. It uses **Java 21** (the current LTS) and **Spring Boot 4.1.1**,
+with Spring Web, Spring Data JPA, Jakarta Bean Validation, Flyway, Actuator and Testcontainers.
 
 Structure:
 
 ```
-controller  →  service  →  model
+HTTP → controller → service → repository → PostgreSQL
+                        ▲
+                    entity / dto
 ```
 
 | Layer | Class | Responsibility |
 | ----- | ----- | -------------- |
-| Controller | `ProductController` | Maps HTTP to the service; holds no state |
-| Service | `ProductService` | In-memory product storage |
-| Model | `Product` | Immutable record: `id`, `name`, `price` |
+| Controller | `ProductController` | Maps HTTP to the service; holds no state and no database logic |
+| Service | `ProductService` | Business operations and transaction boundaries |
+| Repository | `ProductRepository` | Spring Data JPA; CRUD only, no custom queries yet |
+| Entity | `Product` | JPA mapping of the `products` table |
+| DTO | `ProductRequest` | The validated create payload |
+
+The controller never touches the repository and the repository never makes a business decision:
+each layer has one job. The request type is separate from the entity so a client cannot choose an
+id or a timestamp, and so the validation rules describe the API rather than the table.
+
+The service is a **single concrete class**, not an interface plus an implementation. There is
+exactly one implementation and no second one is planned, so an interface would be indirection with
+nothing on the other side of it — the controller depends on the class directly and Spring injects
+it. It becomes an interface on the day a second implementation (a cached one, say) actually exists,
+and not before.
 
 ### Endpoints
 
@@ -433,37 +596,80 @@ controller  →  service  →  model
 | ------ | ---- | --------- |
 | `GET` | `/api/products` | Returns all products, ordered by id |
 | `GET` | `/api/products/{id}` | Returns one product, or `404` |
-| `POST` | `/api/products` | Creates a product, returns `201` with the assigned id |
+| `POST` | `/api/products` | Validates and creates a product, returns `201` with the assigned id |
 | `GET` | `/actuator/health` | Returns `{"status":"UP"}` — the ALB health check target |
 
-Example:
+Example (the table starts empty — the data is no longer seeded):
 
 ```bash
 curl http://<alb-dns-name>/api/products
-# [{"id":1,"name":"Laptop","price":1200.00},{"id":2,"name":"Smartphone","price":800.00}]
+# []
 
 curl -X POST http://<alb-dns-name>/api/products \
      -H 'Content-Type: application/json' \
-     -d '{"name":"Tablet","price":450.00}'
-# {"id":3,"name":"Tablet","price":450.00}
+     -d '{"name":"Tablet","description":"10 inch","price":450.00,"quantity":12}'
+# {"id":1,"name":"Tablet","description":"10 inch","price":450.00,"quantity":12,
+#  "createdAt":"2026-01-01T09:15:00.123456Z","updatedAt":"2026-01-01T09:15:00.123456Z"}
+
+curl http://<alb-dns-name>/api/products/1
+# {"id":1,"name":"Tablet",...}
 
 curl http://<alb-dns-name>/actuator/health
 # {"status":"UP"}
 ```
 
-### Why in-memory
+Ids come from a database identity column, so they are unique across restarts and never reused.
 
-There is deliberately no database. `ProductService` seeds two products and keeps them in a
-`ConcurrentHashMap`. State is lost when the task stops, which is acceptable because this phase runs
-exactly one task and exists to prove the deploy path, not to store data. A later phase replaces the
-service with a real repository backed by RDS.
+### Validation
+
+`ProductRequest` is annotated and the controller marks it `@Valid`, so Bean Validation runs before
+the method body and a violation becomes a `400` with no database round trip:
+
+| Field | Rule |
+| ----- | ---- |
+| `name` | required, not blank, at most 255 characters |
+| `description` | optional, at most 1000 characters |
+| `price` | required, greater than zero, at most 2 decimal places |
+| `quantity` | optional, zero or greater; defaults to 0 |
+
+`price` is a `BigDecimal` throughout — request, entity and column (`NUMERIC(12,2)`). A `double`
+cannot represent `0.10` exactly, so money would drift by fractions of a cent on every round trip.
+
+`createdAt` and `updatedAt` are `java.time.Instant` values in `timestamptz` columns: an absolute
+point in time with no zone to get wrong. They are stamped by the entity itself (`@PrePersist` /
+`@PreUpdate`), never sent by the client, and come back as ISO-8601 UTC (`...Z`).
+
+### Schema and migrations
+
+The schema is owned by **Flyway**, not by Hibernate. `db/migration/V1__create_products_table.sql`
+creates `products` and is applied once, in order, with a checksum recorded in
+`flyway_schema_history`. Hibernate is configured with `ddl-auto=validate`, so if the entity and the
+migrated table ever disagree the application **refuses to start** instead of failing on the first
+query at runtime.
+
+Rules that follow from that:
+
+- A schema change is a new `V2__...sql` file, never an edit to `V1`. Flyway checksums applied
+  migrations and rejects a changed one.
+- `ddl-auto` is never `update`. The application must not alter tables it does not own.
+- The tests run the same migrations against a real PostgreSQL (see [Testing](#testing)), so a broken
+  migration fails the build rather than a deployment.
+
+### Transactions
+
+`ProductService` is where transactions live. Reads are `@Transactional(readOnly = true)` so
+Hibernate skips dirty checking, and `create` runs in a transaction that either commits as a whole or
+rolls back as a whole. `spring.jpa.open-in-view=false` keeps a connection from being held open for
+the whole request.
 
 ### Port and health
 
 The application listens on **8080** (`server.port`), which is also the container port in the task
 definition and the target group port — the ECS task passes `SERVER_PORT` so all three stay in sync.
 Actuator exposes **only** the `health` endpoint over HTTP, with details suppressed, because that
-endpoint is publicly reachable through the load balancer.
+endpoint is publicly reachable through the load balancer. The health indicator includes the
+database: if PostgreSQL is unreachable the endpoint reports `DOWN`, the ALB marks the task unhealthy
+and ECS replaces it, rather than serving errors from a task that cannot reach its data.
 
 ---
 
@@ -488,8 +694,10 @@ Design points:
 - **Non-root.** A dedicated `app` user is created and the process runs as it (`USER app`), so a
   compromised process is not root inside the container.
 - **Small.** Only the packaged jar crosses the stage boundary.
-- **No secrets.** No credentials are baked into the image. If the application ever needs AWS access,
-  it uses the task role's temporary credentials at runtime — never a key in the image.
+- **No secrets.** No credential is baked into the image. The database credentials are injected by
+  ECS from Secrets Manager when the container starts (see
+  [Database credentials and Secrets Manager](#database-credentials-and-secrets-manager)), and no
+  `.env` file, keystore or password ever crosses the stage boundary.
 - **Container-aware heap.** `-XX:MaxRAMPercentage=75.0` sizes the JVM heap from the container's memory
   limit rather than the host's, so the task's configured memory is what the JVM actually respects.
 
@@ -544,18 +752,19 @@ before the container starts            inside the container
 
 "Get the container running"            "What the container may do"
 
-ecr: pull the image                    Phase 2: nothing
+ecr: pull the image                    Phase 3: nothing
 logs: create the stream, write logs
+secrets: read the DB credentials
 ```
 
 | | Execution role | Task role |
 | --- | --- | --- |
 | Assumed by | The ECS container agent | The application process |
 | When | Before the container starts | While the container runs |
-| Used for | Pulling the image, writing logs | Calling AWS services the app uses |
-| Phase 2 permissions | ECR pull + CloudWatch log write | **none** |
+| Used for | Pulling the image, writing logs, fetching injected secrets | Calling AWS services the app uses |
+| Phase 3 permissions | ECR pull + CloudWatch log write + read one secret | **none** |
 
-**Execution role.** ECS assumes it to perform the two infrastructure actions it needs before the
+**Execution role.** ECS assumes it to perform the infrastructure actions it needs before the
 container runs. The permissions are granted with scoped CDK `grant` calls rather than the broad
 `AmazonECSTaskExecutionRolePolicy` managed policy:
 
@@ -564,14 +773,70 @@ container runs. The permissions are granted with scoped CDK `grant` calls rather
 - `ecr:GetAuthorizationToken` — an account-level action that cannot be scoped to a repository, so it
   is the only statement with a `*` resource.
 - `logs:CreateLogStream`, `logs:PutLogEvents` — scoped to the one log group.
+- `secretsmanager:GetSecretValue`, `secretsmanager:DescribeSecret` — scoped to the one database
+  secret. No `kms:*` statement is needed because the secret is encrypted with the AWS managed key,
+  so there is nothing extra to grant.
 
-**Task role.** Assumed by the application itself. In Phase 2 the API only uses in-memory data, so the
-role carries **no permissions at all** — a compromised container has no AWS credentials worth using.
-It exists now so later phases attach permissions (S3, SQS, Secrets Manager) to a role that is already
-wired into the task definition.
+**Task role.** Assumed by the application itself. The API talks to PostgreSQL over JDBC and to no AWS
+API at all, so the role carries **no permissions whatsoever** — a compromised container has no AWS
+credentials worth using. This is deliberate: the database password reaches the container through the
+*execution* role, which never runs application code, so nothing the application can be tricked into
+doing also gives it the ability to read secrets.
 
-`test/application-stack.test.ts` asserts that the execution role has no wildcard action, that its
-only `*` resource is `ecr:GetAuthorizationToken`, and that the task role has no attached policy.
+`test/application-stack.test.ts` asserts that the execution role has no wildcard action and no `kms:`
+action, that its only `*` resource is `ecr:GetAuthorizationToken`, and that the task role has no
+attached policy at all.
+
+---
+
+## Database credentials and Secrets Manager
+
+The credential flow, end to end:
+
+```
+CloudFormation ──generates password──▶ Secrets Manager (username + password)
+                                             │
+                            execution role   │ secretsmanager:GetSecretValue
+                                             ▼
+                                        ECS agent (container start)
+                                             │
+                                             ▼
+                       container env: DB_USERNAME, DB_PASSWORD
+                                             │
+                       container env: DB_HOST, DB_PORT, DB_NAME   (from the DB stack outputs)
+                                             ▼
+                                    Spring Boot (spring.datasource.*)
+```
+
+Rules the implementation follows, and where they are enforced:
+
+| Rule | Where |
+| ---- | ----- |
+| The password is generated, never written down | `GenerateSecretString` in the database stack; `test/database-stack.test.ts` asserts no literal `password` appears in the template |
+| The instance reads it as a dynamic reference | `MasterUserPassword: {{resolve:secretsmanager:...}}`; asserted in the same test |
+| The container receives it as an injected secret, not a value | `secrets:` in the task definition; asserted in `test/application-stack.test.ts` |
+| No credential is in Java, `application.properties`, the CDK source, the Dockerfile or the README | `application.properties` reads `${DB_USERNAME}`/`${DB_PASSWORD}` with **no default**, so a missing value fails the container instead of falling back to an empty password |
+| Only the role that needs it can read it | `secret.grantRead(executionRole)`; the task role stays permissionless |
+
+The secret is created **without an explicit name**. CloudFormation generates one, which means a
+`cdk destroy` followed by a `cdk deploy` in dev never collides with a secret that is still inside its
+recovery window. Find it by its `Project`/`Environment` tags or by the exported
+`ecommerce-<env>-db-secret-arn`.
+
+Reading it by hand (an operator action, not something the application does):
+
+```bash
+aws secretsmanager get-secret-value \
+  --secret-id "$(aws cloudformation list-exports \
+      --query "Exports[?Name=='ecommerce-dev-db-secret-arn'].Value" --output text)" \
+  --query SecretString --output text
+# {"username":"ecommerce","password":"...","engine":"postgres","host":"...","port":5432,"dbname":"ecommerce"}
+```
+
+> The secret carries the connection details as well as the password, because RDS attaches it to the
+> instance as a `SecretTargetAttachment`. The application does not rely on that: it reads the host,
+> port and database name from the database stack's outputs, so the connection contract does not
+> depend on the attachment.
 
 ---
 
@@ -588,14 +853,18 @@ Three groups, linked by reference:
 Rules and rationale:
 
 - **The database tier has no CIDR-based inbound rule at all.** The only way to reach it is from a
-  resource carrying the application security group.
+  resource carrying the application security group, which in practice is the ECS task. The Phase 3
+  database stack *attaches* this group to the RDS instance and adds no rule of its own, so every
+  rule in the platform still lives in exactly one place.
+- **The database tier has no egress rule either**, and it sits in subnets with no route off the VPC:
+  an RDS instance has no reason to start a connection, so it cannot.
 - **The application tier has no inbound rule from the internet**, and its outbound internet access is
   limited to TLS (443).
 - **Only the load balancer accepts traffic from `0.0.0.0/0`.** Phase 1 opened 443; Phase 2 adds 80 for
   the HTTP listener. Port 80 is added by the *application* stack, not the network stack: the load
   balancer security group is re-imported there so the Phase 2 rule is owned by the Phase 2 stack.
-- **The application stack creates no security group of its own** — it references the Phase 1 groups,
-  so there is exactly one definition of each.
+- **The application and database stacks create no security group of their own** — they reference the
+  Phase 1 groups, so there is exactly one definition of each.
 - **`allowAllOutbound: false` everywhere**, with egress granted explicitly.
 - The VPC's **default security group is stripped of its rules** (`restrictDefaultSecurityGroup: true`).
 
@@ -625,6 +894,13 @@ is exactly the rule set intended.
 | ECS desired count | 1 | 1 | 1 |
 | ALB deletion protection | off | on | on |
 | Container log retention | 1 week | 1 month | 3 months |
+| Database engine | PostgreSQL 16 | PostgreSQL 16 | PostgreSQL 16 |
+| Database instance | `db.t4g.micro` | `db.t4g.micro` | `db.t4g.small` |
+| Database storage | 20 GiB gp3, encrypted | 20 GiB gp3, encrypted | 50 GiB gp3, encrypted |
+| Database backups | 1 day | 7 days | 30 days |
+| Database Multi-AZ | off | off | on |
+| Database deletion protection | off | on | on |
+| Database removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
 | Image tag | `v0.1.0` | `v0.1.0` | `v0.1.0` |
 | Removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
 
@@ -644,8 +920,10 @@ npx cdk synth                        # 3. falls back to dev
 An unknown environment name fails immediately with a clear error rather than silently deploying dev
 configuration to the wrong account. `lib/config/validation.ts` additionally rejects an invalid CIDR, a
 zero-AZ deployment, more NAT Gateways than Availability Zones, an empty region, a Fargate cpu/memory
-pair ECS would refuse, an out-of-range port, a health check path that is not absolute, and a `latest`
-image tag.
+pair ECS would refuse, an out-of-range port, a health check path that is not absolute, a `latest`
+image tag, a database or user name that is not a valid PostgreSQL identifier, a user name RDS
+reserves (`postgres`, `admin`, `rdsadmin`, ...), storage below the gp3 minimum, a backup retention
+outside 1–35 days, and deletion protection combined with `RemovalPolicy.DESTROY`.
 
 ### Pinning the account
 
@@ -697,12 +975,17 @@ account without clashing.
 | ----- | ------ | ----------------- | ----------- |
 | Network | `VpcId` | `ecommerce-dev-vpc-id` | every later stack |
 | Network | `PublicSubnetIds` | `ecommerce-dev-public-subnet-ids` | ALB, NAT placement |
-| Network | `PrivateSubnetIds` | `ecommerce-dev-private-subnet-ids` | ECS tasks, RDS, ElastiCache |
+| Network | `PrivateSubnetIds` | `ecommerce-dev-private-subnet-ids` | ECS tasks |
+| Network | `DatabaseSubnetIds` | `ecommerce-dev-database-subnet-ids` | RDS DB subnet group |
 | Network | `AlbSecurityGroupId` | `ecommerce-dev-alb-security-group-id` | Phase 2 load balancer |
 | Network | `ApplicationSecurityGroupId` | `ecommerce-dev-application-security-group-id` | Phase 2 ECS service |
-| Network | `DatabaseSecurityGroupId` | `ecommerce-dev-database-security-group-id` | Phase 3 RDS / ElastiCache |
+| Network | `DatabaseSecurityGroupId` | `ecommerce-dev-database-security-group-id` | Phase 3 RDS |
 | Registry | `RepositoryUri` | `ecommerce-dev-ecr-repository-uri` | image push |
 | Registry | `RepositoryName` | `ecommerce-dev-ecr-repository-name` | image push |
+| Database | `DatabaseEndpoint` | `ecommerce-dev-db-endpoint` | ECS task env `DB_HOST` |
+| Database | `DatabasePort` | `ecommerce-dev-db-port` | ECS task env `DB_PORT` |
+| Database | `DatabaseName` | `ecommerce-dev-db-name` | ECS task env `DB_NAME` |
+| Database | `CredentialsSecretArn` | `ecommerce-dev-db-secret-arn` | ECS secret injection, operators |
 | Application | `ClusterName` | `ecommerce-dev-ecs-cluster-name` | operations |
 | Application | `ServiceName` | `ecommerce-dev-ecs-service-name` | operations |
 | Application | `LoadBalancerDnsName` | `ecommerce-dev-alb-dns-name` | the API endpoint |
@@ -720,18 +1003,36 @@ account without clashing.
 - The **ECR repository** is emptied on delete in dev and retained in uat/prod, so images survive a
   `cdk destroy`.
 - The **ALB** has deletion protection enabled where the removal policy is `RETAIN`.
+- The **RDS instance** has its own `deletionProtection` and `removalPolicy` in `DatabaseConfig`,
+  plus `deleteAutomatedBackups` following the removal policy: dev really does remove everything,
+  uat/prod keep the instance and its recovery window.
+- The **database credentials secret** follows the same removal policy, so dev leaves no secret
+  behind and uat/prod keep the credential that matches the retained instance.
 
 Everything else is either ephemeral by nature (subnets, route tables, security groups) or replaced
-rather than deleted. When Phase 3 adds stateful resources, the following must be configured
-explicitly and are called out so they are not forgotten:
+rather than deleted.
+
+Two deliberate Phase 3 choices worth knowing:
+
+- **`removalPolicy: RETAIN`, not `SNAPSHOT`, for the database.** `RETAIN` leaves the instance in
+  place when the stack is deleted — it keeps running and keeps billing, which is a loud, obvious
+  state to be in. `SNAPSHOT` takes a final snapshot and deletes the instance, which is quieter but
+  also easy to miss. Either is defensible; this phase chooses the one that cannot silently lose the
+  instance's backups.
+- **Deletion protection and `DESTROY` are mutually exclusive.** The validator rejects the
+  combination, because a stack that can never be deleted is a trap rather than a safeguard.
+
+Stateful resources that are still ahead of this phase, and what they will need:
 
 | Resource | Required protection |
 | -------- | ------------------- |
-| RDS / Aurora | `deletionProtection: true`, automated backups, `RemovalPolicy.SNAPSHOT`; Multi-AZ in prod |
 | ElastiCache | Automatic backups, and a final snapshot before replacement |
 | S3 (assets, uploads) | `RemovalPolicy.RETAIN`, versioning, and lifecycle rules |
-| Secrets Manager | Recovery window; never `DESTROY` in prod |
-| KMS keys | `RemovalPolicy.RETAIN` — deleting a key is irreversible |
+| KMS keys (customer managed) | `RemovalPolicy.RETAIN` — deleting a key is irreversible |
+
+The database currently uses the AWS managed KMS keys for both storage encryption and the secret. A
+customer managed key would add key policies, rotation and a per-key charge; it belongs in the same
+hardening pass as those resources.
 
 ---
 
@@ -751,10 +1052,29 @@ npx cdk destroy             # remove a stack (dev only, see above)
 Application (`application/`):
 
 ```bash
-mvn test                    # run the Spring Boot tests
+mvn test                    # run the Spring Boot tests (starts a PostgreSQL test container)
 mvn package                 # build the executable jar (target/ecommerce-api-0.1.0.jar)
 docker build -t ecommerce-api:v0.1.0 .
 ```
+
+`mvn test` needs a running Docker daemon: the tests start a throwaway PostgreSQL container rather
+than substituting an in-memory database, so they exercise the real engine, dialect and migrations.
+The first run pulls `postgres:16-alpine` if it is not already local.
+
+To run the API locally against a PostgreSQL of your own:
+
+```bash
+docker run -d --name ecommerce-pg -p 5432:5432 \
+  -e POSTGRES_USER=ecommerce -e POSTGRES_PASSWORD=<your password> -e POSTGRES_DB=ecommerce \
+  postgres:16-alpine
+
+DB_HOST=localhost DB_PORT=5432 DB_NAME=ecommerce \
+DB_USERNAME=ecommerce DB_PASSWORD=<your password> \
+  java -jar target/ecommerce-api-0.1.0.jar
+```
+
+The connection details are environment variables in every environment, local or deployed, so
+nothing about the application changes between the two.
 
 ### First deployment
 
@@ -767,21 +1087,24 @@ npx cdk bootstrap aws://<account>/ap-southeast-1
 Then deploy one environment at a time, in dependency order:
 
 ```bash
-# 1. Network foundation
+# 1. Network foundation (VPC, subnets, security groups)
 npx cdk deploy ecommerce-network-dev -c environment=dev
 
 # 2. Registry (must exist before an image can be pushed)
 npx cdk deploy ecommerce-ecr-dev -c environment=dev
 
-# 3. Build and push the image (see "ECR: how an image is tagged and pushed")
+# 3. Database (instance + generated credentials secret)
+npx cdk deploy ecommerce-database-dev -c environment=dev
+
+# 4. Build and push the image (see "ECR: how an image is tagged and pushed")
 #    ...
 
-# 4. Compute (the service finds the image and starts a task)
+# 5. Compute (the service finds the image, the secret and the database endpoint)
 npx cdk deploy ecommerce-application-dev -c environment=dev
 ```
 
-`npx cdk deploy --all -c environment=dev` deploys all three stacks in the correct order in one go,
-but only after an image has been pushed for the first time; otherwise the ECS service starts with no
+`npx cdk deploy --all -c environment=dev` deploys all four stacks in the correct order in one go, but
+only after an image has been pushed for the first time; otherwise the ECS service starts with no
 image to run.
 
 Things that are easy to get wrong:
@@ -791,34 +1114,170 @@ Things that are easy to get wrong:
 - **The CDK CLI silently ignores unknown options.** A mistyped flag does not fail the command — it
   deploys the `cdk.json` default. Read the stack name in the output.
 - **Push the image before deploying the compute.** The service cannot start without it.
+- **Deploy the database before the compute.** The application stack imports its endpoint and secret.
 - **Pin the account per environment** before deploying anything other than dev.
 - **Deploy from a dedicated IAM principal or Identity Center role, not the account root user.**
-- **Deploying is not free:** NAT Gateways, an ALB and a running Fargate task all bill hourly.
+- **Deploying is not free:** NAT Gateways, an ALB, a running Fargate task and an RDS instance all
+  bill hourly.
 
 Deployment is **not** performed automatically by this repository: nothing in the build or test path
 runs `cdk deploy`.
 
 ---
 
+## Deployment and verification procedure
+
+An end-to-end check of Phase 3 in dev, from nothing to a row that survives a task replacement.
+Everything below is a manual operator action; nothing in this repository deploys.
+
+### 1. Deploy the foundation, registry and database
+
+```bash
+export ECOMMERCE_DEV_ACCOUNT=<account>       # PowerShell: $env:ECOMMERCE_DEV_ACCOUNT = "<account>"
+
+npx cdk deploy ecommerce-network-dev    -c environment=dev
+npx cdk deploy ecommerce-ecr-dev        -c environment=dev
+npx cdk deploy ecommerce-database-dev   -c environment=dev
+```
+
+Watch for `CREATE_COMPLETE` on the database stack — RDS takes several minutes to create the
+instance.
+
+### 2. Confirm the database is private
+
+```bash
+aws rds describe-db-instances --db-instance-identifier ecommerce-dev-db \
+  --query "DBInstances[0].{Public:PubliclyAccessible,MultiAZ:MultiAZ,Encrypted:StorageEncrypted,BackupDays:BackupRetentionPeriod}"
+# {"Public": false, "MultiAZ": false, "Encrypted": true, "BackupDays": 1}
+
+aws rds describe-db-instances --db-instance-identifier ecommerce-dev-db \
+  --query "DBInstances[0].DBSubnetGroup.Subnets[].SubnetAvailabilityZone.Name"
+# two different Availability Zones
+```
+
+There should be no route from the database subnets to the internet or to a NAT gateway:
+
+```bash
+aws ec2 describe-route-tables \
+  --filters "Name=association.subnet-id,Values=$(aws cloudformation list-exports \
+      --query "Exports[?Name=='ecommerce-dev-database-subnet-ids'].Value" --output text)" \
+  --query "RouteTables[].Routes"
+# each route table has only the implicit local route
+```
+
+### 3. Confirm the security group chain
+
+```bash
+aws ec2 describe-security-groups \
+  --group-ids "$(aws cloudformation list-exports \
+      --query "Exports[?Name=='ecommerce-dev-database-security-group-id'].Value" --output text)" \
+  --query "SecurityGroups[0].IpPermissions"
+# exactly one rule: TCP 5432, SourceSecurityGroupId = the application security group, no CidrIp
+```
+
+There must be **no** `0.0.0.0/0` rule on the database security group.
+
+### 4. Push the image and deploy the compute
+
+```bash
+docker build -t ecommerce-api:v0.1.0 application
+docker tag ecommerce-api:v0.1.0 <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-dev-api:v0.1.0
+aws ecr get-login-password --region ap-southeast-1 \
+  | docker login --username AWS --password-stdin <account>.dkr.ecr.ap-southeast-1.amazonaws.com
+docker push <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-dev-api:v0.1.0
+
+npx cdk deploy ecommerce-application-dev -c environment=dev
+```
+
+### 5. Confirm the migration ran and the API reads and writes PostgreSQL
+
+```bash
+ALB=$(aws cloudformation list-exports \
+  --query "Exports[?Name=='ecommerce-dev-api-url'].Value" --output text)
+
+curl "$ALB/api/products"
+# []
+
+curl -X POST "$ALB/api/products" -H 'Content-Type: application/json' \
+     -d '{"name":"Tablet","description":"10 inch","price":450.00,"quantity":12}'
+# {"id":1,...,"createdAt":"...","updatedAt":"..."}
+
+curl "$ALB/api/products/1"
+# {"id":1,"name":"Tablet",...}
+
+curl "$ALB/actuator/health"
+# {"status":"UP"}
+```
+
+The Flyway migration is recorded in the container log at startup:
+
+```bash
+aws logs tail /ecs/ecommerce-dev-api --since 10m | grep -i flyway
+# Successfully applied 1 migration to schema "public", now at version v1
+```
+
+### 6. Confirm the data is really in the database
+
+The task cannot reach the internet, so the simplest check is to force a task replacement and see the
+row survive — the data is in RDS, not in the container:
+
+```bash
+aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-api --force-new-deployment
+aws ecs wait services-stable --cluster ecommerce-dev-cluster --services ecommerce-dev-api
+
+curl "$ALB/api/products/1"
+# {"id":1,"name":"Tablet",...}   <- still there, from a different task
+```
+
+### 7. Confirm no credential is exposed
+
+```bash
+aws ecs describe-task-definition --task-definition ecommerce-dev-api-task \
+  --query "taskDefinition.containerDefinitions[0].{env:environment,secrets:secrets}"
+# environment: DB_HOST / DB_PORT / DB_NAME only
+# secrets:     DB_USERNAME / DB_PASSWORD, each a valueFrom reference into Secrets Manager
+```
+
+No password appears anywhere in that output, in the task definition, in the image or in this
+repository.
+
+### 8. Tear down (dev only)
+
+```bash
+npx cdk destroy ecommerce-application-dev -c environment=dev
+npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
+npx cdk destroy ecommerce-ecr-dev         -c environment=dev
+npx cdk destroy ecommerce-network-dev     -c environment=dev
+```
+
+Dev has `deletionProtection: false` and `RemovalPolicy.DESTROY` precisely so this works. In uat/prod
+the destroy is refused until deletion protection is switched off — which is the point.
+
+---
+
 ## Testing
 
-`npm test` in `ecommerce-infrastructure/` runs **85 Jest tests** over the synthesised CloudFormation
-templates and the configuration modules — 31 for the network stack, 26 for the application stack, 6
-for the registry stack and 22 for the configuration. `mvn test` in `application/` runs **6 Spring Boot
-tests** over the API.
+`npm test` in `ecommerce-infrastructure/` runs **115 Jest tests** over the synthesised CloudFormation
+templates and the configuration modules — 33 for the network stack, 18 for the database stack, 29 for
+the application stack, 6 for the registry stack and 29 for the configuration. `mvn test` in
+`application/` runs **13 Spring Boot tests** — 9 end-to-end HTTP tests against a real PostgreSQL and 4
+service unit tests — and needs a Docker daemon.
 
-Network (Phase 1):
+Network (Phase 1, Phase 3):
 
 - the VPC exists, with the configured CIDR and DNS support, and a different CIDR per environment
-- two Availability Zones in dev and uat, three in prod, with one public and one private subnet each
+- two Availability Zones in dev and uat, three in prod, with one public, one private and one isolated
+  subnet each
 - public subnets do not auto-assign public IPs
 - an Internet Gateway exists and both public route tables send `0.0.0.0/0` to it
 - exactly one NAT Gateway in dev, one per AZ in prod, each in a public subnet with an Elastic IP
 - both private route tables send `0.0.0.0/0` to a NAT Gateway and never to the Internet Gateway
+- the isolated database subnets have route tables with **no routes at all**, so there is no path to
+  the internet gateway or to a NAT gateway
 - the three tier security groups exist; only the ALB accepts `0.0.0.0/0` inbound
 - the application and database tiers are reachable only by security group reference
 - the project, environment and management tags are present on every resource
-- the VPC and subnet outputs exist, with one subnet id per Availability Zone
+- the VPC, public, private and database subnet outputs exist, with one subnet id per Availability Zone
 - flow logs are off in dev and capture all traffic in prod, with a scoped delivery policy
 
 Registry (Phase 2):
@@ -827,12 +1286,35 @@ Registry (Phase 2):
 - untagged images expire; the repository is emptied on delete in dev and retained in prod
 - the repository is tagged and its push URI is exported
 
-Application (Phase 2):
+Database (Phase 3):
+
+- one PostgreSQL instance per environment, with the engine version, class, storage and database name
+  from the configuration
+- the instance is never publicly accessible, and its DB subnet group contains the two isolated
+  database subnets and no application or public subnet
+- the instance carries the Phase 1 database security group; the database stack creates **no** security
+  group, **no** ingress rule and no `0.0.0.0/0` anywhere
+- storage is encrypted with gp3; automated backups are on with 1/7/30 day retention
+- deletion protection is off in dev and on in uat/prod; the removal policy is `DESTROY` in dev and
+  `RETAIN` in uat/prod, and `deleteAutomatedBackups` follows it
+- Multi-AZ is off in dev/uat and on in prod
+- the password is generated by Secrets Manager (no literal password appears in the template), the
+  instance reads it as a dynamic reference, and the secret is destroyed with dev but retained with
+  uat/prod
+- no administrator, power-user or AWS-managed policy appears anywhere
+- the instance and the secret carry the project, environment and management tags
+- the endpoint, port, database name and secret ARN are exported
+
+Application (Phase 2, Phase 3):
 
 - the cluster, task definition and service exist; the task is Fargate with `awsvpc` networking
 - the task is sized 512/1024 in dev and 1024/2048 in prod, and never references a `latest` image
 - the container exposes port 8080 and logs to the dedicated log group
-- the execution role has only scoped ECR pull and log write permissions, with no wildcard action
+- the container receives `DB_HOST`, `DB_PORT` and `DB_NAME` as plain environment variables, and
+  `DB_USERNAME`/`DB_PASSWORD` as **secret references**, not values
+- the application stack defines no database instance and no secret of its own
+- the execution role has only scoped ECR pull, log write and secret read permissions, with no wildcard
+  action and no `kms:` action; its only `*` resource is `ecr:GetAuthorizationToken`
 - the task role has no permissions at all; no administrator or power-user policy appears anywhere
 - the service runs exactly one task, in the private subnets, without a public IP, in the application
   security group, with the circuit breaker enabled
@@ -845,21 +1327,32 @@ Configuration:
 - valid per environment, non-overlapping CIDRs, no hardcoded account ids, no secrets
 - unknown environment names are rejected
 - invalid Fargate cpu/memory pairs, ports, health check paths and `latest` image tags are rejected
+- invalid PostgreSQL identifiers, reserved master user names, too-small storage, a backup retention
+  outside 1–35 days, and deletion protection combined with `DESTROY` are all rejected
+- the database configuration never contains a password
 - the image tag is resolved from CDK context, then `IMAGE_TAG`, then configuration
 
-Spring Boot:
+Spring Boot (Phase 3):
 
-- the seeded products are listed and a single product is returned by id
-- an unknown id returns `404`; a product without a name returns `400`
-- creating a product returns `201` with a server-assigned id
-- `/actuator/health` reports `UP`
+- the tests run against a real PostgreSQL 16 container, migrated by the same Flyway migration the
+  deployment uses, so the engine, the dialect and the schema are the ones that matter
+- an empty table returns `[]`, and an unknown id returns `404`
+- creating a product returns `201` with a database-assigned id and populated timestamps, and the row
+  is then readable through `GET` — proving the data went to PostgreSQL, not to a field
+- products come back ordered by id
+- an omitted `quantity` defaults to zero
+- a missing or blank name, a price of zero or less, a missing price and a negative quantity are all
+  rejected with `400`, and nothing is written
+- the service maps a request onto an entity, defaults an omitted quantity and sorts by id
+- `/actuator/health` reports `UP`, which includes a successful database check
 
 ---
 
 ## Cost expectations
 
 Phase 1 is mostly free; the cost is NAT Gateways and (in uat/prod) flow logs. Phase 2 adds the
-always-on compute.
+always-on compute. Phase 3 adds the database, which is the one component that keeps costing while
+nothing is running.
 
 | Item | Rough cost driver |
 | ---- | ----------------- |
@@ -869,43 +1362,60 @@ always-on compute.
 | VPC Flow Logs | CloudWatch Logs ingestion per GB, plus storage |
 | **Application Load Balancer** | hourly charge + LCU (connections, bandwidth, rules) |
 | **Fargate task** | per vCPU-hour and per GB-hour while the task runs |
+| **RDS instance** | per instance-hour while it exists, whether or not it is queried |
+| **RDS Multi-AZ** | doubles the instance charge (prod only) |
+| **RDS storage and backups** | per GB-month of gp3 storage, plus backup storage beyond the free amount |
+| **Secrets Manager** | per secret-month, plus a small charge per 10,000 API calls |
 | **CloudWatch Logs** | ingestion per GB, plus storage per retention period |
 | ECR storage | per GB-month, plus a small charge for scanning |
 | The default-SG cleanup Lambda | one invocation per stack create/update |
 
 The `dev` configuration is deliberately the cheapest (one NAT Gateway, no flow logs, the smallest
-sensible Fargate task) while remaining topologically identical to prod, so a change tested in dev
-behaves the same way in prod. The single biggest ongoing cost in Phase 2 is the running Fargate task
-plus the load balancer, both billed by the hour — `npx cdk destroy` (or, in uat/prod, a deliberate
-scale-to-zero) stops that spend.
+sensible Fargate task, a single small RDS instance with one day of backups) while remaining
+topologically identical to prod, so a change tested in dev behaves the same way in prod.
+
+The two biggest ongoing costs are the RDS instance and the Fargate task, both billed by the hour
+whether or not they are used, followed by the load balancer. `npx cdk destroy` stops all three;
+there is no scale-to-zero for a database, which is exactly why dev is configured to be destroyable
+and why prod is configured not to be destroyed by accident.
 
 ---
 
-## Phase 3 and beyond
+## Phase 4 and beyond
 
 The platform is designed so the next phase attaches resources without redesigning what exists:
 
 ```
-                 Phase 3
+                 Phase 4
                     │
                     ▼
-            RDS (private, Multi-AZ)     ← private subnets, Database SG
-                    │
             ElastiCache (Redis)         ← private subnets, Database SG
                     │
             Auto scaling (ECS)          ← varies the desired count at runtime
                     │
             HTTPS: certificate + 443 listener + 80 → 443 redirect
                     │
-            Secrets Manager, S3, SQS/SNS
+            S3, SQS/SNS, customer managed KMS keys
+                    │
+            API Gateway, Cognito, CloudFront/Route 53/WAF, CI/CD
 ```
 
-Phase 3 will add a database (the application's in-memory service becomes a real repository), a cache,
-ECS auto scaling (which is what actually makes production resilient to losing a task), TLS
-termination on the load balancer, and the stateful-resource protections listed above. Later phases add
-API Gateway, Cognito, CloudFront/Route 53/WAF, and CI/CD.
+Phase 3 delivered the database, the schema migrations and the credential path. What is still ahead:
 
-Nothing built so far needs to change for those to land: the subnets, route tables, security groups,
-outputs, task role and container definition are already in place. The one deliberate Phase 2
-limitation — `desiredCount = 1`, so losing the task briefly removes the only instance — is resolved by
-auto scaling in Phase 3.
+- **A cache** (ElastiCache) in the same private subnets, behind the same database security group
+  pattern.
+- **ECS auto scaling**, which is what actually makes production resilient to losing a task. The one
+  deliberate remaining limitation is `desiredCount = 1` everywhere: losing the task briefly removes
+  the only instance, and the ECS service replaces it, but there is a gap.
+- **TLS on the load balancer**: an ACM certificate, a 443 listener and a redirect from 80. Today the
+  listener speaks plain HTTP on port 80 only.
+- **Object storage, queues and topics**, plus customer managed KMS keys for the database, the secret
+  and those resources.
+- **API Gateway, Cognito, CloudFront/Route 53/WAF and CI/CD** in the phases after that.
+
+Nothing built so far needs to change for those to land. The network already separates public,
+private and isolated subnets; the security groups already model the tiers by reference; the outputs,
+tags and IAM split are in place; and the task definition already takes its database connection from
+the environment, so pointing it at a different database is a stack parameter rather than a code
+change. The application's own schema is versioned by Flyway, so a later phase can add tables without
+touching the ones already deployed.

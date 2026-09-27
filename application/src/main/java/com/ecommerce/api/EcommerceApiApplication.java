@@ -6,9 +6,10 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 /**
  * Entry point of the e-commerce product API.
  *
- * The application is intentionally minimal: it serves in-memory product data over REST and exposes
- * the Actuator health endpoint the load balancer health check depends on. There is no database, no
- * cache and no authentication in this phase.
+ * The application serves product data over REST, backed by PostgreSQL through Spring Data JPA, and
+ * exposes the Actuator health endpoint the load balancer health check depends on. The schema is
+ * owned by Flyway; the credentials come from the environment, injected from Secrets Manager by ECS.
+ * There is no cache and no authentication in this phase.
  */
 @SpringBootApplication
 public class EcommerceApiApplication {

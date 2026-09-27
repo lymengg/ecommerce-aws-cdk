@@ -15,7 +15,7 @@
   <artifactId>ecommerce-api</artifactId>
   <version>0.1.0</version>
   <name>ecommerce-api</name>
-  <description>Minimal Spring Boot product API for the e-commerce platform</description>
+  <description>Spring Boot product API backed by PostgreSQL for the e-commerce platform</description>
 
   <properties>
     <java.version>21</java.version>
@@ -34,6 +34,47 @@
       <artifactId>spring-boot-starter-actuator</artifactId>
     </dependency>
 
+    <!--
+      Spring Data JPA on Hibernate: the Product entity, the repository and the transaction
+      management that the service layer relies on.
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-jpa</artifactId>
+    </dependency>
+
+    <!-- Jakarta Bean Validation, used by the request DTO annotations (@NotBlank, @Positive, ...). -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-validation</artifactId>
+    </dependency>
+
+    <!--
+      Flyway owns the schema. The application never creates or alters a table itself: it validates
+      the entities against what Flyway has already migrated, so a mismatch fails the deployment
+      instead of the first query.
+
+      Spring Boot 4 modularised its auto-configuration, so the Flyway auto-configuration now lives
+      in spring-boot-flyway rather than in spring-boot-autoconfigure: flyway-core alone would be on
+      the classpath without ever being wired up. The dialect module is still required separately,
+      because Flyway 10+ moved database support out of the core jar.
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-flyway</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.flywaydb</groupId>
+      <artifactId>flyway-database-postgresql</artifactId>
+    </dependency>
+
+    <!-- PostgreSQL JDBC driver. -->
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>runtime</scope>
+    </dependency>
+
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-test</artifactId>
@@ -47,6 +88,22 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-webmvc-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      The tests run against a real PostgreSQL, not an in-memory stand-in: H2 does not enforce the
+      same constraints, does not speak the same dialect, and would happily pass a schema Flyway
+      could never create. The container image matches the major version the database stack deploys.
+    -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

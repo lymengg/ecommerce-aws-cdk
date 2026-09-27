@@ -1,7 +1,24 @@
+import { RemovalPolicy } from 'aws-cdk-lib';
+
 import { EnvironmentConfig } from './types';
 
 /** Minimal IPv4 CIDR validation: dotted quad plus prefix length. */
 const IPV4_CIDR = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
+
+/** PostgreSQL identifiers we generate: lower case, starts with a letter, digits and underscores. */
+const POSTGRES_IDENTIFIER = /^[a-z][a-z0-9_]{0,62}$/;
+
+/**
+ * Master user names RDS reserves for itself. Asking for one of these makes the instance fail to
+ * create, which is far too late to discover.
+ */
+const RESERVED_MASTER_USERNAMES = ['postgres', 'rdsadmin', 'admin', 'root', 'rds_superuser'];
+
+/** RDS accepts a backup retention between 0 (disabled) and 35 days. */
+const MAX_BACKUP_RETENTION_DAYS = 35;
+
+/** Smallest storage RDS accepts for a gp3 volume. */
+const MIN_ALLOCATED_STORAGE_GB = 20;
 
 /** Inclusive integer range, used to spell out the larger Fargate memory tiers compactly. */
 function range(start: number, end: number, step: number): number[] {
@@ -49,6 +66,7 @@ export function assertValidEnvironmentConfig(config: EnvironmentConfig): void {
   }
 
   assertValidApplicationConfig(config.application, fail);
+  assertValidDatabaseConfig(config.database, fail);
 }
 
 /**
@@ -94,3 +112,46 @@ function assertValidApplicationConfig(
     fail('application.imageTag must be an immutable tag; "latest" is not allowed.');
   }
 }
+
+/**
+ * Validates the database tier configuration against the limits RDS enforces. The engine rejects an
+ * invalid storage size, backup window or reserved user name when the instance is created, which is
+ * the worst possible time to find out, so the same rules are checked here.
+ */
+function assertValidDatabaseConfig(
+  database: EnvironmentConfig['database'],
+  fail: (message: string) => never,
+): void {
+  if (!POSTGRES_IDENTIFIER.test(database.databaseName)) {
+    fail(`database.databaseName "${database.databaseName}" is not a valid PostgreSQL identifier.`);
+  }
+  if (!POSTGRES_IDENTIFIER.test(database.masterUsername)) {
+    fail(`database.masterUsername "${database.masterUsername}" is not a valid PostgreSQL identifier.`);
+  }
+  if (RESERVED_MASTER_USERNAMES.includes(database.masterUsername)) {
+    fail(
+      `database.masterUsername "${database.masterUsername}" is reserved by RDS. ` +
+        `Expected anything but: ${RESERVED_MASTER_USERNAMES.join(', ')}.`,
+    );
+  }
+  if (!Number.isInteger(database.allocatedStorageGb) || database.allocatedStorageGb < MIN_ALLOCATED_STORAGE_GB) {
+    fail(
+      `database.allocatedStorageGb must be an integer of at least ${MIN_ALLOCATED_STORAGE_GB} GiB, ` +
+        `got ${database.allocatedStorageGb}.`,
+    );
+  }
+  if (
+    !Number.isInteger(database.backupRetentionDays) ||
+    database.backupRetentionDays < 1 ||
+    database.backupRetentionDays > MAX_BACKUP_RETENTION_DAYS
+  ) {
+    fail(
+      `database.backupRetentionDays must be between 1 and ${MAX_BACKUP_RETENTION_DAYS} days ` +
+        `(automated backups are required), got ${database.backupRetentionDays}.`,
+    );
+  }
+  if (database.deletionProtection && database.removalPolicy === RemovalPolicy.DESTROY) {
+    fail('database.deletionProtection cannot be enabled while database.removalPolicy is DESTROY.');
+  }
+}
+

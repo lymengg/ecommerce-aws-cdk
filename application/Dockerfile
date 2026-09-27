@@ -34,5 +34,6 @@ EXPOSE 8080
 
 # MaxRAMPercentage makes the JVM size its heap from the container memory limit
 # rather than the host's total memory. No secrets are baked into the image: the
-# task role supplies credentials at runtime, if the application ever needs them.
+# database credentials are injected by ECS from Secrets Manager when the
+# container starts, and never exist as a file in this image.
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]
