@@ -1,5 +1,6 @@
 package com.ecommerce.api.support;
 
+import java.util.Map;
 import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.webmvc.test.autoconfigure.MockMvcBuilderCustomizer;
 import org.springframework.context.annotation.Bean;
@@ -45,6 +46,10 @@ public class TestSecurityConfiguration {
                 .issuerUri("https://cognito-idp.example.com")
                 .userNameAttributeName("cognito:username")
                 .clientName("Cognito")
+                // Cognito advertises its (non-standard) logout endpoint in discovery; the logout
+                // handler reads it from here.
+                .providerConfigurationMetadata(
+                        Map.of("end_session_endpoint", "https://cognito-idp.example.com/logout"))
                 .build();
 
         return new InMemoryClientRegistrationRepository(registration);

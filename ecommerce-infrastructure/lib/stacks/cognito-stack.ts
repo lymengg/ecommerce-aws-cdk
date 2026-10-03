@@ -150,9 +150,11 @@ export class CognitoStack extends Stack {
           `http://localhost:${LOCAL_API_PORT}${CALLBACK_PATH}`,
         ],
         // RP-initiated logout: after Cognito clears its session the browser returns to the SPA, not
-        // the API - the user should land on the frontend, not on an API response. The URL is exact
-        // (no wildcard) and is what the application sends as the post-logout redirect.
-        logoutUrls: [auth.logoutUrl],
+        // the API. The registered set is the deployed frontend URL plus every origin the frontend
+        // legitimately runs on (the CORS allowlist) - in dev and uat that adds the local Vite dev
+        // server, so a developer can log out locally as well as from the deployed SPA. Exact URLs,
+        // never wildcards.
+        logoutUrls: [...new Set([auth.frontendUrl, ...auth.allowedOrigins])],
       },
       accessTokenValidity: auth.accessTokenValidity,
       idTokenValidity: auth.idTokenValidity,
@@ -164,20 +166,21 @@ export class CognitoStack extends Stack {
       enableTokenRevocation: true,
     });
 
-    // The authentication flows are set through the escape hatch rather than the L2 `authFlows`
-    // property, because that property cannot be combined with refresh token rotation: when a
-    // rotation grace period is set, CDK omits `ALLOW_REFRESH_TOKEN_AUTH` from `ExplicitAuthFlows`,
-    // which would break token refresh. The explicit list is the smallest secure set:
+    // The explicit auth flows are pinned to the single one the platform uses. SRP is how the
+    // managed login pages sign a user in.
     //
-    //   ALLOW_USER_SRP_AUTH        the managed login pages sign the user in with SRP
-    //   ALLOW_REFRESH_TOKEN_AUTH   the BFF refreshes silently, with rotation
+    // `ALLOW_REFRESH_TOKEN_AUTH` is deliberately **absent**, and Cognito enforces that: it rejects
+    // the combination with an error - "ALLOW_REFRESH_TOKEN_AUTH is not a permitted ExplicitAuthFlow
+    // when refresh token rotation is enabled". Refresh still works; with rotation on, the refresh
+    // token is single-use and the refresh flow is implicit. (This is also why the L2 `authFlows`
+    // property omits it when a rotation grace period is set.)
     //
-    // `ALLOW_USER_PASSWORD_AUTH` is deliberately absent - RFC 9700 deprecates the resource owner
-    // password credentials grant, so there is no scriptable password login - as is
-    // `ALLOW_ADMIN_USER_PASSWORD_AUTH`. `ALLOW_CUSTOM_AUTH` is absent because no Lambda triggers
-    // are configured; Cognito's own default would otherwise enable it.
+    // `ALLOW_USER_PASSWORD_AUTH` is absent because RFC 9700 deprecates the resource owner password
+    // credentials grant - no scriptable password login exists - as is
+    // `ALLOW_ADMIN_USER_PASSWORD_AUTH`. `ALLOW_CUSTOM_AUTH` is absent because no Lambda triggers are
+    // configured; Cognito's own default would otherwise enable it.
     const cfnClient = this.userPoolClient.node.defaultChild as CfnUserPoolClient;
-    cfnClient.addPropertyOverride('ExplicitAuthFlows', ['ALLOW_USER_SRP_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH']);
+    cfnClient.addPropertyOverride('ExplicitAuthFlows', ['ALLOW_USER_SRP_AUTH']);
 
     this.issuerUrl = this.userPool.userPoolProviderUrl;
 

@@ -119,23 +119,37 @@ describe('DnsStack certificate', () => {
     expect(certificate.properties.DomainName).toBe('www.dev.example.com');
   });
 
+  test('covers the apex as well, because the SPA is served there', () => {
+    const certificate = single(buildStacks('dev').template, 'AWS::CertificateManager::Certificate');
+
+    expect(certificate.properties.SubjectAlternativeNames).toEqual(['dev.example.com']);
+  });
+
   test('is DNS validated against the hosted zone it creates', () => {
     const { template } = buildStacks('dev');
     const zone = single(template, 'AWS::Route53::HostedZone');
     const certificate = single(template, 'AWS::CertificateManager::Certificate');
 
-    // A single domain validation option that points ACM at the hosted zone, so ACM creates and
-    // renews the validation CNAME itself - no email approval, no manual record.
-    expect(certificate.properties.DomainValidationOptions).toHaveLength(1);
-    expect(certificate.properties.DomainValidationOptions[0].DomainName).toBe('api.dev.example.com');
-    expect(json(certificate.properties.DomainValidationOptions[0].HostedZoneId)).toContain(zone.logicalId);
+    // One validation option per name, both pointing ACM at the hosted zone, so ACM creates and
+    // renews the validation CNAMEs itself - no email approval, no manual record.
+    const options = certificate.properties.DomainValidationOptions as {
+      DomainName: string;
+      HostedZoneId: unknown;
+    }[];
+    expect(options.map((option) => option.DomainName).sort()).toEqual(['api.dev.example.com', 'dev.example.com']);
+    for (const option of options) {
+      expect(json(option.HostedZoneId)).toContain(zone.logicalId);
+    }
   });
 
-  test('covers only the API name - no wildcard and no extra subject alternative names', () => {
+  test('covers exactly the API name and the apex - no wildcard', () => {
     const certificate = single(buildStacks('dev').template, 'AWS::CertificateManager::Certificate');
 
+    expect(certificate.properties.DomainName).toBe('api.dev.example.com');
     expect(certificate.properties.DomainName).not.toContain('*');
-    expect(certificate.properties.SubjectAlternativeNames).toBeUndefined();
+    for (const name of certificate.properties.SubjectAlternativeNames ?? []) {
+      expect(name).not.toContain('*');
+    }
   });
 });
 

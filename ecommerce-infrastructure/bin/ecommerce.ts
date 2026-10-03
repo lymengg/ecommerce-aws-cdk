@@ -9,6 +9,7 @@ import { CognitoStack } from '../lib/stacks/cognito-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
+import { FrontendStack } from '../lib/stacks/frontend-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
 const app = new App();
@@ -23,6 +24,9 @@ const config = getEnvironmentConfig(environment);
 const deployedConfig: EnvironmentConfig = {
   ...config,
   application: { ...config.application, imageTag: resolveImageTag(config, app) },
+  // The frontend image has its own default tag but honours the same override, so one release tag can
+  // pin both images.
+  frontend: { ...config.frontend, imageTag: resolveImageTag(config, app, config.frontend.imageTag) },
 };
 
 const network = new NetworkStack(app, `ecommerce-network-${environment}`, {
@@ -95,8 +99,8 @@ const dns =
 if (config.dns === undefined || dns === undefined) {
   throw new Error(`Phase 4 authentication requires a delegated domain for environment "${environment}".`);
 }
-// The browser lands on the SPA after logout; the URL is registered in the app client's logoutUrls.
-const logoutUrl = config.auth.logoutUrl;
+// The SPA: where the browser lands after login and after logout, and a registered logout URI.
+const frontendUrl = config.auth.frontendUrl;
 
 const cognito = new CognitoStack(app, `ecommerce-cognito-${environment}`, {
   env: {
@@ -113,7 +117,7 @@ const cognito = new CognitoStack(app, `ecommerce-cognito-${environment}`, {
 // stacks: network, registry, database, dns and cognito must exist before compute can attach to
 // them. The references are by object, never by ARN string, and there is no path back from any
 // producer to the application stack, so the dependency graph stays acyclic.
-new ApplicationStack(app, `ecommerce-application-${environment}`, {
+const application = new ApplicationStack(app, `ecommerce-application-${environment}`, {
   env: {
     account: config.account,
     region: config.region,
@@ -134,7 +138,40 @@ new ApplicationStack(app, `ecommerce-application-${environment}`, {
     issuerUrl: cognito.issuerUrl,
     userPoolClientId: cognito.userPoolClient.userPoolClientId,
     clientSecret: cognito.clientSecret,
-    logoutUrl,
+    frontendUrl,
   },
   description: `E-commerce platform application compute (${environment})`,
+});
+
+// Phase 4.5 frontend: the Nuxt SPA, served by nginx as a second Fargate service behind the load
+// balancer that already exists, on the apex of the delegated subdomain. The SPA and the API are then
+// same-site, which is what lets the BFF's session cookie work across them.
+//
+// Deploy order: ... -> application -> frontend. The frontend consumes the ECS cluster, the HTTPS
+// listener, the load balancer, the application security group and the frontend repository, all by
+// reference - so it is deployed after the compute and can be redeployed on its own.
+//
+// A CloudFront distribution would be the natural CDN in front of this service, but this account
+// cannot create CloudFront resources until AWS Support verifies it; the load balancer serves the
+// files directly until then, and adding the distribution later needs no change here.
+const httpsListener = application.api.httpsListener;
+if (httpsListener === undefined) {
+  // config.dns is required, so the certificate and the HTTPS listener always exist.
+  throw new Error(`The frontend requires the HTTPS listener for environment "${environment}".`);
+}
+
+new FrontendStack(app, `ecommerce-frontend-${environment}`, {
+  env: {
+    account: config.account,
+    region: config.region,
+  },
+  config: deployedConfig,
+  repository: registry.frontendRepository,
+  cluster: application.cluster,
+  applicationSecurityGroup: network.securityGroups.application,
+  loadBalancer: application.api.loadBalancer,
+  albSecurityGroup: network.securityGroups.alb,
+  httpsListener,
+  zone: dns.zone,
+  description: `E-commerce platform frontend hosting (${environment})`,
 });

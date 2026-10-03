@@ -19,7 +19,7 @@ public final class TestAuthProperties {
         registry.add("COGNITO_ISSUER_URI", () -> "https://cognito-idp.example.com");
         registry.add("COGNITO_CLIENT_ID", () -> "test-client-id");
         registry.add("COGNITO_CLIENT_SECRET", () -> "test-client-secret");
-        registry.add("COGNITO_LOGOUT_URI", () -> "http://localhost:8080/logout");
+        registry.add("FRONTEND_URL", () -> "http://localhost:5173");
         registry.add("CORS_ALLOWED_ORIGINS", () -> "http://localhost:5173");
         registry.add("SESSION_TIMEOUT", () -> "PT30M");
     }

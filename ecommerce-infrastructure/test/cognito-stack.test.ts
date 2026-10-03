@@ -176,13 +176,21 @@ describe('CognitoStack app client', () => {
     }
   });
 
-  test('registers the frontend as the only post-logout URI', () => {
+  test('registers the frontend origins as post-logout URIs, never the API', () => {
     const client = single(buildStacks('dev').template, 'AWS::Cognito::UserPoolClient');
 
-    // The browser lands on the SPA after logout, not on the API, and the URI is exact.
-    expect(client.properties.LogoutURLs).toEqual(['http://localhost:5173']);
+    // The browser lands on the SPA after logout: the deployed apex and the local dev server. The
+    // URIs are exact - no wildcard, and no API path.
+    expect(client.properties.LogoutURLs).toEqual(['https://dev.example.com', 'http://localhost:5173']);
     expect(json(client.properties.LogoutURLs)).not.toContain('*');
     expect(json(client.properties.LogoutURLs)).not.toContain('/logout');
+  });
+
+  test('registers only the apex as a post-logout URI in production', () => {
+    const client = single(buildStacks('prod').template, 'AWS::Cognito::UserPoolClient');
+
+    // Production's CORS allowlist is the apex alone, so no localhost origin leaks in.
+    expect(client.properties.LogoutURLs).toEqual(['https://prod.example.com']);
   });
 
   test('takes the token lifetimes from configuration, in minutes', () => {
@@ -206,10 +214,13 @@ describe('CognitoStack app client', () => {
     expect(client.properties.RefreshTokenRotation).toEqual({ Feature: 'ENABLED', RetryGracePeriodSeconds: 60 });
   });
 
-  test('enables only SRP and refresh auth flows, never the password grant', () => {
+  test('enables only the SRP auth flow, never the password grant', () => {
     const client = single(buildStacks('dev').template, 'AWS::Cognito::UserPoolClient');
 
-    expect(client.properties.ExplicitAuthFlows).toEqual(['ALLOW_USER_SRP_AUTH', 'ALLOW_REFRESH_TOKEN_AUTH']);
+    expect(client.properties.ExplicitAuthFlows).toEqual(['ALLOW_USER_SRP_AUTH']);
+    // Cognito rejects ALLOW_REFRESH_TOKEN_AUTH alongside refresh token rotation; the refresh flow is
+    // implicit when rotation is on.
+    expect(json(client.properties)).not.toContain('ALLOW_REFRESH_TOKEN_AUTH');
     // RFC 9700 deprecates the resource owner password credentials grant: no password login exists.
     expect(json(client.properties)).not.toContain('ALLOW_USER_PASSWORD_AUTH');
     expect(json(client.properties)).not.toContain('ALLOW_ADMIN_USER_PASSWORD_AUTH');

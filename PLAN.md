@@ -10,6 +10,7 @@ Phase 2   Compute & Containers           ✅ done
 Phase 3   Database & Persistence         ✅ done
 Phase 3.5 TLS & DNS                      ✅ done
 Phase 4   Authentication & Authorization ✅ done
+Phase 4.5 Frontend (Nuxt SPA on AWS)     ✅ done
 Phase 5   Messaging & Event-Driven       ← next
 Phase 6   Caching & Performance
 Phase 7   Observability & Security
@@ -104,6 +105,68 @@ unauthenticated. Enforced by claim, never by endpoint secrecy.
 **Concepts:** user pools vs identity pools, BFF vs SPA-held tokens, OIDC auth-code + PKCE,
 confidential vs public clients, claim-to-authority mapping, CSRF for SPAs, session cookies and
 `SameSite`, RP-initiated logout and token rotation, why ALB `authenticate-oidc` is not enough.
+
+## Phase 4.5 — Frontend (Nuxt SPA on AWS) ✅
+
+Pulled ahead of Phase 5 at the user's request: the browser client is what makes Phase 4's BFF
+pattern observable, and it is the thing that will exercise Phase 5's order endpoints.
+
+**Delivered:** a Nuxt 4 storefront (`frontend/`) built as a **client-only SPA** (`ssr: false`) - a
+Nuxt SSR server would never receive the API-scoped `httpOnly` session cookie - with Nuxt UI and
+Tailwind. It signs in and out through the BFF, calls the API with `credentials: 'include'` and a
+CSRF token from `GET /csrf`, and never holds a token. Pages: catalog (search/sort), product detail,
+client-side cart (Pinia + `localStorage`), a checkout screen that is UI-only until Phase 5 wires
+orders, an account page reading `/me`, and an admin create page surfaced only for `ROLE_admin` (and
+enforced by the API).
+
+**Hosting:** `ecommerce-frontend-<env>` - nginx as a second Fargate service behind the load balancer
+that already exists, with a host rule on the HTTPS listener sending the apex to it, IPv4/IPv6 alias
+records, and no new security group rule (the load balancer already reaches the application group on
+the container port). The SPA (apex) and the API (`api.<env-domain>`) are same-site, which is what lets
+the `SameSite=Lax` session cookie work. The image is a two-stage build into `nginx-unprivileged`, and
+nginx renders its CSP from an `API_ORIGIN` environment variable at container start, so one image
+serves every environment.
+
+A CloudFront distribution over a private S3 bucket was built first and **could not be deployed**:
+this account cannot create CloudFront resources until AWS Support verifies it. It was removed rather
+than left as dead, undeployable code, and Phase 6 brings CloudFront back as a CDN *in front of this
+same service* - no application change.
+
+**Small API additions:** `GET /csrf` (the double-submit cookie is unreadable cross-origin, so the SPA
+is handed the token, header name and form field name - one value for both a write and the logout
+form) and an OAuth2 login-success redirect to the SPA; the config field `auth.logoutUrl` became
+`auth.frontendUrl`, since it is now both the login and logout landing.
+
+**Correctness note:** Cognito does **not** implement OIDC RP-Initiated Logout, so Spring's
+`OidcClientInitiatedLogoutSuccessHandler` (which sends `post_logout_redirect_uri`) does not work
+against it - the local session would end but the Cognito session and refresh token would survive.
+`CognitoLogoutSuccessHandler` builds Cognito's own `/logout?client_id&logout_uri` URL instead. The
+session cookie is also `__Host-`-prefixed, and the post-login redirect is validated as a same-origin
+path so it cannot become an open redirect.
+
+**Deploy-time lesson:** the first real deploy failed on the app client with
+"ALLOW_REFRESH_TOKEN_AUTH is not a permitted ExplicitAuthFlow when refresh token rotation is
+enabled". The unit tests could not catch it — it is a service-side constraint, not a template
+shape — and the CDK L2 was right to omit the flow. Pinning `ExplicitAuthFlows` to `ALLOW_USER_SRP_AUTH`
+alone is the correct configuration.
+
+**Acceptance:** the deployed storefront answers `200` on the apex and on every client-side route with
+no redirect, serves the API origin in its CSP, and the API answers `401` (not a redirect) to an
+anonymous `/me`; `npm test` (Vitest) and `npm run typecheck` are green; `cdk synth` includes the
+frontend stack; the sign-in -> cart -> admin-create -> sign-out flow is verified by hand.
+
+**Concepts:** static hosting vs SSR, ALB host-based routing, host rules and listener re-import across
+stacks, Fargate task sizing, SPA fallback and why `$uri/` must be omitted, cache-control for hashed
+assets vs the app shell, CSP and security headers, envsubst-templated container config, cross-origin
+cookies and SameSite, double-submit CSRF across origins.
+
+**Deploy-time lessons:** Cognito rejects `ALLOW_REFRESH_TOKEN_AUTH` when refresh-token rotation is
+enabled (a service-side constraint no unit test can see); an explicit S3 bucket name collides in the
+global namespace (CloudFormation now generates it); rotating a certificate in use deadlocks the
+producer stack until the consumer switches, which is why a replaced certificate needs the consumer
+deployed first; and a strict `script-src 'self'` blocks Nuxt's inline import map, so the policy
+allows them by hash computed at build time - with the image verified to start locally before it is
+pushed, which is what would have caught the `set` directive taking exactly two arguments.
 
 ## Phase 5 — Messaging & Event-Driven ⬜
 

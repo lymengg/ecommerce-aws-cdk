@@ -6,10 +6,13 @@ import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
 
 import { EnvironmentConfig } from './types';
 
+/** The delegated subdomain, required from Phase 4 on (auth needs an HTTPS origin). */
+const domain = process.env.ECOMMERCE_DEV_DOMAIN;
+
 /**
  * Optional override for the frontend origin, read from the environment like the account id and the
  * domain so a real frontend URL never has to be committed to source. When unset, the local Vite dev
- * server is the only allowed origin.
+ * server and the delegated apex are the allowed origins.
  */
 const frontendOrigin = process.env.ECOMMERCE_DEV_FRONTEND_ORIGIN;
 
@@ -48,6 +51,17 @@ export const devConfig: EnvironmentConfig = {
     imageTag: 'v0.1.0',
     logRetention: RetentionDays.ONE_WEEK,
   },
+  // The storefront is static files behind nginx: a quarter of a vCPU and 512 MiB is generous, and a
+  // single task is plenty for dev. Being stateless, it could run more - see prod.
+  frontend: {
+    desiredCount: 1,
+    cpu: 256,
+    memoryLimitMiB: 512,
+    containerPort: 8080,
+    healthCheckPath: '/healthz',
+    imageTag: 'v0.1.0',
+    logRetention: RetentionDays.ONE_WEEK,
+  },
   // A single db.t4g.micro with 20 GiB of gp3 storage: the smallest burstable Graviton instance RDS
   // offers, which is plenty for a demo workload. `deletionProtection` is off and the removal policy
   // is DESTROY so `cdk destroy` really does remove everything, including the generated credentials.
@@ -66,9 +80,7 @@ export const devConfig: EnvironmentConfig = {
   // ends up in source. From Phase 4 it is required rather than optional: the BFF's session cookie
   // is `Secure`, so an authentication-enabled environment must answer over HTTPS. Setting
   // ECOMMERCE_DEV_DOMAIN is therefore a required step of a dev deployment too.
-  dns: process.env.ECOMMERCE_DEV_DOMAIN
-    ? { zoneName: process.env.ECOMMERCE_DEV_DOMAIN, apiSubdomain: 'api' }
-    : undefined,
+  dns: domain ? { zoneName: domain, apiSubdomain: 'api' } : undefined,
   // Dev is deliberately the permissive end of every lever so a fresh environment is quick to sign
   // in to: the shortest password Cognito allows, no MFA, self sign-up on, and long-lived tokens.
   // None of this is a production posture - see prod.ts for the other end of each lever.
@@ -84,12 +96,15 @@ export const devConfig: EnvironmentConfig = {
     idTokenValidity: Duration.hours(1),
     refreshTokenValidity: Duration.days(30),
     sessionTimeout: Duration.hours(8),
-    // The frontend is built separately; in dev it is the Vite dev server. A same-site setup (or a
-    // dev proxy) is what makes the session cookie work, because cross-site cookies are increasingly
-    // blocked by browsers - see the README. ECOMMERCE_DEV_FRONTEND_ORIGIN replaces the default when
-    // a real dev frontend is deployed somewhere else.
-    allowedOrigins: frontendOrigin ? [frontendOrigin] : ['http://localhost:5173'],
-    // Where the browser lands after Cognito logs the user out: the SPA, not the API.
-    logoutUrl: frontendOrigin ?? 'http://localhost:5173',
+    // The local Vite dev server is allowed so a developer machine can call the deployed API
+    // directly; the delegated apex is added because that is where the deployed dev SPA runs
+    // (CloudFront). A same-site setup (or the dev proxy) is what makes the session cookie work,
+    // because cross-site cookies are increasingly blocked by browsers - see the README.
+    allowedOrigins: frontendOrigin
+      ? [frontendOrigin]
+      : ['http://localhost:5173', ...(domain ? [`https://${domain}`] : [])],
+    // The SPA: where the browser lands after login and after logout. The deployed dev frontend is
+    // the apex; a local run falls back to the Vite dev server.
+    frontendUrl: frontendOrigin ?? (domain ? `https://${domain}` : 'http://localhost:5173'),
   },
 };

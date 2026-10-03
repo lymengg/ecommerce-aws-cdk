@@ -41,8 +41,8 @@ export interface ApplicationAuthProps {
   /** Secret holding the app client secret under the `clientSecret` key. */
   readonly clientSecret: ISecret;
 
-  /** Where the browser returns after RP-initiated logout. */
-  readonly logoutUrl: string;
+  /** The SPA's URL: the OAuth2 login-success and post-logout landing. */
+  readonly frontendUrl: string;
 }
 
 export interface ApplicationStackProps extends StackProps {
@@ -148,7 +148,7 @@ export class ApplicationStack extends Stack {
         issuerUrl: props.auth.issuerUrl,
         userPoolClientId: props.auth.userPoolClientId,
         clientSecret: props.auth.clientSecret,
-        logoutUrl: props.auth.logoutUrl,
+        frontendUrl: props.auth.frontendUrl,
         allowedOrigins: config.auth.allowedOrigins,
         sessionTimeout: config.auth.sessionTimeout,
       },

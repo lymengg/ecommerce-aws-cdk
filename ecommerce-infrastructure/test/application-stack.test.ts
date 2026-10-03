@@ -88,13 +88,13 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
             issuerUrl: 'https://cognito-idp.example.com/pool',
             userPoolClientId: 'test-client-id',
             clientSecret: Secret.fromSecretNameV2(network, 'StandInClientSecret', 'stand-in-client-secret'),
-            logoutUrl: config.auth.logoutUrl,
+            frontendUrl: config.auth.frontendUrl,
           }
         : {
             issuerUrl: cognito.issuerUrl,
             userPoolClientId: cognito.userPoolClient.userPoolClientId,
             clientSecret: cognito.clientSecret,
-            logoutUrl: config.auth.logoutUrl,
+            frontendUrl: config.auth.frontendUrl,
           },
   });
 
@@ -269,9 +269,10 @@ describe('ApplicationStack authentication wiring', () => {
     expect(json(environment.COGNITO_ISSUER_URI)).toContain('test-cognito-dev');
     expect(json(environment.COGNITO_CLIENT_ID)).toContain('test-cognito-dev');
     // Post-logout the browser returns to the SPA, not the API.
-    expect(environment.COGNITO_LOGOUT_URI).toBe('http://localhost:5173');
-    // CORS origins are an explicit allowlist and never a wildcard.
-    expect(environment.CORS_ALLOWED_ORIGINS).toBe('http://localhost:5173');
+    expect(environment.FRONTEND_URL).toBe('https://dev.example.com');
+    // CORS origins are an explicit allowlist and never a wildcard: the local dev server and the
+    // deployed dev SPA.
+    expect(environment.CORS_ALLOWED_ORIGINS).toBe('http://localhost:5173,https://dev.example.com');
     expect(json(environment.CORS_ALLOWED_ORIGINS)).not.toContain('*');
     // Session timeout travels in the ISO-8601 form Spring Boot's Duration binding expects.
     expect(environment.SESSION_TIMEOUT).toBe('PT8H');

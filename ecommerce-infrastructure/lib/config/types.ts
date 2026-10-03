@@ -67,6 +67,47 @@ export interface ApplicationConfig {
 }
 
 /**
+ * Runtime configuration of the static frontend tier (Phase 4.5).
+ *
+ * The storefront is a set of files. It is served by a small nginx container behind the existing
+ * Application Load Balancer, on the apex of the delegated subdomain, so the browser talks to the SPA
+ * and the API as two hosts under the same registrable domain - which is what makes the BFF's
+ * `SameSite=Lax` session cookie work.
+ *
+ * Deliberately **stateless**, unlike the API tier: nginx keeps nothing between requests, so the
+ * service may run more than one task and the `desiredCount` guard that protects the API's in-memory
+ * sessions does not apply here.
+ */
+export interface FrontendConfig {
+  /** Number of Fargate tasks serving the SPA. Stateless, so more than one is safe. */
+  readonly desiredCount: number;
+
+  /** Fargate task CPU units (1024 units = 1 vCPU). Must form a valid Fargate cpu/memory pair. */
+  readonly cpu: number;
+
+  /** Fargate task memory in MiB. Must form a valid Fargate cpu/memory pair. */
+  readonly memoryLimitMiB: number;
+
+  /** Port nginx listens on inside the container. The target group forwards to it. */
+  readonly containerPort: number;
+
+  /**
+   * Target group health check path. nginx answers it directly, without touching the built SPA, so a
+   * broken bundle cannot make the task look unhealthy (and a broken nginx cannot look healthy).
+   */
+  readonly healthCheckPath: string;
+
+  /**
+   * Container image tag the ECS task definition deploys. Immutable only, exactly like the API's -
+   * `resolveImageTag()` rejects `latest`.
+   */
+  readonly imageTag: string;
+
+  /** How long nginx container logs are kept in CloudWatch Logs. */
+  readonly logRetention: RetentionDays;
+}
+
+/**
  * Runtime configuration of the relational data tier (Phase 3).
  *
  * The application tier above is stateless and can be replaced at any moment; the database cannot.
@@ -252,15 +293,18 @@ export interface AuthConfig {
   readonly allowedOrigins: readonly string[];
 
   /**
-   * Absolute URL the browser returns to after RP-initiated logout. This is the **frontend**, not the
-   * API: once the Cognito session has ended, the user should land on the SPA, which is why the
-   * value is registered in the app client's `logoutUrls`. Must be an absolute origin and never `*`.
+   * Absolute URL of the single-page frontend. It is the browser's navigation target in three
+   * places, which is why it lives in configuration rather than in a stack:
    *
-   * It is deliberately separate from {@link allowedOrigins}: the CORS allowlist governs which
-   * origins may call the API, while this is a single navigation target. In a same-site setup the
-   * two usually share a host, but they are not required to.
+   * - the OAuth2 **login success** landing (Spring Security redirects here after the code exchange),
+   * - the **post-logout** landing after RP-initiated logout, and
+   * - the app client's registered `logoutUrls` entry.
+   *
+   * Must be an absolute origin and never `*`. It is deliberately separate from
+   * {@link allowedOrigins}: the CORS allowlist governs which origins may call the API, while this is
+   * a single navigation target. In a same-site setup the two usually share a host, but they need not.
    */
-  readonly logoutUrl: string;
+  readonly frontendUrl: string;
 }
 
 /**
@@ -310,6 +354,9 @@ export interface EnvironmentConfig {
 
   /** Containerised application tier configuration (Phase 2). */
   readonly application: ApplicationConfig;
+
+  /** Static frontend tier configuration (Phase 4.5). */
+  readonly frontend: FrontendConfig;
 
   /** Relational data tier configuration (Phase 3). */
   readonly database: DatabaseConfig;

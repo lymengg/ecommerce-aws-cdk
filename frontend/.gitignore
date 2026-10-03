@@ -1,0 +1,14 @@
+# Nuxt build output and generated types.
+.nuxt
+.output
+.data
+dist
+
+# Local environment (the API base URL). Commit .env.example instead.
+.env
+.env.*
+!.env.example
+
+# Dependencies and logs.
+node_modules
+*.log

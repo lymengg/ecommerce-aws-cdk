@@ -51,6 +51,16 @@ export const uatConfig: EnvironmentConfig = {
     imageTag: 'v0.1.0',
     logRetention: RetentionDays.ONE_MONTH,
   },
+  // Same single-task footprint as dev; logs kept longer so a failed acceptance test can be read back.
+  frontend: {
+    desiredCount: 1,
+    cpu: 256,
+    memoryLimitMiB: 512,
+    containerPort: 8080,
+    healthCheckPath: '/healthz',
+    imageTag: 'v0.1.0',
+    logRetention: RetentionDays.ONE_MONTH,
+  },
   // No Multi-AZ here: UAT accepts a slower failover in exchange for half the instance cost. What it
   // does not accept is losing the data, so deletion protection is on and the instance is retained.
   database: {
@@ -88,8 +98,8 @@ export const uatConfig: EnvironmentConfig = {
     allowedOrigins: frontendOrigin
       ? [frontendOrigin]
       : ['http://localhost:5173', ...(domain ? [`https://${domain}`] : [])],
-    // After logout the browser lands on the deployed SPA (the apex), not the localhost origin that
-    // is only there so a developer machine may call the API.
-    logoutUrl: frontendOrigin ?? (domain ? `https://${domain}` : 'http://localhost:5173'),
+    // The SPA is the deployed apex, not the localhost origin that is only there so a developer
+    // machine may call the API.
+    frontendUrl: frontendOrigin ?? (domain ? `https://${domain}` : 'http://localhost:5173'),
   },
 };

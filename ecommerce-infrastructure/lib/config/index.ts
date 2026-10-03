@@ -60,9 +60,13 @@ export function getEnvironmentConfig(environment: EnvironmentName = resolveEnvir
  * replacement silently deploy an image nobody reviewed. It is rejected here rather than at ECS,
  * which would only fail after the service had already started rolling.
  */
-export function resolveImageTag(config: EnvironmentConfig, app?: App): string {
+export function resolveImageTag(
+  config: EnvironmentConfig,
+  app?: App,
+  defaultTag: string = config.application.imageTag,
+): string {
   const fromContext: unknown = app?.node.tryGetContext(IMAGE_TAG_CONTEXT_KEY);
-  const candidate = String(fromContext ?? process.env.IMAGE_TAG ?? config.application.imageTag).trim();
+  const candidate = String(fromContext ?? process.env.IMAGE_TAG ?? defaultTag).trim();
 
   if (candidate === '') {
     throw new Error('imageTag must not be empty.');

@@ -100,6 +100,7 @@ export function assertValidEnvironmentConfig(config: EnvironmentConfig): void {
   }
 
   assertValidApplicationConfig(config.application, fail);
+  assertValidFrontendConfig(config.frontend, fail);
   assertValidDatabaseConfig(config.database, fail);
   assertValidDnsConfig(config, fail);
   assertValidAuthConfig(config, fail);
@@ -166,12 +167,12 @@ function assertValidAuthConfig(config: EnvironmentConfig, fail: (message: string
     }
   }
 
-  // The post-logout target is registered with Cognito as an exact logout URI, so a relative or
-  // wildcard value would make the app client fail to create (or send the browser somewhere it
-  // should not go).
-  if (auth.logoutUrl === '*' || !WEB_ORIGIN.test(auth.logoutUrl)) {
+  // The frontend URL is registered with Cognito as an exact logout URI and is the OAuth2 login
+  // success target, so a relative or wildcard value would make the app client fail to create (or
+  // send the browser somewhere it should not go).
+  if (auth.frontendUrl === '*' || !WEB_ORIGIN.test(auth.frontendUrl)) {
     fail(
-      `auth.logoutUrl "${auth.logoutUrl}" is not an absolute origin. Expected "scheme://host[:port]" ` +
+      `auth.frontendUrl "${auth.frontendUrl}" is not an absolute origin. Expected "scheme://host[:port]" ` +
         'and never "*".',
     );
   }
@@ -255,34 +256,59 @@ function assertValidApplicationConfig(
     );
   }
 
-  const allowedMemory = FARGATE_TASK_SIZES[application.cpu];
-  if (allowedMemory === undefined) {
-    fail(
-      `application.cpu must be one of ${Object.keys(FARGATE_TASK_SIZES).join(', ')} Fargate CPU units, ` +
-        `got ${application.cpu}.`,
-    );
-  } else if (!allowedMemory.includes(application.memoryLimitMiB)) {
-    fail(
-      `application.memoryLimitMiB ${application.memoryLimitMiB} is not a valid Fargate memory size for ` +
-        `${application.cpu} CPU units. Expected one of: ${allowedMemory.join(', ')}.`,
-    );
+  assertValidFargateSize('application', application.cpu, application.memoryLimitMiB, fail);
+  assertValidContainer('application', application, fail);
+}
+
+/**
+ * Validates the static frontend tier. Same checks as the API tier - a Fargate size ECS accepts, a
+ * valid port, an absolute health check path and an immutable image tag - but **without** the
+ * single-task guard: nginx holds no session, so scaling it out is safe.
+ */
+function assertValidFrontendConfig(frontend: EnvironmentConfig['frontend'], fail: (message: string) => never): void {
+  if (!Number.isInteger(frontend.desiredCount) || frontend.desiredCount < 0) {
+    fail(`frontend.desiredCount must be a non-negative integer, got ${frontend.desiredCount}.`);
   }
 
-  if (
-    !Number.isInteger(application.containerPort) ||
-    application.containerPort < 1 ||
-    application.containerPort > 65535
-  ) {
-    fail(`application.containerPort must be between 1 and 65535, got ${application.containerPort}.`);
+  assertValidFargateSize('frontend', frontend.cpu, frontend.memoryLimitMiB, fail);
+  assertValidContainer('frontend', frontend, fail);
+}
+
+/** The cpu/memory pair has to be one Fargate actually offers. */
+function assertValidFargateSize(
+  name: string,
+  cpu: number,
+  memoryLimitMiB: number,
+  fail: (message: string) => never,
+): void {
+  const allowedMemory = FARGATE_TASK_SIZES[cpu];
+  if (allowedMemory === undefined) {
+    fail(`${name}.cpu must be one of ${Object.keys(FARGATE_TASK_SIZES).join(', ')} Fargate CPU units, got ${cpu}.`);
+  } else if (!allowedMemory.includes(memoryLimitMiB)) {
+    fail(
+      `${name}.memoryLimitMiB ${memoryLimitMiB} is not a valid Fargate memory size for ${cpu} CPU units. ` +
+        `Expected one of: ${allowedMemory.join(', ')}.`,
+    );
   }
-  if (!application.healthCheckPath.startsWith('/')) {
-    fail(`application.healthCheckPath must start with "/", got "${application.healthCheckPath}".`);
+}
+
+/** The container-facing settings both tiers share: port, health check path and image tag. */
+function assertValidContainer(
+  name: string,
+  container: { containerPort: number; healthCheckPath: string; imageTag: string },
+  fail: (message: string) => never,
+): void {
+  if (!Number.isInteger(container.containerPort) || container.containerPort < 1 || container.containerPort > 65535) {
+    fail(`${name}.containerPort must be between 1 and 65535, got ${container.containerPort}.`);
   }
-  if (application.imageTag.trim() === '') {
-    fail('application.imageTag must not be empty.');
+  if (!container.healthCheckPath.startsWith('/')) {
+    fail(`${name}.healthCheckPath must start with "/", got "${container.healthCheckPath}".`);
   }
-  if (application.imageTag.toLowerCase() === 'latest') {
-    fail('application.imageTag must be an immutable tag; "latest" is not allowed.');
+  if (container.imageTag.trim() === '') {
+    fail(`${name}.imageTag must not be empty.`);
+  }
+  if (container.imageTag.toLowerCase() === 'latest') {
+    fail(`${name}.imageTag must be an immutable tag; "latest" is not allowed.`);
   }
 }
 

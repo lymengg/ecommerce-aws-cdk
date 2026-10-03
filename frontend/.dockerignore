@@ -1,0 +1,18 @@
+# Nothing that is generated, local or test-only belongs in the build context.
+node_modules
+.nuxt
+.output
+.data
+dist
+
+.env
+.env.*
+!.env.example
+
+test
+# `scripts/csp-hashes.mjs` runs during the build, so only the deploy helper is excluded.
+scripts/deploy.sh
+README.md
+Dockerfile
+.dockerignore
+.gitignore

@@ -48,6 +48,19 @@ export const prodConfig: EnvironmentConfig = {
     imageTag: 'v0.1.0',
     logRetention: RetentionDays.THREE_MONTHS,
   },
+  // Two tasks, which the API cannot do while its sessions are in memory. nginx is stateless, so
+  // losing one task - or an entire Availability Zone - costs nothing: the load balancer simply sends
+  // the next request to the survivor. A slightly larger task than dev/uat for the same reason the
+  // API is larger: headroom, not throughput (nginx serves static files for almost nothing).
+  frontend: {
+    desiredCount: 2,
+    cpu: 512,
+    memoryLimitMiB: 1024,
+    containerPort: 8080,
+    healthCheckPath: '/healthz',
+    imageTag: 'v0.1.0',
+    logRetention: RetentionDays.THREE_MONTHS,
+  },
   // Multi-AZ doubles the instance cost, which is exactly the trade production is meant to make: a
   // single AZ failure becomes a failover instead of an outage. `RemovalPolicy.RETAIN` keeps the
   // instance (and its data) if the stack is ever deleted, and deletion protection stops that from
@@ -94,8 +107,7 @@ export const prodConfig: EnvironmentConfig = {
     // Empty when no domain is configured, which cannot happen: the validator rejects production
     // without `dns` before it ever looks at this list.
     allowedOrigins: frontendOrigin ? [frontendOrigin] : domain ? [`https://${domain}`] : [],
-    // After logout the browser lands on the deployed SPA. Empty without a domain, which the `dns`
-    // check rejects first.
-    logoutUrl: frontendOrigin ?? (domain ? `https://${domain}` : ''),
+    // The SPA is the deployed apex. Empty without a domain, which the `dns` check rejects first.
+    frontendUrl: frontendOrigin ?? (domain ? `https://${domain}` : ''),
   },
 };

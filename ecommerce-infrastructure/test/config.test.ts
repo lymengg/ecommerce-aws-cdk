@@ -136,6 +136,37 @@ describe('application configuration', () => {
   });
 });
 
+describe('frontend configuration', () => {
+  test.each(ENVIRONMENT_NAMES)('%s describes a valid, stateless frontend task', (environment: EnvironmentName) => {
+    const frontend = getEnvironmentConfig(environment).frontend;
+
+    expect(frontend.desiredCount).toBeGreaterThanOrEqual(1);
+    expect(frontend.containerPort).toBe(8080);
+    expect(frontend.healthCheckPath).toBe('/healthz');
+    expect(frontend.imageTag).not.toBe('latest');
+  });
+
+  test('may run more than one task, unlike the API tier', () => {
+    // nginx holds no session, so the single-task guard that protects the API does not apply.
+    expect(getEnvironmentConfig('dev').frontend.desiredCount).toBe(1);
+    expect(getEnvironmentConfig('prod').frontend.desiredCount).toBe(2);
+  });
+
+  test('rejects a Fargate size ECS would refuse, or a mutable image tag', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, frontend: { ...dev.frontend, cpu: 300 } }),
+    ).toThrow(/frontend.cpu must be one of/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, frontend: { ...dev.frontend, healthCheckPath: 'healthz' } }),
+    ).toThrow(/frontend.healthCheckPath/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, frontend: { ...dev.frontend, imageTag: 'latest' } }),
+    ).toThrow(/immutable tag/);
+  });
+});
+
 describe('database configuration', () => {
   test.each(ENVIRONMENT_NAMES)('%s describes a valid, protected PostgreSQL instance', (environment: EnvironmentName) => {
     const database = getEnvironmentConfig(environment).database;
@@ -276,8 +307,8 @@ describe('auth configuration', () => {
     expect(auth.accessTokenValidity.toSeconds()).toBeLessThanOrEqual(Duration.days(1).toSeconds());
     expect(auth.sessionTimeout.toSeconds()).toBeLessThanOrEqual(auth.refreshTokenValidity.toSeconds());
     // The post-logout target is the SPA, registered with Cognito as an exact URI.
-    expect(auth.logoutUrl).toMatch(/^https?:\/\/[^/]+$/);
-    expect(auth.logoutUrl).not.toContain('*');
+    expect(auth.frontendUrl).toMatch(/^https?:\/\/[^/]+$/);
+    expect(auth.frontendUrl).not.toContain('*');
   });
 
   test('keeps development permissive and production strict', () => {
@@ -360,12 +391,12 @@ describe('auth configuration', () => {
     }
   });
 
-  test('rejects a wildcard, relative or empty post-logout URI', () => {
+  test('rejects a wildcard, relative or empty frontend URL', () => {
     const dev = getEnvironmentConfig('dev');
 
-    for (const logoutUrl of ['*', 'shop.example.com', '', '/logout']) {
-      expect(() => assertValidEnvironmentConfig({ ...dev, auth: { ...dev.auth, logoutUrl } })).toThrow(
-        /auth.logoutUrl/,
+    for (const frontendUrl of ['*', 'shop.example.com', '', '/app']) {
+      expect(() => assertValidEnvironmentConfig({ ...dev, auth: { ...dev.auth, frontendUrl } })).toThrow(
+        /auth.frontendUrl/,
       );
     }
   });

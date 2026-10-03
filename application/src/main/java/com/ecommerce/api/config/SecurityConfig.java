@@ -1,6 +1,7 @@
 package com.ecommerce.api.config;
 
 import com.ecommerce.api.security.CognitoAuthoritiesMapper;
+import com.ecommerce.api.security.CognitoLogoutSuccessHandler;
 import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -16,7 +17,6 @@ import org.springframework.security.config.annotation.web.builders.HttpSecurity;
 import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.context.SecurityContextHolder;
-import org.springframework.security.oauth2.client.oidc.web.logout.OidcClientInitiatedLogoutSuccessHandler;
 import org.springframework.security.oauth2.client.registration.ClientRegistrationRepository;
 import org.springframework.security.oauth2.client.web.DefaultOAuth2AuthorizationRequestResolver;
 import org.springframework.security.oauth2.client.web.OAuth2AuthorizationRequestCustomizers;
@@ -27,6 +27,8 @@ import org.springframework.security.web.access.AccessDeniedHandler;
 import org.springframework.security.web.authentication.DelegatingAuthenticationEntryPoint;
 import org.springframework.security.web.authentication.HttpStatusEntryPoint;
 import org.springframework.security.web.authentication.LoginUrlAuthenticationEntryPoint;
+import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
+import org.springframework.security.web.csrf.XorCsrfTokenRequestAttributeHandler;
 import org.springframework.security.web.util.matcher.RequestMatcher;
 import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
@@ -73,15 +75,15 @@ public class SecurityConfig {
 
     private final ClientRegistrationRepository clientRegistrationRepository;
     private final List<String> allowedOrigins;
-    private final String logoutUri;
+    private final String frontendUrl;
 
     public SecurityConfig(
             ClientRegistrationRepository clientRegistrationRepository,
             @Value("${app.cors.allowed-origins}") List<String> allowedOrigins,
-            @Value("${app.auth.logout-uri}") String logoutUri) {
+            @Value("${app.auth.frontend-url}") String frontendUrl) {
         this.clientRegistrationRepository = clientRegistrationRepository;
         this.allowedOrigins = allowedOrigins;
-        this.logoutUri = logoutUri;
+        this.frontendUrl = frontendUrl;
     }
 
     @Bean
@@ -96,6 +98,10 @@ public class SecurityConfig {
                         // The load balancer health check is anonymous by necessity.
                         .requestMatchers("/actuator/health")
                         .permitAll()
+                        // The SPA fetches its CSRF token here before any write. Anonymous by
+                        // necessity: a signed-out visitor needs a token to sign in.
+                        .requestMatchers(HttpMethod.GET, "/csrf")
+                        .permitAll()
                         // Product reads stay public, exactly as they were before this phase.
                         .requestMatchers(HttpMethod.GET, "/api/**")
                         .permitAll()
@@ -106,18 +112,30 @@ public class SecurityConfig {
                         .authenticated())
                 .oauth2Login(oauth -> oauth
                         .authorizationEndpoint(endpoint -> endpoint.authorizationRequestResolver(authorizationRequestResolver))
+                        // The SPA is served from a different origin, so the browser must be sent
+                        // back there after the code exchange; Spring's default would land it on the
+                        // API root, which serves no page. `true` forces this over any saved request.
+                        .defaultSuccessUrl(frontendUrl, true)
                         // Turn the cognito:groups claim into authorities. This is the central
                         // enforce-by-claim mechanism a future write endpoint inherits.
                         .userInfoEndpoint(userInfo -> userInfo.userAuthoritiesMapper(authoritiesMapper)))
-                // RP-initiated logout: end the session here, then end the Cognito session, so a
-                // stolen cookie cannot be used after logout. Token revocation is enabled on the app
-                // client, so the refresh token is invalidated too. Cognito then returns the browser
-                // to the SPA (COGNITO_LOGOUT_URI), which is a registered logout URI - the API has no
-                // logout landing of its own.
-                .logout(logout -> logout.logoutSuccessHandler(oidcLogoutSuccessHandler()))
-                // CSRF stays on, using Spring Security's single-page-application handling: the token
-                // is delivered in a cookie the SPA reads and echoes back in a header.
-                .csrf(csrf -> csrf.spa())
+                // End the session here, then end the Cognito session, so a stolen cookie cannot be
+                // used after logout. Token revocation is enabled on the app client, so the refresh
+                // token is invalidated too. Cognito then returns the browser to the SPA, which is a
+                // registered sign-out URL - the API has no logout landing.
+                //
+                // Cognito does not implement OIDC RP-Initiated Logout, so Spring's own handler is
+                // not usable here; see CognitoLogoutSuccessHandler.
+                .logout(logout -> logout.logoutSuccessHandler(
+                        new CognitoLogoutSuccessHandler(clientRegistrationRepository, frontendUrl)))
+                // CSRF stays on, with a double-submit cookie plus Spring's BREACH-protected request
+                // handler. The SPA cannot read the cookie (it is scoped to the API host), so it
+                // fetches the token from GET /csrf and echoes it back - in the header on a write,
+                // in a form field on logout. `XorCsrfTokenRequestAttributeHandler` decodes either,
+                // so one token representation covers both. See SessionController#csrf.
+                .csrf(csrf -> csrf
+                        .csrfTokenRepository(CookieCsrfTokenRepository.withHttpOnlyFalse())
+                        .csrfTokenRequestHandler(new XorCsrfTokenRequestAttributeHandler()))
                 .cors(Customizer.withDefaults())
                 .exceptionHandling(exceptions -> exceptions
                         .authenticationEntryPoint(entryPoint)
@@ -156,10 +174,13 @@ public class SecurityConfig {
     @Bean
     public CorsConfigurationSource corsConfigurationSource() {
         CorsConfiguration configuration = new CorsConfiguration();
+        // Exact origins and an explicit header allowlist. A wildcard is never used: with
+        // `allowCredentials` it is meaningless for origins and unsafe in general.
         configuration.setAllowedOrigins(allowedOrigins);
         configuration.setAllowedMethods(List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
-        configuration.setAllowedHeaders(List.of("*"));
+        configuration.setAllowedHeaders(List.of("Content-Type", "Accept", "X-XSRF-TOKEN"));
         configuration.setAllowCredentials(true);
+        // Nothing extra is exposed: the SPA gets its CSRF token from GET /csrf, not from a header.
         configuration.setMaxAge(Duration.ofHours(1));
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
@@ -168,12 +189,12 @@ public class SecurityConfig {
     }
 
     /**
-     * An unauthenticated request to {@code /api/**} gets a 401; anything else is redirected to the
-     * hosted UI, which is how the browser login flow begins.
+     * An unauthenticated call to one of the storefront's `fetch` endpoints gets a 401; anything else
+     * is redirected to the hosted UI, which is how the browser login flow begins.
      */
     private AuthenticationEntryPoint authenticationEntryPoint() {
         LinkedHashMap<RequestMatcher, AuthenticationEntryPoint> entryPoints = new LinkedHashMap<>();
-        entryPoints.put(apiRequestMatcher(), new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED));
+        entryPoints.put(fetchRequestMatcher(), new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED));
 
         DelegatingAuthenticationEntryPoint entryPoint = new DelegatingAuthenticationEntryPoint(entryPoints);
         entryPoint.setDefaultEntryPoint(new LoginUrlAuthenticationEntryPoint(AUTHORIZATION_REQUEST_BASE_URI));
@@ -199,20 +220,20 @@ public class SecurityConfig {
         };
     }
 
-    /** Matches the API surface. A lambda avoids depending on a specific path-matcher implementation. */
-    private RequestMatcher apiRequestMatcher() {
-        return request -> request.getRequestURI().startsWith("/api");
+    /**
+     * Matches everything the storefront calls with `fetch`: the product API and the session
+     * endpoints (`/me`, `/csrf`). A client that follows a 302 into the hosted UI cannot use the page
+     * it lands on - and an XMLHttpRequest following one would be a cross-origin error - so these
+     * answer 401 instead. Everything else is a browser navigation, and a redirect is exactly right
+     * for it.
+     *
+     * A lambda avoids depending on a specific path-matcher implementation.
+     */
+    private RequestMatcher fetchRequestMatcher() {
+        return request -> {
+            String path = request.getRequestURI();
+            return path.startsWith("/api") || path.equals("/me") || path.equals("/csrf");
+        };
     }
 
-    /**
-     * Ends the Cognito session when the user logs out, then returns the browser to the configured
-     * logout URI. Without this, "logout" would only clear the local session and the Cognito session
-     * would live on.
-     */
-    private OidcClientInitiatedLogoutSuccessHandler oidcLogoutSuccessHandler() {
-        OidcClientInitiatedLogoutSuccessHandler handler =
-                new OidcClientInitiatedLogoutSuccessHandler(clientRegistrationRepository);
-        handler.setPostLogoutRedirectUri(logoutUri);
-        return handler;
-    }
 }

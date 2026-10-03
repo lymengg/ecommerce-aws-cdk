@@ -13,6 +13,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.ecommerce.api.repository.ProductRepository;
 import com.ecommerce.api.support.TestAuthProperties;
 import com.ecommerce.api.support.TestSecurityConfiguration;
+import com.jayway.jsonpath.JsonPath;
+import jakarta.servlet.http.Cookie;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -21,10 +23,13 @@ import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.context.annotation.Import;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.mock.web.MockHttpSession;
 import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.postgresql.PostgreSQLContainer;
@@ -85,6 +90,44 @@ class SecurityTest {
     }
 
     @Test
+    void exposesTheCsrfTokenForTheCrossOriginSpa() throws Exception {
+        // The SPA is served from another origin and cannot read the XSRF-TOKEN cookie, so it fetches
+        // the token here (anonymously, before signing in) and echoes it in the header on writes.
+        mockMvc.perform(get("/csrf"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.headerName").isNotEmpty())
+                .andExpect(jsonPath("$.token").isNotEmpty());
+    }
+
+    @Test
+    @WithMockUser(roles = "admin")
+    void acceptsTheTokenFromTheCsrfEndpointOnAWrite() throws Exception {
+        // Proves the cross-origin flow end to end: the token comes from GET /csrf, exactly as the
+        // SPA would use it, and the write is accepted. The session and the cookie are both carried
+        // so the test does not care which store the server keeps the token in.
+        MockHttpSession session = new MockHttpSession();
+        MvcResult csrfResult = mockMvc.perform(get("/csrf").session(session))
+                .andExpect(status().isOk())
+                .andReturn();
+        Cookie xsrfCookie = csrfResult.getResponse().getCookie("XSRF-TOKEN");
+        String body = csrfResult.getResponse().getContentAsString();
+        // The SPA reads both values from the response rather than assuming the names.
+        String headerName = JsonPath.read(body, "$.headerName");
+        String token = JsonPath.read(body, "$.token");
+
+        MockHttpServletRequestBuilder request = post("/api/products")
+                .session(session)
+                .header(headerName, token)
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"name\":\"Laptop\",\"price\":1200.00}");
+        if (xsrfCookie != null) {
+            request = request.cookie(xsrfCookie);
+        }
+
+        mockMvc.perform(request).andExpect(status().isCreated());
+    }
+
+    @Test
     void refusesAnAnonymousWriteWithUnauthorizedNotARedirect() throws Exception {
         // No CSRF token and no session: the request is refused before it reaches the controller,
         // and because the caller is anonymous the answer is 401 rather than a login redirect.
@@ -122,6 +165,25 @@ class SecurityTest {
     }
 
     @Test
+    void answers401ForAnAnonymousMeRatherThanRedirectingIntoTheLoginFlow() throws Exception {
+        // /me is called by the SPA with fetch. A 302 into the hosted UI would be a cross-origin
+        // error for the SPA and a dead end for any other client, so it answers 401 like /api/**.
+        mockMvc.perform(get("/me"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(header().doesNotExist("Location"));
+    }
+
+    @Test
+    @WithMockUser
+    void logoutLandsOnTheFrontendWhenThereIsNoOidcSessionToEnd() throws Exception {
+        // Proves the custom logout handler is wired: the default Spring behaviour would redirect to
+        // /login?logout, but a signed-out user has to end up back on the SPA.
+        mockMvc.perform(post("/logout").with(csrf()))
+                .andExpect(status().is3xxRedirection())
+                .andExpect(redirectedUrl("http://localhost:5173"));
+    }
+
+    @Test
     void authorizationRequestUsesPkceAndState() throws Exception {
         String location = mockMvc.perform(get("/oauth2/authorization/cognito"))
                 .andExpect(status().is3xxRedirection())
@@ -139,9 +201,9 @@ class SecurityTest {
 
     @Test
     void redirectsAPageRequestToTheHostedUiWhenUnauthenticated() throws Exception {
-        // A browser navigating to a protected page must be sent to Cognito to sign in; only the API
-        // surface answers 401 instead.
-        mockMvc.perform(get("/me"))
+        // A browser navigating to a protected page must be sent to Cognito to sign in; only the
+        // storefront's fetch endpoints (/api/**, /me, /csrf) answer 401 instead.
+        mockMvc.perform(get("/account"))
                 .andExpect(status().is3xxRedirection())
                 .andExpect(redirectedUrl("/oauth2/authorization/cognito"));
     }

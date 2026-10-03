@@ -77,8 +77,13 @@ export class DnsStack extends Stack {
 
     this.apiDomainName = `${dns.apiSubdomain}.${dns.zoneName}`;
 
+    // One certificate for the whole platform's public names: the API and the apex the SPA is served
+    // from. Both terminate on the same load balancer, so a single certificate with a subject
+    // alternative name is simpler than two certificates and two SNI entries - and it is still
+    // exactly two names, no wildcard.
     this.certificate = new Certificate(this, 'Certificate', {
       domainName: this.apiDomainName,
+      subjectAlternativeNames: [dns.zoneName],
       validation: CertificateValidation.fromDns(this.zone),
     });
 

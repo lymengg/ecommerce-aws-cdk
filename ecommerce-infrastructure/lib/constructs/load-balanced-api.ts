@@ -60,7 +60,7 @@ export interface DatabaseConnection {
  * Everything the container needs to authenticate as the OAuth client of the Cognito user pool
  * (Phase 4).
  *
- * The issuer URL, the client id, the logout URI, the CORS allowlist and the session timeout are
+ * The issuer URL, the client id, the frontend URL, the CORS allowlist and the session timeout are
  * configuration, not secrets, so they travel as ordinary environment variables. Only the client
  * secret comes from Secrets Manager, injected by ECS at container start exactly like the database
  * password. Nothing here ever reaches the browser: the browser only holds an `httpOnly` session
@@ -76,8 +76,8 @@ export interface AuthConnection {
   /** Secret holding the app client secret under the `clientSecret` key. */
   readonly clientSecret: ISecret;
 
-  /** Where the browser returns after RP-initiated logout; must match a registered logout URI. */
-  readonly logoutUrl: string;
+  /** The SPA's URL: the OAuth2 login-success and post-logout landing, and a registered logout URI. */
+  readonly frontendUrl: string;
 
   /**
    * Exact frontend origins allowed to call the API with credentials. Never a wildcard: the API
@@ -384,7 +384,7 @@ export class LoadBalancedApi extends Construct {
         // session cookie's lifetime.
         COGNITO_ISSUER_URI: auth.issuerUrl,
         COGNITO_CLIENT_ID: auth.userPoolClientId,
-        COGNITO_LOGOUT_URI: auth.logoutUrl,
+        FRONTEND_URL: auth.frontendUrl,
         CORS_ALLOWED_ORIGINS: auth.allowedOrigins.join(','),
         SESSION_TIMEOUT: auth.sessionTimeout.toIsoString(),
       },
