@@ -1,9 +1,21 @@
-import { RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Mfa } from 'aws-cdk-lib/aws-cognito';
 import { InstanceClass, InstanceSize, InstanceType } from 'aws-cdk-lib/aws-ec2';
 import { RetentionDays } from 'aws-cdk-lib/aws-logs';
 import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
 
 import { EnvironmentConfig } from './types';
+
+/**
+ * The delegated subdomain, read once from the environment. From Phase 4 it is required rather than
+ * optional (the BFF's session cookie is `Secure`), so UAT now needs `ECOMMERCE_UAT_DOMAIN` to
+ * synthesise. Reading it into a local also lets the CORS allowlist be derived from it without
+ * repeating the lookup.
+ */
+const domain = process.env.ECOMMERCE_UAT_DOMAIN;
+
+/** Optional override for the frontend origin; see the dev configuration for why it is read here. */
+const frontendOrigin = process.env.ECOMMERCE_UAT_FRONTEND_ORIGIN;
 
 /**
  * UAT environment: production-like topology at a smaller scale.
@@ -53,8 +65,31 @@ export const uatConfig: EnvironmentConfig = {
     removalPolicy: RemovalPolicy.RETAIN,
   },
   // Same delegation model as dev: the subdomain comes from the environment so it is never committed
-  // to source, and omitting it keeps UAT HTTP-only until a zone has been delegated.
-  dns: process.env.ECOMMERCE_UAT_DOMAIN
-    ? { zoneName: process.env.ECOMMERCE_UAT_DOMAIN, apiSubdomain: 'api' }
-    : undefined,
+  // to source. Required from Phase 4 on, because auth needs an HTTPS origin.
+  dns: domain ? { zoneName: domain, apiSubdomain: 'api' } : undefined,
+  // UAT sits between dev and prod: a real password policy and MFA available (but not forced, so a
+  // tester without an authenticator can still sign in), and token lifetimes short enough that the
+  // refresh path is exercised during acceptance testing.
+  auth: {
+    passwordMinimumLength: 10,
+    requireUppercase: true,
+    requireLowercase: true,
+    requireDigits: true,
+    requireSymbols: false,
+    mfa: Mfa.OPTIONAL,
+    selfSignUpEnabled: true,
+    accessTokenValidity: Duration.minutes(30),
+    idTokenValidity: Duration.minutes(30),
+    refreshTokenValidity: Duration.days(7),
+    sessionTimeout: Duration.hours(4),
+    // The local frontend origin is allowed so acceptance tests can drive the deployed API from a
+    // developer machine; the delegated apex is added so the same-site deployed frontend works too.
+    // ECOMMERCE_UAT_FRONTEND_ORIGIN replaces the default with the real frontend origin.
+    allowedOrigins: frontendOrigin
+      ? [frontendOrigin]
+      : ['http://localhost:5173', ...(domain ? [`https://${domain}`] : [])],
+    // After logout the browser lands on the deployed SPA (the apex), not the localhost origin that
+    // is only there so a developer machine may call the API.
+    logoutUrl: frontendOrigin ?? (domain ? `https://${domain}` : 'http://localhost:5173'),
+  },
 };

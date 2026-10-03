@@ -50,6 +50,20 @@
     </dependency>
 
     <!--
+      OAuth 2.0 / OIDC client support (Phase 4). The application is the OAuth client of the Cognito
+      user pool: it runs the authorization code + PKCE flow server side, holds the tokens itself,
+      and gives the browser only an httpOnly session cookie (the Backend for Frontend pattern).
+
+      Deliberately NOT spring-boot-starter-oauth2-resource-server: this phase authenticates browser
+      users through a session, not bearer tokens. Resource-server support for future mobile or
+      service clients is a later, additive phase - see the README.
+    -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-oauth2-client</artifactId>
+    </dependency>
+
+    <!--
       Flyway owns the schema. The application never creates or alters a table itself: it validates
       the entities against what Flyway has already migrated, so a mismatch fails the deployment
       instead of the first query.
@@ -88,6 +102,16 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-webmvc-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <!--
+      Spring Security test support: the request post-processors (user(), csrf()) and result matchers
+      the security tests use to simulate an authenticated browser session without a real Cognito.
+    -->
+    <dependency>
+      <groupId>org.springframework.security</groupId>
+      <artifactId>spring-security-test</artifactId>
       <scope>test</scope>
     </dependency>
 

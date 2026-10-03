@@ -1,9 +1,17 @@
-import { RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Mfa } from 'aws-cdk-lib/aws-cognito';
 import { InstanceClass, InstanceSize, InstanceType } from 'aws-cdk-lib/aws-ec2';
 import { RetentionDays } from 'aws-cdk-lib/aws-logs';
 import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
 
 import { EnvironmentConfig } from './types';
+
+/**
+ * Optional override for the frontend origin, read from the environment like the account id and the
+ * domain so a real frontend URL never has to be committed to source. When unset, the local Vite dev
+ * server is the only allowed origin.
+ */
+const frontendOrigin = process.env.ECOMMERCE_DEV_FRONTEND_ORIGIN;
 
 /**
  * Development environment: the cheapest footprint that still mirrors the production topology.
@@ -55,9 +63,33 @@ export const devConfig: EnvironmentConfig = {
     removalPolicy: RemovalPolicy.DESTROY,
   },
   // The public subdomain is read from the environment, like the account id, so the domain never
-  // ends up in source. It is omitted entirely when unset, which is what lets dev synthesise and
-  // deploy HTTP-only before a subdomain has been delegated to Route 53.
+  // ends up in source. From Phase 4 it is required rather than optional: the BFF's session cookie
+  // is `Secure`, so an authentication-enabled environment must answer over HTTPS. Setting
+  // ECOMMERCE_DEV_DOMAIN is therefore a required step of a dev deployment too.
   dns: process.env.ECOMMERCE_DEV_DOMAIN
     ? { zoneName: process.env.ECOMMERCE_DEV_DOMAIN, apiSubdomain: 'api' }
     : undefined,
+  // Dev is deliberately the permissive end of every lever so a fresh environment is quick to sign
+  // in to: the shortest password Cognito allows, no MFA, self sign-up on, and long-lived tokens.
+  // None of this is a production posture - see prod.ts for the other end of each lever.
+  auth: {
+    passwordMinimumLength: 8,
+    requireUppercase: false,
+    requireLowercase: true,
+    requireDigits: true,
+    requireSymbols: false,
+    mfa: Mfa.OFF,
+    selfSignUpEnabled: true,
+    accessTokenValidity: Duration.hours(1),
+    idTokenValidity: Duration.hours(1),
+    refreshTokenValidity: Duration.days(30),
+    sessionTimeout: Duration.hours(8),
+    // The frontend is built separately; in dev it is the Vite dev server. A same-site setup (or a
+    // dev proxy) is what makes the session cookie work, because cross-site cookies are increasingly
+    // blocked by browsers - see the README. ECOMMERCE_DEV_FRONTEND_ORIGIN replaces the default when
+    // a real dev frontend is deployed somewhere else.
+    allowedOrigins: frontendOrigin ? [frontendOrigin] : ['http://localhost:5173'],
+    // Where the browser lands after Cognito logs the user out: the SPA, not the API.
+    logoutUrl: frontendOrigin ?? 'http://localhost:5173',
+  },
 };

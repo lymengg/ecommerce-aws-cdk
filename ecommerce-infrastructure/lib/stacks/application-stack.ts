@@ -5,6 +5,7 @@ import { IRepository } from 'aws-cdk-lib/aws-ecr';
 import { Cluster } from 'aws-cdk-lib/aws-ecs';
 import { ARecord, IHostedZone, RecordTarget } from 'aws-cdk-lib/aws-route53';
 import { LoadBalancerTarget } from 'aws-cdk-lib/aws-route53-targets';
+import { ISecret } from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
@@ -24,6 +25,24 @@ export interface ApplicationDnsProps {
 
   /** Fully qualified domain name the API answers on, for example `api.dev.example.com`. */
   readonly domainName: string;
+}
+
+/**
+ * Phase 4 authentication wiring, consumed from the Cognito stack by reference. This stack defines no
+ * Cognito resource of its own - only the values the container needs to act as the OAuth client.
+ */
+export interface ApplicationAuthProps {
+  /** OIDC issuer URL of the user pool. */
+  readonly issuerUrl: string;
+
+  /** Public identifier of the confidential app client. */
+  readonly userPoolClientId: string;
+
+  /** Secret holding the app client secret under the `clientSecret` key. */
+  readonly clientSecret: ISecret;
+
+  /** Where the browser returns after RP-initiated logout. */
+  readonly logoutUrl: string;
 }
 
 export interface ApplicationStackProps extends StackProps {
@@ -53,6 +72,13 @@ export interface ApplicationStackProps extends StackProps {
    * has been delegated, which keeps the HTTP-only path working.
    */
   readonly dns?: ApplicationDnsProps;
+
+  /**
+   * Phase 4 authentication, read from the Cognito stack by reference. The CORS allowlist and the
+   * session timeout come from `config.auth`; only the four connection values travel as props, so
+   * the caller cannot supply a client secret from anywhere but the Cognito stack.
+   */
+  readonly auth: ApplicationAuthProps;
 }
 
 /**
@@ -71,6 +97,12 @@ export interface ApplicationStackProps extends StackProps {
  * gets an HTTPS listener and a port 80 redirect, and an alias record is created in the DNS stack's
  * hosted zone. Both are consumed by reference, so this stack still defines neither the zone nor the
  * certificate.
+ *
+ * Phase 4 makes the API the OAuth client of the Cognito user pool: the issuer, client id, logout
+ * URI, CORS allowlist and session timeout are passed to the container as environment variables, and
+ * the app client secret is injected from Secrets Manager exactly like the database password. No
+ * Cognito resource is defined here - only consumed - so the pool and its app client keep a single
+ * definition in the Cognito stack.
  *
  * No cache, queue or auto scaling is created here: those are later phases.
  */
@@ -112,6 +144,14 @@ export class ApplicationStack extends Stack {
       albSecurityGroup,
       applicationSecurityGroup: props.applicationSecurityGroup,
       database,
+      auth: {
+        issuerUrl: props.auth.issuerUrl,
+        userPoolClientId: props.auth.userPoolClientId,
+        clientSecret: props.auth.clientSecret,
+        logoutUrl: props.auth.logoutUrl,
+        allowedOrigins: config.auth.allowedOrigins,
+        sessionTimeout: config.auth.sessionTimeout,
+      },
       certificate: props.dns?.certificate,
       domainName: props.dns?.domainName,
       removalPolicy: config.removalPolicy,

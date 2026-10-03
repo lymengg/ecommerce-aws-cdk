@@ -9,8 +9,8 @@ Phase 1   Networking                     ✅ done
 Phase 2   Compute & Containers           ✅ done
 Phase 3   Database & Persistence         ✅ done
 Phase 3.5 TLS & DNS                      ✅ done
-Phase 4   Authentication & Authorization ← next
-Phase 5   Messaging & Event-Driven
+Phase 4   Authentication & Authorization ✅ done
+Phase 5   Messaging & Event-Driven       ← next
 Phase 6   Caching & Performance
 Phase 7   Observability & Security
 Phase 8   CI/CD
@@ -74,20 +74,36 @@ no new security group rule (Phase 1 already opened 443).
 **Concepts:** DNS delegation and NS records, DNS vs email validation, certificate lifecycle and
 renewal, listener actions vs target groups, redirect actions, alias records vs IP addresses.
 
-## Phase 4 — Authentication & Authorization ⬜
+## Phase 4 — Authentication & Authorization ✅
 
-**Scope:**
+**Delivered:** a Cognito user pool (`ecommerce-cognito-<env>`) with a **confidential** app client and
+a client secret in Secrets Manager, and a Spring Boot API that is the OAuth client — the **Backend
+for Frontend** pattern. The browser holds only an `httpOnly`, `Secure`, `SameSite=Lax` session
+cookie; the app runs the **authorization code + PKCE** flow server side and holds the tokens itself.
+Only the authorization code flow is enabled: no implicit flow, no client credentials, and no resource
+owner password grant (RFC 9700 deprecates it, so `ALLOW_USER_PASSWORD_AUTH` never appears). `state`
+and `nonce` stay on. Logout is RP-initiated and the refresh token rotates and is revoked.
 
-- Cognito user pool + app client; hosted/managed login or direct JWT issuance.
-- JWT authorizer on the API — either ALB auth action or application-level validation.
-- Order endpoints (`POST /api/orders`) become authenticated; product reads can stay public.
-- Groups/roles for admin vs customer claims.
+`cognito:groups` is mapped to `ROLE_<group>` authorities, and one `SecurityConfig` expresses the
+whole policy: `GET /api/**` and `/actuator/health` are public, writes under `/api/**` require the
+`admin` group, everything else is authenticated, and an unauthenticated `/api/**` call answers `401`
+rather than redirecting. CSRF stays on with Spring Security's SPA handling; CORS allows only exact
+configured origins with credentials.
 
-**Acceptance:** unauthenticated `POST` → 401; valid token → 201; admin-only route enforced by
-claim, not by endpoint secrecy.
+**Deliberately deferred:** bearer-token / resource-server support for future mobile or service
+clients (`spring-boot-starter-oauth2-resource-server` is not on the classpath), and orders — Phase 5
+owns the order domain and inherits the same authorization rule.
 
-**Concepts:** user pools vs identity pools, OIDC auth-code + PKCE, JWT validation, token storage
-and rotation, ALB authentication vs in-app authorization.
+**Known constraint:** sessions are in memory, so `application.desiredCount > 1` is rejected at synth
+until sessions move to Redis (Phase 6).
+
+**Acceptance:** unauthenticated `GET /api/products` → 200; unauthenticated `POST` → 401; authenticated
+non-admin `POST` → 403; admin `POST` → 201 with the row persisted; `/actuator/health` → 200
+unauthenticated. Enforced by claim, never by endpoint secrecy.
+
+**Concepts:** user pools vs identity pools, BFF vs SPA-held tokens, OIDC auth-code + PKCE,
+confidential vs public clients, claim-to-authority mapping, CSRF for SPAs, session cookies and
+`SameSite`, RP-initiated logout and token rotation, why ALB `authenticate-oidc` is not enough.
 
 ## Phase 5 — Messaging & Event-Driven ⬜
 

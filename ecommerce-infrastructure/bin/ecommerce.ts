@@ -5,6 +5,7 @@ import { App } from 'aws-cdk-lib';
 
 import { EnvironmentConfig, getEnvironmentConfig, resolveEnvironmentName, resolveImageTag } from '../lib/config';
 import { ApplicationStack } from '../lib/stacks/application-stack';
+import { CognitoStack } from '../lib/stacks/cognito-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
@@ -81,12 +82,37 @@ const dns =
         description: `E-commerce platform public DNS and TLS certificate (${environment})`,
       });
 
+// Phase 4 authentication. The user pool and the confidential app client the BFF authenticates as
+// live in their own stack, ahead of the compute that consumes them, so the pool can be retained and
+// its users survive a redeployment of the application.
+//
+// The app client needs the API's fully qualified domain name for its exact callback URIs, so it is
+// derived from `config.dns` (never imported as a string). Authentication requires a `Secure` session
+// cookie, so the validator guarantees a domain is configured by the time the app runs; this guard
+// turns a programming mistake into a clear error rather than a broken callback URL.
+//
+// Deploy order is therefore dns -> cognito -> application.
+if (config.dns === undefined || dns === undefined) {
+  throw new Error(`Phase 4 authentication requires a delegated domain for environment "${environment}".`);
+}
+// The browser lands on the SPA after logout; the URL is registered in the app client's logoutUrls.
+const logoutUrl = config.auth.logoutUrl;
+
+const cognito = new CognitoStack(app, `ecommerce-cognito-${environment}`, {
+  env: {
+    account: config.account,
+    region: config.region,
+  },
+  config: deployedConfig,
+  description: `E-commerce platform authentication (${environment})`,
+});
+
 // The application stack consumes the network stack's VPC and security groups, the registry, the
-// database stack's endpoint and credentials secret, and - when configured - the DNS stack's hosted
-// zone and certificate, so the CDK CLI orders the stacks: network, registry, database and dns must
-// exist before compute can attach to them. The references are by object, never by ARN string, and
-// there is no path back from the DNS stack to the application stack, so the dependency graph stays
-// acyclic.
+// database stack's endpoint and credentials secret, the DNS stack's hosted zone and certificate,
+// and the Cognito stack's user pool, app client and client secret, so the CDK CLI orders the
+// stacks: network, registry, database, dns and cognito must exist before compute can attach to
+// them. The references are by object, never by ARN string, and there is no path back from any
+// producer to the application stack, so the dependency graph stays acyclic.
 new ApplicationStack(app, `ecommerce-application-${environment}`, {
   env: {
     account: config.account,
@@ -103,9 +129,12 @@ new ApplicationStack(app, `ecommerce-application-${environment}`, {
     databaseName: config.database.databaseName,
     secret: database.credentialsSecret,
   },
-  dns:
-    dns === undefined
-      ? undefined
-      : { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
+  dns: { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
+  auth: {
+    issuerUrl: cognito.issuerUrl,
+    userPoolClientId: cognito.userPoolClient.userPoolClientId,
+    clientSecret: cognito.clientSecret,
+    logoutUrl,
+  },
   description: `E-commerce platform application compute (${environment})`,
 });

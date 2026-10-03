@@ -1,9 +1,11 @@
 import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
+import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
 
 import { getEnvironmentConfig } from '../lib/config';
 import { DnsConfig, EnvironmentConfig, EnvironmentName } from '../lib/config/types';
 import { ApplicationStack } from '../lib/stacks/application-stack';
+import { CognitoStack } from '../lib/stacks/cognito-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
@@ -30,19 +32,24 @@ interface BuiltStacks {
   readonly database: DatabaseStack;
   readonly application: ApplicationStack;
   readonly dns?: DnsStack;
+  readonly cognito?: CognitoStack;
 }
 
 /**
  * Builds the Phase 1 network stack, the Phase 2 registry stack, the Phase 3 database stack, the
- * Phase 3.5 DNS stack (when the configuration has a delegated subdomain) and the application stack
- * in one app, exactly as `bin/ecommerce.ts` does, so the cross-stack wiring is exercised rather than
- * stubbed. `dnsOverride` injects a subdomain for the tests that need the TLS path without depending
- * on `ECOMMERCE_<ENV>_DOMAIN` being set in the developer's shell.
+ * Phase 3.5 DNS stack, the Phase 4 Cognito stack and the application stack in one app, exactly as
+ * `bin/ecommerce.ts` does, so the cross-stack wiring is exercised rather than stubbed.
+ *
+ * `options.dns` overrides the subdomain for the tests that need a specific TLS path without
+ * depending on `ECOMMERCE_<ENV>_DOMAIN`; `options.dns === null` strips it entirely, which is the
+ * only way to reach the certificate-less listener now that every environment configures a domain
+ * (authentication requires HTTPS).
  */
-function buildStacks(environment: EnvironmentName, dnsOverride?: DnsConfig): BuiltStacks {
+function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | null } = {}): BuiltStacks {
   const app = new App();
   const base = getEnvironmentConfig(environment);
-  const config: EnvironmentConfig = dnsOverride === undefined ? base : { ...base, dns: dnsOverride };
+  const config: EnvironmentConfig =
+    options.dns === null ? { ...base, dns: undefined } : options.dns === undefined ? base : { ...base, dns: options.dns };
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
@@ -55,6 +62,9 @@ function buildStacks(environment: EnvironmentName, dnsOverride?: DnsConfig): Bui
   });
   const dns =
     config.dns === undefined ? undefined : new DnsStack(app, `test-dns-${environment}`, { env, config });
+  // The Cognito stack needs a domain for its callback URIs, so it is only built when one exists.
+  const cognito =
+    config.dns === undefined ? undefined : new CognitoStack(app, `test-cognito-${environment}`, { env, config });
   const application = new ApplicationStack(app, `test-application-${environment}`, {
     env,
     config,
@@ -70,9 +80,25 @@ function buildStacks(environment: EnvironmentName, dnsOverride?: DnsConfig): Bui
     },
     dns:
       dns === undefined ? undefined : { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
+    auth:
+      cognito === undefined
+        ? {
+            // Only reachable from the certificate-less test: without a domain there is no pool, so a
+            // stand-in secret is imported purely to keep the construct's wiring exercised.
+            issuerUrl: 'https://cognito-idp.example.com/pool',
+            userPoolClientId: 'test-client-id',
+            clientSecret: Secret.fromSecretNameV2(network, 'StandInClientSecret', 'stand-in-client-secret'),
+            logoutUrl: config.auth.logoutUrl,
+          }
+        : {
+            issuerUrl: cognito.issuerUrl,
+            userPoolClientId: cognito.userPoolClient.userPoolClientId,
+            clientSecret: cognito.clientSecret,
+            logoutUrl: config.auth.logoutUrl,
+          },
   });
 
-  return { template: Template.fromStack(application), network, database, application, dns };
+  return { template: Template.fromStack(application), network, database, application, dns, cognito };
 }
 
 /** Finds the single listener on a given port, or fails the test if there is not exactly one. */
@@ -213,7 +239,7 @@ describe('ApplicationStack database wiring', () => {
       ]),
     );
 
-    expect(Object.keys(secrets).sort()).toEqual(['DB_PASSWORD', 'DB_USERNAME']);
+    expect(Object.keys(secrets).sort()).toEqual(['COGNITO_CLIENT_SECRET', 'DB_PASSWORD', 'DB_USERNAME']);
     // ECS resolves `{{resolve:secretsmanager:<arn>:SecretString:<field>::}}` at container start.
     expect(json(secrets.DB_USERNAME)).toContain(':username::');
     expect(json(secrets.DB_PASSWORD)).toContain(':password::');
@@ -227,6 +253,72 @@ describe('ApplicationStack database wiring', () => {
 
     template.resourceCountIs('AWS::RDS::DBInstance', 0);
     template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+  });
+});
+
+describe('ApplicationStack authentication wiring', () => {
+  test('passes the Cognito connection details as plain environment variables', () => {
+    const template = buildStacks('dev').template;
+    const container = single(template, 'AWS::ECS::TaskDefinition').properties.ContainerDefinitions[0];
+    const environment = Object.fromEntries(
+      (container.Environment ?? []).map((entry: { Name: string; Value: unknown }) => [entry.Name, entry.Value]),
+    );
+
+    // The issuer, client id and logout URI are tokens resolved from the Cognito stack, never
+    // literals in this stack.
+    expect(json(environment.COGNITO_ISSUER_URI)).toContain('test-cognito-dev');
+    expect(json(environment.COGNITO_CLIENT_ID)).toContain('test-cognito-dev');
+    // Post-logout the browser returns to the SPA, not the API.
+    expect(environment.COGNITO_LOGOUT_URI).toBe('http://localhost:5173');
+    // CORS origins are an explicit allowlist and never a wildcard.
+    expect(environment.CORS_ALLOWED_ORIGINS).toBe('http://localhost:5173');
+    expect(json(environment.CORS_ALLOWED_ORIGINS)).not.toContain('*');
+    // Session timeout travels in the ISO-8601 form Spring Boot's Duration binding expects.
+    expect(environment.SESSION_TIMEOUT).toBe('PT8H');
+  });
+
+  test('injects the Cognito client secret from Secrets Manager instead of carrying it', () => {
+    const template = buildStacks('dev').template;
+    const container = single(template, 'AWS::ECS::TaskDefinition').properties.ContainerDefinitions[0];
+    const secrets = Object.fromEntries(
+      (container.Secrets ?? []).map((secret: { Name: string; ValueFrom: unknown }) => [secret.Name, secret.ValueFrom]),
+    );
+
+    expect(Object.keys(secrets).sort()).toEqual(['COGNITO_CLIENT_SECRET', 'DB_PASSWORD', 'DB_USERNAME']);
+    // The secret comes from the Cognito stack's secret, under the `clientSecret` field.
+    expect(json(secrets.COGNITO_CLIENT_SECRET)).toContain(':clientSecret::');
+    expect(json(secrets.COGNITO_CLIENT_SECRET)).toContain('ClientSecret');
+    // No credential value ever appears in the template.
+    expect(json(container)).not.toContain('client-secret-value');
+  });
+
+  test('defines no Cognito resource of its own, only references the Cognito stack', () => {
+    const template = buildStacks('dev').template;
+
+    template.resourceCountIs('AWS::Cognito::UserPool', 0);
+    template.resourceCountIs('AWS::Cognito::UserPoolClient', 0);
+  });
+
+  test('adds HSTS to the HTTPS listener so browsers never retry over plaintext', () => {
+    const { template } = buildStacks('dev', { dns: TEST_DNS });
+    const listener = listenerOnPort(template, 443);
+    const attributes = Object.fromEntries(
+      (listener.properties.ListenerAttributes ?? []).map((attribute: { Key: string; Value: string }) => [
+        attribute.Key,
+        attribute.Value,
+      ]),
+    );
+
+    expect(attributes['routing.http.response.strict_transport_security.header_value']).toBe(
+      'max-age=31536000; includeSubDomains',
+    );
+  });
+
+  test('adds no new security group rule for the authentication wiring', () => {
+    const template = buildStacks('dev').template;
+
+    // Phase 4 changes IAM and the task definition only: the security group model is untouched.
+    expect(resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress')).toHaveLength(1);
   });
 });
 
@@ -296,7 +388,9 @@ describe('ApplicationStack IAM', () => {
 
     expect(json(statements)).toContain('Repository');
     expect(json(statements)).toContain('ApiLogGroup');
+    // Both secrets are read: the Phase 3 database credentials and the Phase 4 Cognito client secret.
     expect(json(statements)).toContain('Credentials');
+    expect(json(statements)).toContain('ClientSecret');
   });
 
   test('gives the task role no permissions at all', () => {
@@ -428,8 +522,10 @@ describe('ApplicationStack load balancer', () => {
 });
 
 describe('ApplicationStack listener and target group', () => {
-  test('listens on HTTP port 80 and forwards to the target group', () => {
-    const template = buildStacks('dev').template;
+  test('listens on HTTP port 80 and forwards to the target group when no certificate is configured', () => {
+    // Every environment has a certificate from Phase 4 on, so the forwarding port 80 listener only
+    // exists on a stack built without dns; the configured path redirects 80 to 443 instead.
+    const template = buildStacks('dev', { dns: null }).template;
     const listener = single(template, 'AWS::ElasticLoadBalancingV2::Listener');
 
     expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
@@ -506,9 +602,10 @@ describe('ApplicationStack outputs', () => {
 });
 
 describe('ApplicationStack DNS and TLS', () => {
-  test('leaves the plaintext HTTP path unchanged when no dns is configured', () => {
-    // dev with no delegated subdomain: exactly what Phase 2 produced.
-    const template = buildStacks('dev').template;
+  test('still supports a certificate-less listener when a stack is built without dns', () => {
+    // Every environment configures a domain from Phase 4 on (auth needs HTTPS), so this exercises
+    // the construct's optional-certificate branch directly rather than through a real environment.
+    const template = buildStacks('dev', { dns: null }).template;
     const listener = single(template, 'AWS::ElasticLoadBalancingV2::Listener');
 
     expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
@@ -522,7 +619,7 @@ describe('ApplicationStack DNS and TLS', () => {
   });
 
   test('terminates TLS on 443 and forwards to the existing target group', () => {
-    const { template, dns } = buildStacks('dev', TEST_DNS);
+    const { template, dns } = buildStacks('dev', { dns: TEST_DNS });
     const listener = listenerOnPort(template, 443);
 
     expect(listener.properties).toMatchObject({
@@ -541,7 +638,7 @@ describe('ApplicationStack DNS and TLS', () => {
   });
 
   test('redirects plaintext HTTP to HTTPS with a permanent redirect', () => {
-    const template = buildStacks('dev', TEST_DNS).template;
+    const template = buildStacks('dev', { dns: TEST_DNS }).template;
     const listener = listenerOnPort(template, 80);
 
     // A redirect action, not a forward: no plaintext request ever reaches the application.
@@ -552,7 +649,7 @@ describe('ApplicationStack DNS and TLS', () => {
   });
 
   test('creates an alias A record to the load balancer, never an IP address', () => {
-    const { template, dns } = buildStacks('dev', TEST_DNS);
+    const { template, dns } = buildStacks('dev', { dns: TEST_DNS });
     const record = single(template, 'AWS::Route53::RecordSet');
 
     expect(record.properties).toMatchObject({ Name: `${TEST_FQDN}.`, Type: 'A' });
@@ -566,14 +663,14 @@ describe('ApplicationStack DNS and TLS', () => {
   });
 
   test('defines neither the hosted zone nor the certificate, only references them', () => {
-    const template = buildStacks('dev', TEST_DNS).template;
+    const template = buildStacks('dev', { dns: TEST_DNS }).template;
 
     template.resourceCountIs('AWS::Route53::HostedZone', 0);
     template.resourceCountIs('AWS::CertificateManager::Certificate', 0);
   });
 
   test('publishes the HTTPS URL and keeps the plaintext URL for the redirect check', () => {
-    const template = buildStacks('dev', TEST_DNS).template;
+    const template = buildStacks('dev', { dns: TEST_DNS }).template;
     const outputs = template.toJSON().Outputs;
 
     expect(outputs.ApiUrl.Value).toBe(`https://${TEST_FQDN}`);
@@ -583,7 +680,7 @@ describe('ApplicationStack DNS and TLS', () => {
   });
 
   test('adds no duplicate rule for 443 - the Phase 1 security group already allows it', () => {
-    const template = buildStacks('dev', TEST_DNS).template;
+    const template = buildStacks('dev', { dns: TEST_DNS }).template;
 
     const ingress = resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress');
     expect(ingress).toHaveLength(1);

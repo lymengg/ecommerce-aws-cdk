@@ -1,4 +1,5 @@
-import { RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Mfa } from 'aws-cdk-lib/aws-cognito';
 import { InstanceType } from 'aws-cdk-lib/aws-ec2';
 import { RetentionDays } from 'aws-cdk-lib/aws-logs';
 import { PostgresEngineVersion } from 'aws-cdk-lib/aws-rds';
@@ -163,6 +164,106 @@ export interface DnsConfig {
 }
 
 /**
+ * Authentication and authorisation configuration of the platform (Phase 4).
+ *
+ * The platform uses the Backend for Frontend pattern: the Spring Boot API is the OAuth client, the
+ * browser only ever holds an `httpOnly` session cookie, and Cognito is never spoken to directly by
+ * the browser. Everything the user pool, the app client and the BFF's own session need is therefore
+ * expressed here per environment, so the difference between dev and prod is a reviewable diff of
+ * this file rather than a value buried in a stack.
+ *
+ * Deliberately absent: the app client secret. Cognito generates it, Secrets Manager stores it, and
+ * ECS injects it into the container; it is never written down here or anywhere else.
+ *
+ * Because a `Secure` session cookie only works over HTTPS, an environment with an `auth` block and
+ * no `dns` block is rejected at synth (see `validation.ts`).
+ */
+export interface AuthConfig {
+  /**
+   * Minimum password length enforced by Cognito. Cognito accepts 6 to 99 characters; the length is
+   * the single most effective password lever, which is why production asks for considerably more
+   * than the minimum while dev stays easy to sign in to.
+   */
+  readonly passwordMinimumLength: number;
+
+  /** Require at least one uppercase letter. Cheap to satisfy, so prod enables it. */
+  readonly requireUppercase: boolean;
+
+  /** Require at least one lowercase letter. */
+  readonly requireLowercase: boolean;
+
+  /** Require at least one digit. */
+  readonly requireDigits: boolean;
+
+  /**
+   * Require at least one symbol. Symbols meaningfully enlarge the search space, so production asks
+   * for them; dev leaves them off so a throwaway password is not rejected while testing.
+   */
+  readonly requireSymbols: boolean;
+
+  /**
+   * Whether Cognito enforces a second factor at sign-in. Production requires it; dev turns it off
+   * so the login loop can be exercised without a virtual authenticator. Only time-based one-time
+   * passwords are offered (see the Cognito stack) - SMS MFA would need a phone number and an SNS
+   * role, and is not worth the moving parts here.
+   */
+  readonly mfa: Mfa;
+
+  /**
+   * Allow users to create their own account through the hosted UI. Production is invitation-only
+   * (an administrator creates the account), because open registration on a production user pool is
+   * an abuse surface. Dev keeps it on so a fresh environment is usable immediately.
+   */
+  readonly selfSignUpEnabled: boolean;
+
+  /**
+   * Lifetime of the OAuth access token. Cognito accepts 5 minutes to 1 day. This is the credential
+   * the BFF presents when it calls a resource server (a later phase), so it is kept short: a stolen
+   * access token is worthless after it expires, and the BFF refreshes silently.
+   */
+  readonly accessTokenValidity: Duration;
+
+  /**
+   * Lifetime of the OIDC ID token. Cognito accepts 5 minutes to 1 day. The ID token carries the
+   * `cognito:groups` claim the BFF turns into authorities, so it follows the access token lifetime.
+   */
+  readonly idTokenValidity: Duration;
+
+  /**
+   * Lifetime of the refresh token. Cognito accepts 60 minutes to 10 years. Rotation is enabled in
+   * the stack, so this is the window in which a stolen token could be replayed before it is
+   * rotated out; production keeps it as short as the user experience allows.
+   */
+  readonly refreshTokenValidity: Duration;
+
+  /**
+   * How long the BFF keeps its own server-side session alive. This is the browser's session cookie
+   * lifetime, not a Cognito token: the app client's refresh token has to outlive it, or a session
+   * could not be refreshed, which is why the validator checks that.
+   */
+  readonly sessionTimeout: Duration;
+
+  /**
+   * Exact origins the browser frontend is served from, for CORS. The frontend is built separately,
+   * so its origin is environment specific. These must be absolute origins (`scheme://host[:port]`)
+   * and never `*`: the API answers with credentials, and a wildcard origin combined with
+   * `allowCredentials` is both invalid and dangerous.
+   */
+  readonly allowedOrigins: readonly string[];
+
+  /**
+   * Absolute URL the browser returns to after RP-initiated logout. This is the **frontend**, not the
+   * API: once the Cognito session has ended, the user should land on the SPA, which is why the
+   * value is registered in the app client's `logoutUrls`. Must be an absolute origin and never `*`.
+   *
+   * It is deliberately separate from {@link allowedOrigins}: the CORS allowlist governs which
+   * origins may call the API, while this is a single navigation target. In a same-site setup the
+   * two usually share a host, but they are not required to.
+   */
+  readonly logoutUrl: string;
+}
+
+/**
  * Everything a stack needs to know about the environment it is deployed to.
  *
  * Values are supplied per environment (see `dev.ts`, `uat.ts`, `prod.ts`) so that no stack ever
@@ -214,8 +315,12 @@ export interface EnvironmentConfig {
   readonly database: DatabaseConfig;
 
   /**
-   * Public DNS and TLS configuration (Phase 3.5). Omitted in dev until a domain has been delegated,
-   * which keeps `cdk synth` and an HTTP-only deployment working; required in production.
+   * Public DNS and TLS configuration (Phase 3.5). From Phase 4 on this is effectively required in
+   * every environment: an authentication-enabled environment needs an HTTPS origin for its `Secure`
+   * session cookie, so the validator rejects a configuration that has `auth` but no `dns`.
    */
   readonly dns?: DnsConfig;
+
+  /** Authentication and authorisation configuration (Phase 4). Always present; auth is not optional. */
+  readonly auth: AuthConfig;
 }

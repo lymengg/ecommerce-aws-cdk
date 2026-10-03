@@ -1,19 +1,24 @@
 package com.ecommerce.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.csrf;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.ecommerce.api.repository.ProductRepository;
+import com.ecommerce.api.support.TestAuthProperties;
+import com.ecommerce.api.support.TestSecurityConfiguration;
 import com.jayway.jsonpath.JsonPath;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.context.annotation.Import;
 import org.springframework.http.MediaType;
+import org.springframework.security.test.context.support.WithMockUser;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -33,10 +38,16 @@ import org.testcontainers.postgresql.PostgreSQLContainer;
  * environment-driven values in {@code application.properties}. Flyway then migrates the container
  * and Hibernate validates the entity against the migrated schema before the first test runs, so a
  * broken migration or a stale entity fails the suite at startup.
+ *
+ * From Phase 4 the writes are admin-only and CSRF-protected, so the class runs as an {@code admin}
+ * mock user and every POST carries a CSRF token. The authentication rules themselves - 401 for an
+ * anonymous write, 403 for a non-admin - are covered by {@link SecurityTest}.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
 @Testcontainers
+@Import(TestSecurityConfiguration.class)
+@WithMockUser(roles = "admin")
 class ProductApiTest {
 
     @Container
@@ -47,6 +58,7 @@ class ProductApiTest {
         registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
         registry.add("spring.datasource.username", POSTGRES::getUsername);
         registry.add("spring.datasource.password", POSTGRES::getPassword);
+        TestAuthProperties.register(registry);
     }
 
     @Autowired
@@ -73,7 +85,7 @@ class ProductApiTest {
 
     @Test
     void createsAProductAndReadsItBackFromPostgres() throws Exception {
-        String body = mockMvc.perform(post("/api/products")
+        String body = mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"name":"Laptop","description":"A 14 inch laptop","price":1200.00,"quantity":5}
@@ -115,7 +127,7 @@ class ProductApiTest {
 
     @Test
     void defaultsAnOmittedQuantityToZero() throws Exception {
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Cable\",\"price\":9.99}"))
                 .andExpect(status().isCreated())
@@ -130,12 +142,12 @@ class ProductApiTest {
 
     @Test
     void rejectsAProductWithoutAName() throws Exception {
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"price\":10.00}"))
                 .andExpect(status().isBadRequest());
 
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"   \",\"price\":10.00}"))
                 .andExpect(status().isBadRequest());
@@ -145,17 +157,17 @@ class ProductApiTest {
 
     @Test
     void rejectsAPriceThatIsNotPositive() throws Exception {
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Freebie\",\"price\":0.00}"))
                 .andExpect(status().isBadRequest());
 
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Refund\",\"price\":-1.00}"))
                 .andExpect(status().isBadRequest());
 
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"No price\"}"))
                 .andExpect(status().isBadRequest());
@@ -163,7 +175,7 @@ class ProductApiTest {
 
     @Test
     void rejectsANegativeQuantity() throws Exception {
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"Oversold\",\"price\":10.00,\"quantity\":-1}"))
                 .andExpect(status().isBadRequest());
@@ -177,7 +189,7 @@ class ProductApiTest {
     }
 
     private void createProduct(String name, String price, int quantity) throws Exception {
-        mockMvc.perform(post("/api/products")
+        mockMvc.perform(post("/api/products").with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"name\":\"%s\",\"price\":%s,\"quantity\":%d}".formatted(name, price, quantity)))
                 .andExpect(status().isCreated());

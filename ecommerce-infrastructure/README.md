@@ -22,8 +22,15 @@ ACM certificate validated by DNS, an HTTPS listener on the load balancer that fo
 existing target group, and a permanent redirect from HTTP to HTTPS. The API is now reached at
 `https://api.<env-domain>` instead of by the load balancer's plaintext DNS name.
 
-No cache, queue, authentication, CI/CD or auto scaling exists yet. Those are Phase 4+ and are listed
-at the end of this document.
+**Phase 4** delivers authentication and authorisation, using the **Backend for Frontend** pattern: a
+Cognito user pool with a confidential app client, and a Spring Boot API that is the OAuth client and
+holds the tokens server side. The browser receives only an `httpOnly` session cookie. Product reads
+stay public; product writes require the `admin` Cognito group, enforced server side by claim. The
+authorization code + PKCE flow is the only flow enabled - no implicit flow, no password grant, and no
+bearer-token resource server (that is deferred; see [Phase 5 and beyond](#phase-5-and-beyond)).
+
+No cache, queue, CI/CD or auto scaling exists yet. Those are later phases and are listed at the end
+of this document.
 
 ---
 
@@ -36,21 +43,22 @@ at the end of this document.
 5. [Core concepts: the application tier](#core-concepts-the-application-tier)
 6. [Core concepts: the data tier](#core-concepts-the-data-tier)
 7. [Core concepts: DNS and TLS](#core-concepts-dns-and-tls)
-8. [The Spring Boot application](#the-spring-boot-application)
-9. [The container image](#the-container-image)
-10. [ECR: how an image is tagged and pushed](#ecr-how-an-image-is-tagged-and-pushed)
-11. [IAM: execution role versus task role](#iam-execution-role-versus-task-role)
-12. [Database credentials and Secrets Manager](#database-credentials-and-secrets-manager)
-13. [Security group model](#security-group-model)
-14. [Environments and configuration](#environments-and-configuration)
-15. [Tags](#tags)
-16. [Stack outputs](#stack-outputs)
-17. [Removal policies and resource protection](#removal-policies-and-resource-protection)
-18. [Commands](#commands)
-19. [Deployment and verification procedure](#deployment-and-verification-procedure)
-20. [Testing](#testing)
-21. [Cost expectations](#cost-expectations)
-22. [Phase 4 and beyond](#phase-4-and-beyond)
+8. [Core concepts: authentication and authorisation](#core-concepts-authentication-and-authorisation)
+9. [The Spring Boot application](#the-spring-boot-application)
+10. [The container image](#the-container-image)
+11. [ECR: how an image is tagged and pushed](#ecr-how-an-image-is-tagged-and-pushed)
+12. [IAM: execution role versus task role](#iam-execution-role-versus-task-role)
+13. [Database credentials and Secrets Manager](#database-credentials-and-secrets-manager)
+14. [Security group model](#security-group-model)
+15. [Environments and configuration](#environments-and-configuration)
+16. [Tags](#tags)
+17. [Stack outputs](#stack-outputs)
+18. [Removal policies and resource protection](#removal-policies-and-resource-protection)
+19. [Commands](#commands)
+20. [Deployment and verification procedure](#deployment-and-verification-procedure)
+21. [Testing](#testing)
+22. [Cost expectations](#cost-expectations)
+23. [Phase 5 and beyond](#phase-5-and-beyond)
 
 ---
 
@@ -152,6 +160,47 @@ Internet ──80──▶ ALB SG              │
  (301 redirect)                      └──443──▶ Internet (via NAT, e.g. image pulls)
 ```
 
+### The Phase 4 request path
+
+Authentication does not add a new tier; it changes what the application does with a request. The
+browser never holds a token and never talks to Cognito directly - the Spring Boot app is the OAuth
+client (the Backend for Frontend pattern):
+
+```
+  Browser (SPA)                 BFF (Spring Boot)                    Cognito
+  ─────────────                 ─────────────────                    ───────
+  GET /me  ──────────────────▶  no session
+                               302 ────────────────────────────────▶ /oauth2/authorization/cognito
+                                                                      hosted UI (PKCE, S256)
+       ◀────────────────────────────────────────────────────────────  authorization code
+                                POST /login/oauth2/code/cognito
+                                exchange code (client secret) ──────▶ token endpoint
+                                ◀──────────────────────────────────── ID / access / refresh tokens
+                                create server-side session
+       ◀── 302 + Set-Cookie: SESSION (httpOnly, Secure, SameSite=Lax)
+
+  GET /api/products  ─────────▶  permitAll  ──▶ PostgreSQL (public read)
+  POST /api/products ─────────▶  session cookie + X-XSRF-TOKEN header
+                                 CSRF ok, cognito:groups -> ROLE_admin, hasRole("admin") ok
+                                 ──▶ PostgreSQL (write)
+
+  POST /logout ───────────────▶  end session ────────────────────────▶ Cognito /logout (RP-initiated)
+       ◀── 302 https://<frontend>  ◀───────────────────────────────────  session + refresh token revoked
+            (the SPA, not the API)
+```
+
+| Caller | Request | Result |
+| ------ | ------- | ------ |
+| Anyone | `GET /api/products`, `GET /api/products/{id}` | `200` (reads stay public) |
+| Anyone | `GET /actuator/health` | `200` (the load balancer health check) |
+| Anonymous | `POST /api/products` | `401`, not a redirect to the hosted UI |
+| Signed in, not in `admin` | `POST /api/products` | `403` |
+| Signed in, in `admin` | `POST /api/products` | `201` |
+| Anonymous | any other protected path (for example `GET /me`) | `302` to the Cognito hosted UI |
+
+The distinction between `401` and `302` matters: a JavaScript `fetch` gets a status it can act on,
+while a browser navigation still gets the login redirect that starts the hosted-UI flow.
+
 ---
 
 ## Project structure
@@ -163,7 +212,7 @@ aws-cdk/
 │   │   └── ecommerce.ts              # CDK app entry point: resolve env, build the stacks
 │   ├── lib/
 │   │   ├── config/
-│   │   │   ├── types.ts              # EnvironmentConfig + Application/Database/DnsConfig
+│   │   │   ├── types.ts              # EnvironmentConfig + Application/Database/Dns/AuthConfig
 │   │   │   ├── validation.ts         # fail-fast validation of an environment config
 │   │   │   ├── dev.ts                # dev values
 │   │   │   ├── uat.ts                # uat values
@@ -172,21 +221,23 @@ aws-cdk/
 │   │   ├── constructs/
 │   │   │   ├── tier-security-groups.ts   # ALB / application / database security groups
 │   │   │   ├── vpc-flow-logs.ts          # optional flow logging + its least-privilege role
-│   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB wiring, IAM
+│   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB + auth wiring, IAM
 │   │   ├── stacks/
 │   │   │   ├── network-stack.ts      # VPC, public/private/isolated subnets, routing, SGs
 │   │   │   ├── ecr-stack.ts          # container registry
 │   │   │   ├── database-stack.ts     # RDS PostgreSQL instance + Secrets Manager credentials
 │   │   │   ├── dns-stack.ts          # Route 53 hosted zone + ACM certificate (Phase 3.5)
+│   │   │   ├── cognito-stack.ts      # user pool, confidential app client, client secret (Phase 4)
 │   │   │   └── application-stack.ts  # ECS cluster, service, ALB, IAM, logs, DNS record
 │   │   └── tags.ts                   # the shared tag contract
 │   ├── test/
-│   │   ├── setup-env.ts              # sets ECOMMERCE_PROD_DOMAIN before the config is imported
+│   │   ├── setup-env.ts              # sets ECOMMERCE_<ENV>_DOMAIN before the config is imported
 │   │   ├── network-stack.test.ts     # network contract tests (CDK assertions)
 │   │   ├── ecr-stack.test.ts         # registry contract tests
 │   │   ├── database-stack.test.ts    # database contract tests
 │   │   ├── dns-stack.test.ts         # hosted zone + certificate contract tests
-│   │   ├── application-stack.test.ts # compute + database + TLS wiring contract tests
+│   │   ├── cognito-stack.test.ts     # user pool, app client and secret contract tests
+│   │   ├── application-stack.test.ts # compute + database + TLS + auth wiring contract tests
 │   │   └── config.test.ts            # configuration tests
 │   ├── cdk.json
 │   ├── jest.config.js
@@ -197,17 +248,22 @@ aws-cdk/
 └── application/                      # the Spring Boot API
     ├── src/main/java/com/ecommerce/api/
     │   ├── EcommerceApiApplication.java
+    │   ├── config/SecurityConfig.java          # filter chain, CORS, 401 entry point, CSRF, OIDC logout
+    │   ├── security/CognitoAuthoritiesMapper.java  # cognito:groups -> ROLE_<group>
     │   ├── controller/ProductController.java   # HTTP mapping only
+    │   ├── controller/SessionController.java   # /me, the protected endpoint that starts login
     │   ├── dto/ProductRequest.java             # validated create payload
     │   ├── service/ProductService.java         # business operations + transactions
     │   ├── repository/ProductRepository.java   # Spring Data JPA
     │   └── entity/Product.java                 # JPA entity mapped to `products`
     ├── src/main/resources/
-    │   ├── application.properties              # datasource from env, no credentials
+    │   ├── application.properties              # datasource + auth from env, no credentials
     │   └── db/migration/V1__create_products_table.sql   # Flyway migration
     ├── src/test/java/com/ecommerce/api/
     │   ├── ProductApiTest.java                 # HTTP + PostgreSQL (Testcontainers)
-    │   └── service/ProductServiceTest.java     # service unit tests (Mockito)
+    │   ├── SecurityTest.java                   # 401 / 403 / 201 and CORS contract
+    │   ├── service/ProductServiceTest.java     # service unit tests (Mockito)
+    │   └── support/                            # in-memory OIDC registration + auth test properties
     ├── pom.xml
     ├── Dockerfile
     ├── .dockerignore
@@ -227,7 +283,8 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 | Network | `ecommerce-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
 | Registry | `ecommerce-ecr-<env>` | ECR repository |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
-| DNS | `ecommerce-dns-<env>` | Route 53 hosted zone, ACM certificate (created only when a domain is configured) |
+| DNS | `ecommerce-dns-<env>` | Route 53 hosted zone, ACM certificate |
+| Cognito | `ecommerce-cognito-<env>` | Cognito user pool, prefix domain, confidential app client, client-secret secret, baseline alarm |
 | Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listeners, alias record, log group, IAM roles |
 
 The registry is a **separate stack from the compute** on purpose. An ECS service cannot start until
@@ -248,18 +305,28 @@ the zone can be delegated and left in place while the compute is redeployed. It 
 stack — the hosted zone is created, never looked up — so it can be deployed in parallel with the
 network, registry and database.
 
-Deployment order is therefore: **network → registry → database → dns → application**. The DNS stack
-sits between the database and the application because the application consumes its zone and
-certificate; nothing consumes the application, so there is no path back and the graph stays acyclic.
-One manual step sits inside that order: the zone must be delegated at the registrar (see
-[Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificate finishes issuing,
-which is why `ecommerce-dns-<env>` is deployed and delegated before `ecommerce-application-<env>`.
+The Cognito stack is a **separate stack from the compute** because a user pool holds users: it is
+stateful, it outlives the code that reads it, and its removal policy has to be decided
+independently. It sits after DNS and before the application, because the app client's
+callback URIs are exact HTTPS URLs on `api.<env-domain>` — the API's fully qualified name is derived
+from `config.dns`, never imported as a string — and because the application consumes the pool, the
+app client and the client secret by reference. (The logout URI points at the frontend, which needs
+no DNS from this stack.)
+
+Deployment order is therefore: **network → registry → database → dns → cognito → application**. The
+DNS stack sits between the database and the application because the application consumes its zone and
+certificate; the Cognito stack sits between DNS and the application because the application consumes
+the pool and the client secret. Nothing consumes the application, so there is no path back and the
+graph stays acyclic. One manual step sits inside that order: the zone must be delegated at the
+registrar (see [Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificate
+finishes issuing, which is why `ecommerce-dns-<env>` is deployed and delegated before
+`ecommerce-cognito-<env>` and `ecommerce-application-<env>`.
 
 The application stack consumes the network stack's VPC and security groups, the registry stack's
-repository, the database stack's endpoint and credentials secret, and the DNS stack's zone and
-certificate **by reference** (CDK cross-stack references), so the CDK CLI orders the stacks
-automatically and there is exactly one definition of each resource. No ARN is ever plumbed between
-stacks as a string.
+repository, the database stack's endpoint and credentials secret, the DNS stack's zone and
+certificate, and the Cognito stack's user pool, app client and client secret **by reference** (CDK
+cross-stack references), so the CDK CLI orders the stacks automatically and there is exactly one
+definition of each resource. No ARN is ever plumbed between stacks as a string.
 
 > Cross-stack references use **weak** strength (`"@aws-cdk/core:defaultCrossStackReferences": "weak"`
 > in `cdk.json`). A weak reference reads the producer's output directly instead of locking an export
@@ -476,9 +543,14 @@ reachable from outside the VPC. The listener pins `SslPolicy.RECOMMENDED_TLS`
 (`ELBSecurityPolicy-TLS13-1-2-2021-06`), which sets TLS 1.2 as the floor; the older `RECOMMENDED`
 policy still negotiates TLS 1.0/1.1 and is deliberately not used.
 
-Until a domain has been delegated, `LoadBalancedApi` is built without a certificate and the single
-port 80 listener forwards to the target group exactly as it did in Phase 2 — the HTTP-only path is
-unchanged, it is simply no longer what production uses.
+The 443 listener also carries the **HSTS** response header
+(`routing.http.response.strict_transport_security.header_value = max-age=31536000; includeSubDomains`),
+so a browser that has seen the API once will not retry it over plaintext. Setting it at the load
+balancer rather than only in the application means the redirect from port 80 carries it too.
+
+`LoadBalancedApi` still supports being built without a certificate — the single port 80 listener
+forwards to the target group exactly as it did in Phase 2 — but no environment takes that path any
+more: from Phase 4 authentication needs an HTTPS origin, so `dns` is required everywhere.
 
 ### CloudWatch Logs
 
@@ -666,22 +738,224 @@ stack decision, noted here so it is not discovered at deploy time.
 
 ---
 
+## Core concepts: authentication and authorisation
+
+Phase 4 adds a Cognito user pool and makes the Spring Boot API the OAuth client. The decision below
+is deliberate and recorded here so it is not relitigated: **Backend for Frontend (BFF), with
+bearer-token support explicitly deferred.**
+
+### Why the BFF pattern
+
+The browser holds only an `httpOnly` session cookie. It never receives an OAuth token and never
+talks to Cognito directly; the Spring Boot app performs the whole authorization code flow server
+side and holds the tokens itself.
+
+- The IETF browser-based apps BCP recommends BFF for browser clients, and OAuth 2.0 Security BCP
+  (RFC 9700) forbids placing tokens where a script can reach them. With the BFF, an XSS bug yields a
+  session cookie — which the server can revoke — not a refresh token an attacker can exfiltrate and
+  replay for days.
+- The app client is **confidential** (it has a secret), so the token endpoint is not open to anyone
+  who can read a client id out of a browser. A public client would have to rely on PKCE alone to
+  protect the code exchange.
+- Logout and revocation become real server-side operations: the BFF ends its own session and then
+  asks Cognito to end the Cognito session, and the app client has token revocation enabled, so the
+  refresh token is invalidated too.
+- There is no browser-side token lifetime, audience or `token_use` handling to get wrong, because
+  there are no browser-side tokens.
+
+**Explicitly rejected:**
+
+- **Implicit flow** — it exposes tokens in the URL fragment, where scripts and browser history can
+  reach them.
+- **Resource Owner Password Credentials grant** — RFC 9700 deprecates it, so `ALLOW_USER_PASSWORD_AUTH`
+  never appears and there is no scriptable password login.
+- **Tokens in `localStorage`/`sessionStorage`** — readable by any script on the page, which is the
+  exact class of bug the BFF removes.
+- **ALB `authenticate-oidc`** — it answers `302`, not `401`/`403`, and cannot express per-route
+  claims, so it cannot enforce "reads are public, writes need `admin`" or give a `fetch` a status it
+  can act on.
+
+**Deferred on purpose:** bearer-token / resource-server support for future mobile or service clients.
+`spring-boot-starter-oauth2-resource-server` is deliberately **not** on the classpath this phase. The
+`/api/**` authorization rules live in one place (`SecurityConfig`), so adding a bearer-token entry
+point later is additive rather than a rewrite.
+
+### The user pool and the app client
+
+`ecommerce-cognito-<env>` creates:
+
+| Resource | Purpose |
+| -------- | ------- |
+| `cognito.UserPool` `ecommerce-<env>-users` | The users. Password policy, MFA mode and self sign-up come from `config.auth`; the removal policy comes from `config.removalPolicy`. Deletion protection is deliberately not enabled. |
+| `cognito.UserPoolDomain` | A Cognito **prefix** domain hosting the managed login pages. A custom domain would need its own `us-east-1` certificate and DNS record — branding, not security, and a non-goal this phase. |
+| `cognito.UserPoolClient` `ecommerce-<env>-api-client` | The confidential app client: `generateSecret: true`, authorization code grant only, `openid email profile` scopes. |
+| `secretsmanager.Secret` | Holds the generated client secret under the `clientSecret` key. ECS injects it into the container exactly like the database password. |
+
+Only the **authorization code grant** is enabled. Every other flow is explicitly `false` in
+`oAuth.flows`, so a future edit cannot quietly re-enable one. The client's explicit auth flows are
+set to exactly `ALLOW_USER_SRP_AUTH` and `ALLOW_REFRESH_TOKEN_AUTH` (the L2 `authFlows` property
+cannot be combined with refresh rotation, so the stack uses the documented escape hatch): there is
+no `ALLOW_USER_PASSWORD_AUTH`, no admin password flow and no custom-auth flow. Callback URIs are
+**exact**, never wildcards, and the logout URI is the **frontend**:
+
+```
+callback:  https://api.<env-domain>/login/oauth2/code/cognito
+           http://localhost:8080/login/oauth2/code/cognito
+logout:    <auth.logoutUrl>            e.g. https://<env-domain>  (dev: http://localhost:5173)
+```
+
+The `localhost` callback is the Spring Boot app running on a developer machine — the only non-HTTPS
+origin Cognito allows. The logout URI is the SPA because that is where a signed-out user should land;
+the API has no logout landing of its own. There is deliberately **no identity pool**: nothing in this
+platform exchanges a user token for AWS credentials, so creating one would only widen the blast
+radius.
+
+MFA offers time-based one-time passwords only (`EnabledMfas: [SOFTWARE_TOKEN_MFA]`); SMS MFA would
+need a verified phone number and an SNS role for no security gain over TOTP.
+
+### The exact flow (authorization code + PKCE)
+
+1. The browser navigates to a protected path (`GET /me`). With no session, the BFF answers `302` to
+   `/oauth2/authorization/cognito`.
+2. Spring Security generates `state`, `nonce` and a PKCE `code_verifier`, sends the browser to the
+   Cognito hosted UI with the `S256` code challenge, and stores the authorization request in the
+   session. `state` and `nonce` are on by default and are **not** disabled.
+3. The user signs in (and, in production, satisfies MFA). Cognito redirects back to
+   `/login/oauth2/code/cognito` with an authorization code.
+4. The BFF exchanges the code at the token endpoint, authenticating as the confidential client with
+   the secret from Secrets Manager and proving possession of the `code_verifier`. It receives an ID
+   token, an access token and a rotating refresh token — none of which leave the server.
+5. The BFF creates a server-side session and returns `Set-Cookie: SESSION` (`httpOnly`, `Secure`,
+   `SameSite=Lax`). The browser now holds only that cookie.
+6. On logout (`POST /logout`, CSRF-protected), the BFF ends the session and redirects to Cognito's
+   end-session endpoint (RP-initiated logout); Cognito ends its session, revokes the refresh token,
+   and returns the browser to the SPA (`auth.logoutUrl`, a registered logout URI).
+
+`server.forward-headers-strategy=framework` is what makes step 4 correct behind the load balancer:
+the request arrives over plain HTTP with `X-Forwarded-Proto: https`, and without it the redirect URI
+would be built as `http://…` and would not match the registered HTTPS callback.
+
+### Groups and the enforce-by-claim mechanism
+
+Cognito puts the user's groups in the `cognito:groups` claim of the ID token. `CognitoAuthoritiesMapper`
+turns each group into an authority named `ROLE_<group>`, so the `admin` group becomes `ROLE_admin`.
+`SecurityConfig` then expresses the whole API policy in one place:
+
+```java
+.requestMatchers("/actuator/health").permitAll()
+.requestMatchers(HttpMethod.GET, "/api/**").permitAll()
+.requestMatchers("/api/**").hasRole("admin")
+.anyRequest().authenticated()
+```
+
+Reads are anonymous, writes require `ROLE_admin`, and anything unmatched is authenticated — deny by
+default. Authorization is enforced server side by claim, never by hiding a button in the UI. A later
+write endpoint (`POST /api/orders`, Phase 5) inherits the same rule without touching the filter chain.
+
+### CSRF and CORS: what the frontend must do
+
+CSRF is on, using Spring Security's single-page-application handling (`csrf.spa()`). The token is
+delivered in a cookie the SPA reads and echoes back in a header:
+
+- The SPA reads the `XSRF-TOKEN` cookie and sends its value in the `X-XSRF-TOKEN` header on every
+  unsafe request (`POST`, `PUT`, `PATCH`, `DELETE`). A missing or stale token is rejected.
+- The SPA must send credentials (`fetch(..., { credentials: 'include' })`) so the session cookie is
+  attached.
+- CORS allows only the exact origins in `auth.allowedOrigins`, with `allowCredentials: true`. A
+  wildcard origin with credentials is both invalid and dangerous, so it is rejected at synth.
+
+Cross-site cookies are increasingly blocked by browsers, so the frontend is expected to be
+**same-site** with the API (both under the same registrable domain, e.g. `https://<env-domain>` for
+the SPA and `https://api.<env-domain>` for the API) or to use a development proxy that makes the
+requests same-origin. The `http://localhost:5173` origin in dev/uat is for exactly that: the Vite dev
+server proxying to the API.
+
+### Known constraint: sessions are in memory
+
+The BFF's sessions live in the application's memory for this phase. Two consequences, both enforced
+rather than documented-and-forgotten:
+
+- **The service must run as a single task.** `assertValidEnvironmentConfig` rejects
+  `application.desiredCount > 1` with a message naming the in-memory session store. Auto scaling
+  would give each task its own session store and silently sign users out under load. Phase 6 moves
+  sessions to Redis/ElastiCache; only then is the guard removed.
+- **A redeployment signs users out**, because the new task starts with an empty store. That is
+  acceptable for this phase and is the price of not running a cache yet.
+
+### Threat model, briefly
+
+The BFF is chosen precisely to remove the token-theft class (OWASP A04). The remaining assets and
+what protects them:
+
+| Asset | Where it lives | Protection |
+| ----- | -------------- | ---------- |
+| User password | Cognito (never the app) | Cognito password policy; never leaves Cognito |
+| ID / access token | BFF server memory | Never sent to the browser; short lifetimes (15 min in prod) |
+| Refresh token | BFF server memory | Rotated on use, revoked on logout, 12 h window in prod |
+| Client secret | Secrets Manager → ECS injection | Never in config, image, template or browser; execution role reads it |
+| Session cookie | Browser | `httpOnly`, `Secure`, `SameSite=Lax`; server-side session can be revoked |
+| CSRF token | `XSRF-TOKEN` cookie | Double-submit; sent back in `X-XSRF-TOKEN` on writes |
+
+OWASP A09: the application logs authentication outcomes without tokens or PII, and the Cognito stack
+ships one baseline alarm (`SignInThrottles`) — every new component lands with at least one alarm;
+Phase 7 is the deep dive.
+
+### Verifying it against a deployed environment
+
+```bash
+# Public read: no credentials at all.
+curl https://<api-fqdn>/api/products
+# []
+
+# Anonymous write: 401, not a redirect to the hosted UI.
+curl -i -X POST https://<api-fqdn>/api/products \
+  -H 'Content-Type: application/json' -d '{"name":"X","price":1.00}'
+# HTTP/2 401
+
+# The load balancer health check stays anonymous.
+curl https://<api-fqdn>/actuator/health
+# {"status":"UP"}
+
+# HSTS is on every response served over 443.
+curl -sI https://<api-fqdn>/actuator/health | grep -i strict-transport-security
+# strict-transport-security: max-age=31536000; includeSubDomains
+```
+
+The browser flow has to be done by hand (there is no automated browser test this phase):
+
+1. Open `https://<api-fqdn>/me` in a browser. It redirects to the Cognito hosted UI.
+2. Sign in (dev: any user; prod: a user in the `admin` group for the write test).
+3. The browser returns to `/login/oauth2/code/cognito`, the BFF creates the session, and `/me` shows
+   the user's name and authorities — including `ROLE_admin` for an admin.
+4. From the SPA (or a console), read the `XSRF-TOKEN` cookie, then `POST /api/products` with
+   `credentials: 'include'` and `X-XSRF-TOKEN`. A non-admin gets `403`; an admin gets `201`.
+5. `POST /logout` (with the CSRF header) ends the session and the Cognito session, and returns the
+   browser to the SPA (`auth.logoutUrl`).
+
+---
+
 ## The Spring Boot application
 
 `application/` is a Spring Boot API. It uses **Java 21** (the current LTS) and **Spring Boot 4.1.1**,
-with Spring Web, Spring Data JPA, Jakarta Bean Validation, Flyway, Actuator and Testcontainers.
+with Spring Web, Spring Data JPA, Jakarta Bean Validation, Flyway, Actuator, the OAuth2 **client**
+starter and Testcontainers. It is deliberately **not** a resource server (see
+[Core concepts: authentication and authorisation](#core-concepts-authentication-and-authorisation)).
 
 Structure:
 
 ```
 HTTP → controller → service → repository → PostgreSQL
-                        ▲
-                    entity / dto
+         │              ▲
+         │          entity / dto
+         └─ SecurityConfig / CognitoAuthoritiesMapper   (the session and claim layer)
 ```
 
 | Layer | Class | Responsibility |
 | ----- | ----- | -------------- |
+| Security | `SecurityConfig` | The filter chain: authorize rules, OIDC login, CSRF, CORS, 401 entry point, logout |
+| Security | `CognitoAuthoritiesMapper` | Turns the `cognito:groups` claim into `ROLE_<group>` authorities |
 | Controller | `ProductController` | Maps HTTP to the service; holds no state and no database logic |
+| Controller | `SessionController` | `/me`, the protected endpoint that starts the login flow |
 | Service | `ProductService` | Business operations and transaction boundaries |
 | Repository | `ProductRepository` | Spring Data JPA; CRUD only, no custom queries yet |
 | Entity | `Product` | JPA mapping of the `products` table |
@@ -699,26 +973,30 @@ and not before.
 
 ### Endpoints
 
-| Method | Path | Behaviour |
-| ------ | ---- | --------- |
-| `GET` | `/api/products` | Returns all products, ordered by id |
-| `GET` | `/api/products/{id}` | Returns one product, or `404` |
-| `POST` | `/api/products` | Validates and creates a product, returns `201` with the assigned id |
-| `GET` | `/actuator/health` | Returns `{"status":"UP"}` — the ALB health check target |
+| Method | Path | Access | Behaviour |
+| ------ | ---- | ------ | --------- |
+| `GET` | `/api/products` | public | Returns all products, ordered by id |
+| `GET` | `/api/products/{id}` | public | Returns one product, or `404` |
+| `POST` | `/api/products` | `admin` | Validates and creates a product, returns `201` with the assigned id |
+| `GET` | `/me` | authenticated | The signed-in user's name and authorities (starts the login flow) |
+| `POST` | `/logout` | authenticated | Ends the session and the Cognito session, then returns the browser to the SPA |
+| `GET` | `/actuator/health` | public | Returns `{"status":"UP"}` — the ALB health check target |
 
-Example (the table starts empty — the data is no longer seeded). `<api-fqdn>` is `api.<env-domain>`
-once Phase 3.5 is deployed; a request to the load balancer's plaintext name is answered with a `301`
-to the same path over HTTPS:
+Example (the table starts empty — the data is no longer seeded). `<api-fqdn>` is `api.<env-domain>`;
+a request to the load balancer's plaintext name is answered with a `301` to the same path over HTTPS.
+A write needs an `admin` session **and** a CSRF token, so the `curl` below is expected to fail with
+`401` — the browser flow is in
+[Core concepts: authentication and authorisation](#core-concepts-authentication-and-authorisation):
 
 ```bash
 curl https://<api-fqdn>/api/products
 # []
 
-curl -X POST https://<api-fqdn>/api/products \
+# Anonymous write: 401. An admin session + X-XSRF-TOKEN header would return 201.
+curl -i -X POST https://<api-fqdn>/api/products \
      -H 'Content-Type: application/json' \
      -d '{"name":"Tablet","description":"10 inch","price":450.00,"quantity":12}'
-# {"id":1,"name":"Tablet","description":"10 inch","price":450.00,"quantity":12,
-#  "createdAt":"2026-01-01T09:15:00.123456Z","updatedAt":"2026-01-01T09:15:00.123456Z"}
+# HTTP/2 401
 
 curl https://<api-fqdn>/api/products/1
 # {"id":1,"name":"Tablet",...}
@@ -779,6 +1057,32 @@ Actuator exposes **only** the `health` endpoint over HTTP, with details suppress
 endpoint is publicly reachable through the load balancer. The health indicator includes the
 database: if PostgreSQL is unreachable the endpoint reports `DOWN`, the ALB marks the task unhealthy
 and ECS replaces it, rather than serving errors from a task that cannot reach its data.
+
+### Authentication configuration
+
+Every authentication value arrives from the environment, with **no default**, exactly like the
+database credentials — a missing value fails the container at start rather than falling back to
+something insecure:
+
+| Environment variable | Property | Purpose |
+| -------------------- | -------- | ------- |
+| `COGNITO_ISSUER_URI` | `spring.security.oauth2.client.provider.cognito.issuer-uri` | OIDC discovery and ID-token signature validation |
+| `COGNITO_CLIENT_ID` | `…registration.cognito.client-id` | Public id of the confidential app client |
+| `COGNITO_CLIENT_SECRET` | `…registration.cognito.client-secret` | Injected by ECS from Secrets Manager |
+| `COGNITO_LOGOUT_URI` | `app.auth.logout-uri` | Frontend URL the browser returns to after RP-initiated logout (a registered logout URI) |
+| `CORS_ALLOWED_ORIGINS` | `app.cors.allowed-origins` | Exact frontend origins, comma separated |
+| `SESSION_TIMEOUT` | `server.servlet.session.timeout` | BFF session lifetime (ISO-8601, e.g. `PT30M`) |
+
+The provider is configured by issuer URI, so the JWK set is discovered and the ID token signature is
+**always** verified against Cognito's keys — the algorithm is never taken from the token itself.
+`server.forward-headers-strategy=framework` makes the redirect URI and the session cookie correct
+behind the TLS-terminating load balancer. The session cookie is `httpOnly`, `Secure` and
+`SameSite=Lax`; `SESSION_COOKIE_SECURE` exists only to allow local HTTP development and is left at
+its default of `true` everywhere deployed.
+
+HSTS is set on the **load balancer** listener (`routing.http.response.strict_transport_security.header_value`),
+so every response served over 443 — including the port 80 redirect — carries
+`max-age=31536000; includeSubDomains`. See the load-balanced-api construct.
 
 ---
 
@@ -882,9 +1186,11 @@ container runs. The permissions are granted with scoped CDK `grant` calls rather
 - `ecr:GetAuthorizationToken` — an account-level action that cannot be scoped to a repository, so it
   is the only statement with a `*` resource.
 - `logs:CreateLogStream`, `logs:PutLogEvents` — scoped to the one log group.
-- `secretsmanager:GetSecretValue`, `secretsmanager:DescribeSecret` — scoped to the one database
-  secret. No `kms:*` statement is needed because the secret is encrypted with the AWS managed key,
-  so there is nothing extra to grant.
+- `secretsmanager:GetSecretValue`, `secretsmanager:DescribeSecret` — scoped to the database secret
+  **and** the Phase 4 Cognito client secret (two resources, no wildcard). No `kms:*` statement is
+  needed because both secrets are encrypted with the AWS managed key, so there is nothing extra to
+  grant. The client secret is the one new grant Phase 4 adds; nothing else in IAM changes, and no
+  security group rule changes either.
 
 **Task role.** Assumed by the application itself. The API talks to PostgreSQL over JDBC and to no AWS
 API at all, so the role carries **no permissions whatsoever** — a compromised container has no AWS
@@ -1013,9 +1319,24 @@ is exactly the rule set intended.
 | Database deletion protection | off | on | on |
 | Database removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
 | Image tag | `v0.1.0` | `v0.1.0` | `v0.1.0` |
-| Public DNS subdomain | `ECOMMERCE_DEV_DOMAIN` (optional) | `ECOMMERCE_UAT_DOMAIN` (optional) | `ECOMMERCE_PROD_DOMAIN` (**required**) |
-| API endpoint | `https://api.<dev-domain>` (or plaintext if unset) | `https://api.<uat-domain>` (or plaintext if unset) | `https://api.<prod-domain>` |
+| Public DNS subdomain | `ECOMMERCE_DEV_DOMAIN` (**required**) | `ECOMMERCE_UAT_DOMAIN` (**required**) | `ECOMMERCE_PROD_DOMAIN` (**required**) |
+| API endpoint | `https://api.<dev-domain>` | `https://api.<uat-domain>` | `https://api.<prod-domain>` |
+| Password minimum length | 8 | 10 | 14 |
+| Password character classes | lower + digit | upper + lower + digit | all four |
+| MFA | off | optional | **required** |
+| Self sign-up | on | on | **off** |
+| Access / ID token lifetime | 1 h | 30 min | 15 min |
+| Refresh token lifetime | 30 d | 7 d | 12 h |
+| BFF session timeout | 8 h | 4 h | 30 min |
+| CORS allowed origins | `http://localhost:5173` | localhost + `https://<uat-domain>` | `https://<prod-domain>` |
+| Post-logout target (SPA) | `http://localhost:5173` | `https://<uat-domain>` | `https://<prod-domain>` |
+| Cognito user pool removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
 | Removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
+
+> From Phase 4 **every** environment needs a delegated domain, not just production: the BFF's session
+> cookie is `Secure`, so an authentication-enabled environment must answer over HTTPS. Dev and uat
+> therefore need `ECOMMERCE_DEV_DOMAIN` / `ECOMMERCE_UAT_DOMAIN` set too, and a configuration with
+> `auth` but no `dns` fails synth with that reason.
 
 All three environments live in Asia Pacific (Singapore) `ap-southeast-1`, which has three
 Availability Zones — enough for the production spread. Environment separation does not depend on the
@@ -1037,9 +1358,21 @@ pair ECS would refuse, an out-of-range port, a health check path that is not abs
 image tag, a database or user name that is not a valid PostgreSQL identifier, a user name RDS
 reserves (`postgres`, `admin`, `rdsadmin`, ...), storage below the gp3 minimum, a backup retention
 outside 1–35 days, deletion protection combined with `RemovalPolicy.DESTROY`, a `dns.zoneName` that
-is not a valid DNS host name, an `apiSubdomain` that is not a single DNS label, and a **production
-environment with no `dns` block at all** — plaintext HTTP is not a production option, so a missing
-`ECOMMERCE_PROD_DOMAIN` fails the synth before anything is deployed.
+is not a valid DNS host name, an `apiSubdomain` that is not a single DNS label, a **production
+environment with no `dns` block at all**, and the Phase 4 authentication limits:
+
+- a password minimum length outside Cognito's 6–99 range, or a token lifetime outside the range
+  Cognito accepts (access/ID 5 min–1 day, refresh 60 min–10 years);
+- a session timeout longer than the refresh token it depends on, or an empty / wildcard / relative
+  CORS origin (the API answers with credentials, so `*` is never valid);
+- a post-logout URI that is not an absolute origin (it is registered with Cognito as an exact URI);
+- **`auth` with no `dns`** — an authentication-enabled environment needs an HTTPS origin for its
+  `Secure` session cookie, so this fails at synth with that reason in every environment;
+- **`application.desiredCount > 1`** — the BFF holds sessions in memory, so more than one task would
+  split the session store and silently sign users out. The message names the store and Phase 6, and
+  the guard is removed when sessions move to Redis/ElastiCache.
+
+A missing `ECOMMERCE_<ENV>_DOMAIN` therefore fails the synth before anything is deployed.
 
 ### Pinning the account
 
@@ -1064,16 +1397,21 @@ deploying anything other than dev, so `-c environment=prod` cannot target whiche
 current credentials happen to resolve to.
 
 The public subdomain is read the same way — `ECOMMERCE_DEV_DOMAIN`, `ECOMMERCE_UAT_DOMAIN`,
-`ECOMMERCE_PROD_DOMAIN` — so the domain stays out of source control too. Omitting it in dev or uat
-simply leaves that environment HTTP-only; omitting it in prod fails validation.
+`ECOMMERCE_PROD_DOMAIN` — so the domain stays out of source control too. From Phase 4 it is required
+in **every** environment (auth needs an HTTPS origin), so it must be set before `cdk synth` or
+`cdk deploy` in dev and uat as well as prod.
 
 ```powershell
-$env:ECOMMERCE_PROD_DOMAIN = "prod.example.com"; npx cdk deploy ecommerce-dns-prod -c environment=prod
+$env:ECOMMERCE_DEV_DOMAIN = "dev.example.com"; npx cdk deploy ecommerce-cognito-dev -c environment=dev
 ```
 
 ```bash
-ECOMMERCE_PROD_DOMAIN=prod.example.com npx cdk deploy ecommerce-dns-prod -c environment=prod
+ECOMMERCE_PROD_DOMAIN=prod.example.com npx cdk deploy ecommerce-cognito-prod -c environment=prod
 ```
+
+The frontend's origins are read the same way where an environment needs one that is not derived from
+the domain: `ECOMMERCE_<ENV>_FRONTEND_ORIGIN` is optional and, when set, replaces the default CORS
+allowlist for that environment (see `lib/config/<env>.ts`).
 
 ---
 
@@ -1117,6 +1455,10 @@ account without clashing.
 | DNS | `HostedZoneNameServers` | `ecommerce-dev-hosted-zone-name-servers` | registrar delegation (by hand, once) |
 | DNS | `CertificateArn` | `ecommerce-dev-certificate-arn` | the application stack's HTTPS listener |
 | DNS | `ApiDomainName` | `ecommerce-dev-api-domain-name` | the application stack's alias record and `ApiUrl` |
+| Cognito | `UserPoolId` | `ecommerce-dev-user-pool-id` | operators, Cognito CLI |
+| Cognito | `UserPoolClientId` | `ecommerce-dev-user-pool-client-id` | the application stack's `COGNITO_CLIENT_ID` |
+| Cognito | `IssuerUrl` | `ecommerce-dev-cognito-issuer-url` | the application stack's `COGNITO_ISSUER_URI` |
+| Cognito | `ClientSecretArn` | `ecommerce-dev-client-secret-arn` | the execution role's secret read, operators |
 | Application | `ClusterName` | `ecommerce-dev-ecs-cluster-name` | operations |
 | Application | `ServiceName` | `ecommerce-dev-ecs-service-name` | operations |
 | Application | `LoadBalancerDnsName` | `ecommerce-dev-alb-dns-name` | the load balancer's own name |
@@ -1145,6 +1487,11 @@ account without clashing.
   registrar's NS records still have to be removed by hand (see the destroy caveat below). The ACM
   certificate is not given a removal policy: it is stateless, re-issued automatically, and deleting
   it with the stack leaves nothing behind to pay for or clean up.
+- The **Cognito user pool** is stateful — it holds users — so it follows the removal policy (dev
+  destroys it, uat/prod retain it). Deletion protection is deliberately **not** enabled, so the pool
+  can always be torn down with its stack. Its client secret follows the removal policy too, so
+  uat/prod keep the credential that matches the retained pool. The L2 `UserPool` supports a removal
+  policy directly, so no escape hatch is needed here.
 
 Everything else is either ephemeral by nature (subnets, route tables, security groups) or replaced
 rather than deleted.
@@ -1207,11 +1554,18 @@ docker run -d --name ecommerce-pg -p 5432:5432 \
 
 DB_HOST=localhost DB_PORT=5432 DB_NAME=ecommerce \
 DB_USERNAME=ecommerce DB_PASSWORD=<your password> \
+COGNITO_ISSUER_URI=https://cognito-idp.ap-southeast-1.amazonaws.com/<pool-id> \
+COGNITO_CLIENT_ID=<client-id> COGNITO_CLIENT_SECRET=<client-secret> \
+COGNITO_LOGOUT_URI=http://localhost:5173 \
+CORS_ALLOWED_ORIGINS=http://localhost:5173 SESSION_TIMEOUT=PT30M \
+SESSION_COOKIE_SECURE=false \
   java -jar target/ecommerce-api-0.1.0.jar
 ```
 
-The connection details are environment variables in every environment, local or deployed, so
-nothing about the application changes between the two.
+The connection details and the auth configuration are environment variables in every environment,
+local or deployed, so nothing about the application changes between the two. `SESSION_COOKIE_SECURE=false`
+is the one local-only concession: a `Secure` cookie is not sent over plain HTTP, so a local run over
+`http://localhost:8080` needs it off. Deployed environments leave it at the default of `true`.
 
 ### First deployment
 
@@ -1233,23 +1587,26 @@ npx cdk deploy ecommerce-ecr-dev -c environment=dev
 # 3. Database (instance + generated credentials secret)
 npx cdk deploy ecommerce-database-dev -c environment=dev
 
-# 4. DNS and TLS (hosted zone + ACM certificate) - only when a subdomain is configured
+# 4. DNS and TLS (hosted zone + ACM certificate). The domain is required from Phase 4 on.
 export ECOMMERCE_DEV_DOMAIN=dev.example.com
 npx cdk deploy ecommerce-dns-dev -c environment=dev
 #    Then delegate the zone at the registrar (see "Delegating the subdomain") and wait for the
 #    certificate to finish issuing before the next step.
 
-# 5. Build and push the image (see "ECR: how an image is tagged and pushed")
+# 5. Cognito (user pool + confidential app client + client-secret secret)
+npx cdk deploy ecommerce-cognito-dev -c environment=dev
+
+# 6. Build and push the image (see "ECR: how an image is tagged and pushed")
 #    ...
 
-# 6. Compute (the service finds the image, the secret, the database endpoint and the certificate)
+# 7. Compute (the service finds the image, the secrets, the database endpoint and the certificate)
 npx cdk deploy ecommerce-application-dev -c environment=dev
 ```
 
-`npx cdk deploy --all -c environment=dev` deploys all five stacks in the correct order in one go, but
+`npx cdk deploy --all -c environment=dev` deploys all six stacks in the correct order in one go, but
 only after an image has been pushed for the first time; otherwise the ECS service starts with no
-image to run. The DNS stack only exists when `ECOMMERCE_DEV_DOMAIN` is set, and the application stack
-will wait on a certificate that is still validating until the zone is delegated.
+image to run. The application stack will wait on a certificate that is still validating until the
+zone is delegated.
 
 Things that are easy to get wrong:
 
@@ -1257,11 +1614,14 @@ Things that are easy to get wrong:
   pass both.
 - **The CDK CLI silently ignores unknown options.** A mistyped flag does not fail the command — it
   deploys the `cdk.json` default. Read the stack name in the output.
+- **Set the domain in every environment.** From Phase 4 an auth-enabled environment needs HTTPS, so a
+  missing `ECOMMERCE_<ENV>_DOMAIN` fails synth even in dev.
 - **Push the image before deploying the compute.** The service cannot start without it.
-- **Deploy the database before the compute.** The application stack imports its endpoint and secret.
+- **Deploy the database and Cognito before the compute.** The application stack imports the database
+  endpoint and secret, and the pool, client id and client secret.
 - **Delegate the zone before expecting HTTPS.** The ACM certificate stays `PENDING_VALIDATION` until
   the registrar's NS records for the subdomain resolve; until then the HTTPS listener has nothing to
-  serve, even though the application stack deploys successfully.
+  serve, and the Cognito callback URL will not resolve, even though the stacks deploy successfully.
 - **Pin the account per environment** before deploying anything other than dev.
 - **Deploy from a dedicated IAM principal or Identity Center role, not the account root user.**
 - **Deploying is not free:** NAT Gateways, an ALB, a running Fargate task and an RDS instance all
@@ -1455,14 +1815,54 @@ The redirect preserves the host you requested rather than hardcoding the API dom
 right behaviour (it never sends a client to a name it did not ask for), and it is why the redirect is
 verified against the custom domain rather than the load balancer's own name.
 
-### 10. Destroy caveat: DNS and the registrar
+### 10. Phase 4: verify authentication and authorisation
+
+Deploy the Cognito stack before the application (see [First deployment](#first-deployment)), then
+check the access-control contract from outside the VPC. These are the same checks
+`test/SecurityTest.java` makes in-process:
+
+```bash
+# Public read: no credentials.
+curl "https://api.dev.example.com/api/products"
+# []
+
+# Anonymous write: 401, not a 302 to the hosted UI.
+curl -i -X POST "https://api.dev.example.com/api/products" \
+  -H 'Content-Type: application/json' -d '{"name":"X","price":1.00}'
+# HTTP/2 401
+
+# Health stays anonymous, and HSTS is present on the TLS response.
+curl -sI "https://api.dev.example.com/actuator/health" | grep -i strict-transport-security
+# strict-transport-security: max-age=31536000; includeSubDomains
+```
+
+Then the browser flow, by hand (there is no automated browser test this phase):
+
+1. Create an admin user and add it to the `admin` group (dev has self sign-up on, so a user can
+   register through the hosted UI; group membership is still an operator action):
+   ```bash
+   aws cognito-idp admin-create-user --user-pool-id "$(aws cloudformation list-exports \
+     --query "Exports[?Name=='ecommerce-dev-user-pool-id'].Value" --output text)" \
+     --username tester --user-attributes Name=email,Value=tester@example.com
+   aws cognito-idp admin-add-user-to-group --user-pool-id <pool-id> --username tester --group-name admin
+   ```
+2. Open `https://api.dev.example.com/me`. It redirects to the Cognito hosted UI; sign in. You land
+   back on the BFF, which creates the session, and `/me` shows `ROLE_admin` among the authorities.
+3. From the SPA (or the browser console), read the `XSRF-TOKEN` cookie and `POST /api/products` with
+   `credentials: 'include'` and `X-XSRF-TOKEN`. Expect `201`. Remove the group and repeat for `403`;
+   clear the cookie and repeat for `401`.
+4. `POST /logout` with the CSRF header. The BFF ends the session, redirects through Cognito's
+   end-session endpoint, and returns the browser to the SPA (`auth.logoutUrl`).
+
+### 11. Destroy caveat: DNS and the registrar
 
 `cdk destroy` removes the hosted zone in dev, but it cannot remove the NS records you added at the
 registrar — those live in the registrar's zone, not in Route 53. Tearing an environment down
-completely is therefore two commands plus one manual step:
+completely is therefore a few commands plus one manual step:
 
 ```bash
 npx cdk destroy ecommerce-application-dev -c environment=dev
+npx cdk destroy ecommerce-cognito-dev     -c environment=dev
 npx cdk destroy ecommerce-dns-dev         -c environment=dev
 # then: delete the NS records for dev.example.com at the registrar by hand
 ```
@@ -1476,15 +1876,17 @@ registrar change.
 
 ## Testing
 
-`npm test` in `ecommerce-infrastructure/` runs **139 Jest tests** over the synthesised CloudFormation
-templates and the configuration modules — 33 for the network stack, 18 for the database stack, 36 for
-the application stack, 12 for the DNS stack, 6 for the registry stack and 34 for the configuration.
-`mvn test` in `application/` runs **13 Spring Boot tests** — 9 end-to-end HTTP tests against a real
-PostgreSQL and 4 service unit tests — and needs a Docker daemon.
+`npm test` in `ecommerce-infrastructure/` runs **176 Jest tests** over the synthesised CloudFormation
+templates and the configuration modules — 33 for the network stack, 18 for the database stack, 41 for
+the application stack, 12 for the DNS stack, 21 for the Cognito stack, 6 for the registry stack and
+45 for the configuration. `mvn test` in `application/` runs **22 Spring Boot tests** — 9 product
+end-to-end HTTP tests against a real PostgreSQL, 9 access-control tests, and 4 service unit tests —
+and needs a Docker daemon.
 
-`test/setup-env.ts` sets `ECOMMERCE_PROD_DOMAIN` before `lib/config` is first imported, because the
-production configuration requires a domain and the module reads its environment once, at import. The
-suites that prove the missing-domain failure build their own configuration instead of relying on it.
+`test/setup-env.ts` sets `ECOMMERCE_DEV_DOMAIN`, `ECOMMERCE_UAT_DOMAIN` and `ECOMMERCE_PROD_DOMAIN`
+before `lib/config` is first imported, because from Phase 4 every environment requires a domain and
+the module reads its environment once, at import. The suites that prove the missing-domain failure
+build their own configuration instead of relying on it.
 
 Network (Phase 1, Phase 3):
 
@@ -1540,27 +1942,52 @@ DNS and TLS (Phase 3.5):
 - the zone and the certificate carry the project, environment and management tags
 - the name servers, certificate ARN and API domain name are exported
 
-Application (Phase 2, Phase 3, Phase 3.5):
+Cognito (Phase 4):
+
+- the user pool is named per environment, with the password policy, MFA mode and self sign-up from
+  `config.auth` (dev off/permissive, prod `REQUIRED`/strict), and only TOTP as a second factor
+- the removal policy follows the environment (dev `DESTROY`, uat/prod `RETAIN`), and deletion
+  protection is not set, so the pool can always be torn down
+- the app client has a generated secret and **only** the authorization code grant flow enabled — the
+  implicit and client credentials flows are never on, and the explicit auth flows are exactly SRP and
+  refresh, so `ALLOW_USER_PASSWORD_AUTH` (the resource owner password grant) does not exist
+- the callback URIs are exact (no wildcard) and the logout URI is the frontend, and the scopes are
+  `openid email profile` only
+- the token lifetimes come from configuration, in minutes (dev longer, prod shorter)
+- refresh token rotation and revocation are enabled
+- the client secret is stored in Secrets Manager (its value never appears in the template) under the
+  `clientSecret` key
+- a Cognito prefix domain hosts the managed login pages
+- **no identity pool** is created
+- one baseline CloudWatch alarm exists (`SignInThrottles`)
+- the pool and the secret carry the project, environment and management tags
+- the pool id, client id, issuer URL and client secret ARN are exported
+
+Application (Phase 2, Phase 3, Phase 3.5, Phase 4):
 
 - the cluster, task definition and service exist; the task is Fargate with `awsvpc` networking
 - the task is sized 512/1024 in dev and 1024/2048 in prod, and never references a `latest` image
 - the container exposes port 8080 and logs to the dedicated log group
 - the container receives `DB_HOST`, `DB_PORT` and `DB_NAME` as plain environment variables, and
   `DB_USERNAME`/`DB_PASSWORD` as **secret references**, not values
-- the application stack defines no database instance and no secret of its own
+- the container receives `COGNITO_ISSUER_URI`, `COGNITO_CLIENT_ID`, `COGNITO_LOGOUT_URI`,
+  `CORS_ALLOWED_ORIGINS` and `SESSION_TIMEOUT` as plain environment variables, all resolved from the
+  Cognito stack / configuration, and `COGNITO_CLIENT_SECRET` as a **secret reference**
+- the application stack defines no database instance, no secret and no Cognito resource of its own
 - the execution role has only scoped ECR pull, log write and secret read permissions, with no wildcard
-  action and no `kms:` action; its only `*` resource is `ecr:GetAuthorizationToken`
+  action and no `kms:` action; its only `*` resource is `ecr:GetAuthorizationToken`. Phase 4 adds
+  exactly one scoped grant (the Cognito client secret) and no new security group rule
 - the task role has no permissions at all; no administrator or power-user policy appears anywhere
 - the service runs exactly one task, in the private subnets, without a public IP, in the application
   security group, with the circuit breaker enabled
 - the load balancer is internet-facing in the public subnets and opens only port 80 to the internet
   (the application stack adds no duplicate rule for 443, which Phase 1 already opened)
-- with no `dns` configured the single port 80 listener forwards to the target group, `ApiUrl` is the
-  plaintext ALB name and there is no alias record — the Phase 2 behaviour is unchanged
-- with `dns` configured the port 443 listener terminates TLS (`ELBSecurityPolicy-TLS13-1-2-2021-06`)
-  and forwards to the target group, the port 80 listener is a permanent redirect to HTTPS, an alias
-  `A` record points at the load balancer (never an IP), and `ApiUrl` becomes `https://<fqdn>` with the
-  plaintext URL kept as `HttpApiUrl` for the redirect check
+- a stack built without `dns` still supports the certificate-less forwarding listener — the construct
+  capability is kept even though every environment now configures a domain
+- the port 443 listener terminates TLS (`ELBSecurityPolicy-TLS13-1-2-2021-06`), carries the HSTS
+  response header, and forwards to the target group; the port 80 listener is a permanent redirect to
+  HTTPS; an alias `A` record points at the load balancer (never an IP); and `ApiUrl` is
+  `https://<fqdn>` with the plaintext URL kept as `HttpApiUrl` for the redirect check
 - the application stack defines neither the hosted zone nor the certificate, only references them
 - the target group health checks `/actuator/health` on 8080
 - the project, environment and management tags are present on every resource
@@ -1572,15 +1999,29 @@ Configuration:
 - invalid Fargate cpu/memory pairs, ports, health check paths and `latest` image tags are rejected
 - invalid PostgreSQL identifiers, reserved master user names, too-small storage, a backup retention
   outside 1–35 days, and deletion protection combined with `DESTROY` are all rejected
-- an invalid DNS zone name, an API subdomain that is not a single label, and a production environment
-  with no `dns` block are all rejected; dev and uat may omit `dns` and still validate
-- the database configuration never contains a password
+- an invalid DNS zone name and an API subdomain that is not a single label are rejected
+- **every** environment now requires a `dns` block (auth needs an HTTPS origin), and `auth` without
+  `dns` is rejected with that reason
+- a password length outside 6–99, a token lifetime outside Cognito's range, a session longer than the
+  refresh token, an empty / wildcard / relative CORS origin, and a non-absolute post-logout URI are
+  all rejected
+- `application.desiredCount > 1` is rejected while sessions are in memory
+- the database configuration never contains a password, and the auth configuration never contains a
+  secret
 - the image tag is resolved from CDK context, then `IMAGE_TAG`, then configuration
 
-Spring Boot (Phase 3):
+Spring Boot (Phase 3, Phase 4):
 
 - the tests run against a real PostgreSQL 16 container, migrated by the same Flyway migration the
   deployment uses, so the engine, the dialect and the schema are the ones that matter
+- `GET /api/products` and `/actuator/health` succeed unauthenticated
+- an anonymous `POST /api/products` is rejected with `401` (not a redirect), and nothing is written
+- an authenticated non-admin `POST` is rejected with `403`; an admin `POST` returns `201` and the row
+  is persisted — the same rule a later write endpoint inherits
+- a page request to a protected path (`/me`) redirects to the Cognito authorization endpoint
+- the authorization request carries a PKCE `code_challenge` with `code_challenge_method=S256`, plus
+  `state` and `nonce`
+- CORS allows the configured origin with credentials and refuses any other origin
 - an empty table returns `[]`, and an unknown id returns `404`
 - creating a product returns `201` with a database-assigned id and populated timestamps, and the row
   is then readable through `GET` — proving the data went to PostgreSQL, not to a field
@@ -1597,7 +2038,8 @@ Spring Boot (Phase 3):
 
 Phase 1 is mostly free; the cost is NAT Gateways and (in uat/prod) flow logs. Phase 2 adds the
 always-on compute. Phase 3 adds the database, which is the one component that keeps costing while
-nothing is running.
+nothing is running. Phase 4 adds Cognito, which is priced by monthly active users and is free at the
+scale this learning platform runs at.
 
 | Item | Rough cost driver |
 | ---- | ----------------- |
@@ -1615,7 +2057,9 @@ nothing is running.
 | ECR storage | per GB-month, plus a small charge for scanning |
 | **Route 53 hosted zone** | per hosted zone-month, plus a small charge per million DNS queries |
 | **ACM certificate** | no charge for a public certificate attached to an AWS service; it renews automatically |
+| **Cognito user pool** | free up to the monthly active user free tier, then per MAU; a learning platform stays inside it. Advanced security features and SMS MFA would add cost — neither is used |
 | The default-SG cleanup Lambda | one invocation per stack create/update |
+| The Cognito client-secret reader Lambda | one invocation per stack create/update |
 
 The `dev` configuration is deliberately the cheapest (one NAT Gateway, no flow logs, the smallest
 sensible Fargate task, a single small RDS instance with one day of backups) while remaining
@@ -1628,43 +2072,52 @@ and why prod is configured not to be destroyed by accident.
 
 ---
 
-## Phase 4 and beyond
+## Phase 5 and beyond
 
 The platform is designed so the next phase attaches resources without redesigning what exists:
 
 ```
-                 Phase 4
+                 Phase 5
                     │
                     ▼
-            ElastiCache (Redis)         ← private subnets, Database SG
+            SNS / SQS order pipeline    ← the first async flow
                     │
-            Auto scaling (ECS)          ← varies the desired count at runtime
+            Object storage, customer managed KMS keys
                     │
-            S3, SQS/SNS, customer managed KMS keys
+            ElastiCache (Redis) + ECS auto scaling
                     │
-            CloudFront (+ a us-east-1 certificate), Cognito, WAF, CI/CD
+            CloudFront (+ a us-east-1 certificate), WAF, CI/CD
 ```
 
-Phase 3 delivered the database, the schema migrations and the credential path. What is still ahead:
+Phase 4 delivered authentication and authorisation: the BFF holds the session, reads the pool and
+client secret by reference, and enforces `admin` by claim. What is still ahead:
 
+- **Messaging** (Phase 5): the order pipeline — `POST /api/orders` writes RDS and publishes to SNS,
+  SQS consumes with a DLQ, a worker updates order status. Orders inherit the Phase 4 authorization
+  rule rather than re-deciding it.
 - **A cache** (ElastiCache) in the same private subnets, behind the same database security group
   pattern.
-- **ECS auto scaling**, which is what actually makes production resilient to losing a task. The one
-  deliberate remaining limitation is `desiredCount = 1` everywhere: losing the task briefly removes
-  the only instance, and the ECS service replaces it, but there is a gap.
-- **Object storage, queues and topics**, plus customer managed KMS keys for the database, the secret
+- **ECS auto scaling**, which is what actually makes production resilient to losing a task. The
+  deliberate remaining limitation is `desiredCount = 1` everywhere, and it is **now enforced** by the
+  configuration validator because the BFF holds sessions in memory. Externalising sessions to Redis
+  is the change that lifts the guard; until then, auto scaling must not be enabled.
+- **Object storage and queues/topics**, plus customer managed KMS keys for the database, the secrets
   and those resources.
 - **CloudFront** (Phase 6), which needs its own certificate in `us-east-1` rather than the ALB
   certificate in `ap-southeast-1` created here.
-- **API Gateway, Cognito, WAF and CI/CD** in the phases after that.
+- **Bearer-token / resource-server support** for future mobile or service clients. Deliberately
+  deferred this phase: `spring-boot-starter-oauth2-resource-server` is not on the classpath, and the
+  `/api/**` rules live in one place, so adding a second authentication entry point is additive.
+- **WAF and CI/CD** in the phases after that.
 
 TLS and DNS landed in Phase 3.5: the API now answers at `https://api.<env-domain>`, HTTP redirects to
 it, and the certificate renews itself for as long as the hosted zone exists. DNSSEC signing and CAA
-records are deliberately deferred hardening items.
+records are deliberately deferred hardening items, as is Cognito advanced security (threat
+protection) and a custom Cognito domain.
 
 Nothing built so far needs to change for those to land. The network already separates public,
 private and isolated subnets; the security groups already model the tiers by reference; the outputs,
-tags and IAM split are in place; and the task definition already takes its database connection from
-the environment, so pointing it at a different database is a stack parameter rather than a code
-change. The application's own schema is versioned by Flyway, so a later phase can add tables without
-touching the ones already deployed.
+tags and IAM split are in place; and the task definition takes its database and auth connection from
+the environment, so pointing it at a different pool or database is a stack parameter rather than a
+code change. The application's own schema is versioned by Flyway, so a later phase can add tables
+without touching the ones already deployed.

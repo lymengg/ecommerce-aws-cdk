@@ -56,6 +56,39 @@ export interface DatabaseConnection {
   readonly secret: ISecret;
 }
 
+/**
+ * Everything the container needs to authenticate as the OAuth client of the Cognito user pool
+ * (Phase 4).
+ *
+ * The issuer URL, the client id, the logout URI, the CORS allowlist and the session timeout are
+ * configuration, not secrets, so they travel as ordinary environment variables. Only the client
+ * secret comes from Secrets Manager, injected by ECS at container start exactly like the database
+ * password. Nothing here ever reaches the browser: the browser only holds an `httpOnly` session
+ * cookie, which is the whole point of the Backend for Frontend pattern.
+ */
+export interface AuthConnection {
+  /** OIDC issuer URL of the user pool, used for discovery and token signature validation. */
+  readonly issuerUrl: string;
+
+  /** Public identifier of the confidential app client. Not a secret. */
+  readonly userPoolClientId: string;
+
+  /** Secret holding the app client secret under the `clientSecret` key. */
+  readonly clientSecret: ISecret;
+
+  /** Where the browser returns after RP-initiated logout; must match a registered logout URI. */
+  readonly logoutUrl: string;
+
+  /**
+   * Exact frontend origins allowed to call the API with credentials. Never a wildcard: the API
+   * answers with `Access-Control-Allow-Credentials: true`.
+   */
+  readonly allowedOrigins: readonly string[];
+
+  /** How long the BFF keeps its server-side session, applied to the session cookie. */
+  readonly sessionTimeout: Duration;
+}
+
 export interface LoadBalancedApiProps {
   /** The Phase 1 VPC. The load balancer lands in its public subnets, the tasks in its private ones. */
   readonly vpc: IVpc;
@@ -86,6 +119,9 @@ export interface LoadBalancedApiProps {
 
   /** Where the container finds the database and the secret holding its credentials (Phase 3). */
   readonly database: DatabaseConnection;
+
+  /** How the container authenticates as the Cognito OAuth client (Phase 4). */
+  readonly auth: AuthConnection;
 
   /**
    * ACM certificate covering {@link domainName}. When supplied, the load balancer terminates TLS on
@@ -158,8 +194,17 @@ export class LoadBalancedApi extends Construct {
   constructor(scope: Construct, id: string, props: LoadBalancedApiProps) {
     super(scope, id);
 
-    const { vpc, cluster, repository, config, serviceName, albSecurityGroup, applicationSecurityGroup, database } =
-      props;
+    const {
+      vpc,
+      cluster,
+      repository,
+      config,
+      serviceName,
+      albSecurityGroup,
+      applicationSecurityGroup,
+      database,
+      auth,
+    } = props;
 
     this.logGroup = new LogGroup(this, 'LogGroup', {
       logGroupName: `/ecs/${serviceName}`,
@@ -167,9 +212,9 @@ export class LoadBalancedApi extends Construct {
       removalPolicy: props.removalPolicy,
     });
 
-    this.executionRole = this.createExecutionRole(repository, database);
+    this.executionRole = this.createExecutionRole(repository, database, auth);
     this.taskRole = this.createTaskRole();
-    this.taskDefinition = this.createTaskDefinition(serviceName, repository, config, database);
+    this.taskDefinition = this.createTaskDefinition(serviceName, repository, config, database, auth);
 
     this.loadBalancer = new ApplicationLoadBalancer(this, 'LoadBalancer', {
       loadBalancerName: `${serviceName}-alb`,
@@ -238,11 +283,20 @@ export class LoadBalancedApi extends Construct {
         certificates: [props.certificate],
         // TLS 1.2 as the floor (the ELBSecurityPolicy-TLS13-1-2-2021-06 policy). The older
         // `RECOMMENDED` policy still negotiates TLS 1.0/1.1, which is not acceptable for an endpoint
-        // that will soon carry bearer tokens.
+        // that carries session cookies.
         sslPolicy: SslPolicy.RECOMMENDED_TLS,
         defaultTargetGroups: [this.targetGroup],
         open: false,
       });
+
+      // HSTS (OWASP A02). Setting it on the load balancer rather than only in the application means
+      // every response on 443 carries it - including the redirect from port 80 - so a browser that
+      // has seen the API once will never try it over plaintext again. The long max-age is safe
+      // because the certificate renews automatically for as long as the hosted zone exists.
+      this.httpsListener.setAttribute(
+        'routing.http.response.strict_transport_security.header_value',
+        'max-age=31536000; includeSubDomains',
+      );
     }
 
     // The Phase 1 load balancer security group already accepts HTTPS on 443; port 80 is opened here
@@ -257,17 +311,18 @@ export class LoadBalancedApi extends Construct {
   /**
    * The task execution role. ECS assumes it, not the application, to perform the infrastructure
    * actions it needs before the container even starts: pulling the image from ECR, creating the
-   * CloudWatch log stream and reading the database credentials out of Secrets Manager to inject
-   * them into the container. Every grant is scoped to the specific repository, log group and
-   * secret, so the role has no wildcard resource and no managed policy.
+   * CloudWatch log stream and reading the database and Cognito client secrets out of Secrets
+   * Manager to inject them into the container. Every grant is scoped to the specific repository,
+   * log group and secret, so the role has no wildcard resource and no managed policy.
    *
-   * Reading the secret belongs here rather than on the task role: the value is fetched by the ECS
-   * agent during startup, so the running application never holds a credential it could leak.
+   * Reading the secrets belongs here rather than on the task role: the values are fetched by the
+   * ECS agent during startup, so the running application never holds a credential it could leak.
+   * The Cognito client secret is the one new grant Phase 4 adds - nothing else in IAM changes.
    */
-  private createExecutionRole(repository: IRepository, database: DatabaseConnection): Role {
+  private createExecutionRole(repository: IRepository, database: DatabaseConnection, auth: AuthConnection): Role {
     const role = new Role(this, 'TaskExecutionRole', {
       assumedBy: new ServicePrincipal('ecs-tasks.amazonaws.com'),
-      description: 'ECS task execution role: pull the image, write container logs, read the DB secret',
+      description: 'ECS task execution role: pull the image, write container logs, read the DB and Cognito secrets',
     });
 
     repository.grantPull(role);
@@ -276,6 +331,8 @@ export class LoadBalancedApi extends Construct {
     // is added because the secret is encrypted with the AWS managed key, so there is nothing extra
     // to grant.
     database.secret.grantRead(role);
+    // The Cognito app client secret, injected as COGNITO_CLIENT_SECRET. Scoped to that one secret.
+    auth.clientSecret.grantRead(role);
 
     return role;
   }
@@ -299,6 +356,7 @@ export class LoadBalancedApi extends Construct {
     repository: IRepository,
     config: ApplicationConfig,
     database: DatabaseConnection,
+    auth: AuthConnection,
   ): FargateTaskDefinition {
     const taskDefinition = new FargateTaskDefinition(this, 'TaskDefinition', {
       family: `${serviceName}-task`,
@@ -321,13 +379,23 @@ export class LoadBalancedApi extends Construct {
         DB_HOST: database.host,
         DB_PORT: database.port,
         DB_NAME: database.databaseName,
+        // Phase 4 auth wiring. The issuer, client id and logout URI are public identifiers; the
+        // CORS allowlist is an explicit set of origins (never `*`); the session timeout is the BFF
+        // session cookie's lifetime.
+        COGNITO_ISSUER_URI: auth.issuerUrl,
+        COGNITO_CLIENT_ID: auth.userPoolClientId,
+        COGNITO_LOGOUT_URI: auth.logoutUrl,
+        CORS_ALLOWED_ORIGINS: auth.allowedOrigins.join(','),
+        SESSION_TIMEOUT: auth.sessionTimeout.toIsoString(),
       },
       // Credentials are injected by the ECS agent from Secrets Manager as the container starts and
       // are never visible in the task definition, the console or the image. Spring Boot reads them
-      // as ordinary environment variables (see application.properties).
+      // as ordinary environment variables (see application.properties). The Cognito client secret
+      // follows exactly the same path as the database password.
       secrets: {
         DB_USERNAME: EcsSecret.fromSecretsManager(database.secret, 'username'),
         DB_PASSWORD: EcsSecret.fromSecretsManager(database.secret, 'password'),
+        COGNITO_CLIENT_SECRET: EcsSecret.fromSecretsManager(auth.clientSecret, 'clientSecret'),
       },
       essential: true,
     });

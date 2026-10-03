@@ -1,7 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
-import { App, RemovalPolicy } from 'aws-cdk-lib';
+import { App, Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { Mfa } from 'aws-cdk-lib/aws-cognito';
 
 import {
   DEFAULT_ENVIRONMENT,
@@ -62,7 +63,11 @@ describe('environment configuration', () => {
 
   test('does not carry secrets', () => {
     for (const environment of ENVIRONMENT_NAMES) {
-      expect(JSON.stringify(getEnvironmentConfig(environment))).not.toMatch(/secret|password|accesskey/i);
+      // The auth configuration names a password *policy* (length, character classes), which is not a
+      // credential, so the check looks for the fields that would actually carry a secret value.
+      expect(JSON.stringify(getEnvironmentConfig(environment))).not.toMatch(
+        /secret|accesskey|masterUserPassword|clientSecret/i,
+      );
     }
   });
 
@@ -118,6 +123,16 @@ describe('application configuration', () => {
     expect(() => assertValidEnvironmentConfig({ ...dev, application: { ...application, imageTag: ' ' } })).toThrow(
       /must not be empty/,
     );
+  });
+
+  test('refuses more than one task while the BFF holds sessions in memory', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    // Auto scaling would give each task its own session store and silently sign users out, so the
+    // guard names the in-memory session store and the phase that removes the constraint.
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, application: { ...dev.application, desiredCount: 2 } }),
+    ).toThrow(/desiredCount must be 1 while the BFF holds sessions in memory/);
   });
 });
 
@@ -200,12 +215,21 @@ describe('dns configuration', () => {
     expect(() => assertValidEnvironmentConfig({ ...prod, dns: undefined })).toThrow(/dns is required in production/);
   });
 
-  test('dev and uat may omit dns so they can still synthesise HTTP-only', () => {
+  test('every environment requires a domain from Phase 4 on, because auth needs an HTTPS origin', () => {
     for (const environment of ['dev', 'uat'] as EnvironmentName[]) {
       const config = getEnvironmentConfig(environment);
 
-      expect(() => assertValidEnvironmentConfig({ ...config, dns: undefined })).not.toThrow();
+      // Dev and uat used to be allowed to synthesise HTTP-only; an auth-enabled environment cannot,
+      // because a `Secure` session cookie only works over HTTPS.
+      expect(() => assertValidEnvironmentConfig({ ...config, dns: undefined })).toThrow(
+        /authentication requires a delegated domain/,
+      );
     }
+
+    // Production has its own, older message, which the dns check raises first.
+    expect(() => assertValidEnvironmentConfig({ ...getEnvironmentConfig('prod'), dns: undefined })).toThrow(
+      /dns is required in production/,
+    );
   });
 
   test('accepts a well formed delegated subdomain', () => {
@@ -233,6 +257,116 @@ describe('dns configuration', () => {
       expect(() =>
         assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain } }),
       ).toThrow(/dns.apiSubdomain/);
+    }
+  });
+});
+
+describe('auth configuration', () => {
+  test.each(ENVIRONMENT_NAMES)('%s describes a valid user pool and BFF session', (environment: EnvironmentName) => {
+    const auth = getEnvironmentConfig(environment).auth;
+
+    expect(auth.passwordMinimumLength).toBeGreaterThanOrEqual(6);
+    expect(auth.passwordMinimumLength).toBeLessThanOrEqual(99);
+    expect(auth.allowedOrigins.length).toBeGreaterThan(0);
+    for (const origin of auth.allowedOrigins) {
+      expect(origin).toMatch(/^https?:\/\//);
+      expect(origin).not.toBe('*');
+    }
+    expect(auth.accessTokenValidity.toSeconds()).toBeGreaterThanOrEqual(Duration.minutes(5).toSeconds());
+    expect(auth.accessTokenValidity.toSeconds()).toBeLessThanOrEqual(Duration.days(1).toSeconds());
+    expect(auth.sessionTimeout.toSeconds()).toBeLessThanOrEqual(auth.refreshTokenValidity.toSeconds());
+    // The post-logout target is the SPA, registered with Cognito as an exact URI.
+    expect(auth.logoutUrl).toMatch(/^https?:\/\/[^/]+$/);
+    expect(auth.logoutUrl).not.toContain('*');
+  });
+
+  test('keeps development permissive and production strict', () => {
+    const dev = getEnvironmentConfig('dev').auth;
+    const prod = getEnvironmentConfig('prod').auth;
+
+    expect(dev.mfa).toBe(Mfa.OFF);
+    expect(dev.selfSignUpEnabled).toBe(true);
+    expect(dev.requireSymbols).toBe(false);
+    expect(dev.allowedOrigins).toContain('http://localhost:5173');
+
+    expect(prod.mfa).toBe(Mfa.REQUIRED);
+    expect(prod.selfSignUpEnabled).toBe(false);
+    expect(prod.requireUppercase && prod.requireLowercase && prod.requireDigits && prod.requireSymbols).toBe(true);
+    expect(prod.passwordMinimumLength).toBeGreaterThan(dev.passwordMinimumLength);
+    expect(prod.accessTokenValidity.toSeconds()).toBeLessThan(dev.accessTokenValidity.toSeconds());
+    expect(prod.refreshTokenValidity.toSeconds()).toBeLessThan(dev.refreshTokenValidity.toSeconds());
+    expect(prod.sessionTimeout.toSeconds()).toBeLessThan(dev.sessionTimeout.toSeconds());
+    expect(prod.allowedOrigins).not.toContain('http://localhost:5173');
+  });
+
+  test('never allows a wildcard CORS origin in any environment', () => {
+    for (const environment of ENVIRONMENT_NAMES) {
+      const auth = getEnvironmentConfig(environment).auth;
+
+      expect(auth.allowedOrigins.some((origin) => origin.includes('*'))).toBe(false);
+    }
+  });
+
+  test('rejects a password length Cognito would refuse at deploy time', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() => assertValidEnvironmentConfig({ ...dev, auth: { ...dev.auth, passwordMinimumLength: 5 } })).toThrow(
+      /passwordMinimumLength/,
+    );
+    expect(() => assertValidEnvironmentConfig({ ...dev, auth: { ...dev.auth, passwordMinimumLength: 100 } })).toThrow(
+      /passwordMinimumLength/,
+    );
+  });
+
+  test('rejects token lifetimes outside the range Cognito accepts', () => {
+    const dev = getEnvironmentConfig('dev');
+    const auth = dev.auth;
+
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, auth: { ...auth, accessTokenValidity: Duration.minutes(1) } }),
+    ).toThrow(/accessTokenValidity/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, auth: { ...auth, accessTokenValidity: Duration.days(2) } }),
+    ).toThrow(/accessTokenValidity/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, auth: { ...auth, idTokenValidity: Duration.seconds(30) } }),
+    ).toThrow(/idTokenValidity/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, auth: { ...auth, refreshTokenValidity: Duration.minutes(30) } }),
+    ).toThrow(/refreshTokenValidity/);
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, auth: { ...auth, refreshTokenValidity: Duration.days(3651) } }),
+    ).toThrow(/refreshTokenValidity/);
+  });
+
+  test('rejects a session that outlives the refresh token it depends on', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() =>
+      assertValidEnvironmentConfig({
+        ...dev,
+        auth: { ...dev.auth, sessionTimeout: Duration.days(60), refreshTokenValidity: Duration.days(30) },
+      }),
+    ).toThrow(/sessionTimeout must not exceed/);
+  });
+
+  test('rejects an empty, wildcard or relative CORS origin', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    for (const allowedOrigins of [[], ['*'], ['dev.example.com'], ['https://dev.example.com/']]) {
+      expect(() => assertValidEnvironmentConfig({ ...dev, auth: { ...dev.auth, allowedOrigins } })).toThrow(
+        /allowedOrigins/,
+      );
+    }
+  });
+
+  test('rejects a wildcard, relative or empty post-logout URI', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    for (const logoutUrl of ['*', 'shop.example.com', '', '/logout']) {
+      expect(() => assertValidEnvironmentConfig({ ...dev, auth: { ...dev.auth, logoutUrl } })).toThrow(
+        /auth.logoutUrl/,
+      );
     }
   });
 });

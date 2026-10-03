@@ -1,4 +1,4 @@
-import { RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, RemovalPolicy } from 'aws-cdk-lib';
 
 import { EnvironmentConfig } from './types';
 
@@ -30,6 +30,29 @@ const DNS_HOSTNAME = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9
 
 /** A single DNS label: the leftmost part of a name, with no dots. */
 const DNS_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+/**
+ * Cognito's real password length limits. Asking for a shorter or longer minimum makes the user pool
+ * fail to create, which is far too late to discover.
+ */
+const MIN_PASSWORD_LENGTH = 6;
+const MAX_PASSWORD_LENGTH = 99;
+
+/** Cognito accepts an access/ID token lifetime between 5 minutes and 1 day. */
+const MIN_TOKEN_VALIDITY = Duration.minutes(5);
+const MAX_TOKEN_VALIDITY = Duration.days(1);
+
+/** Cognito accepts a refresh token lifetime between 60 minutes and 10 years. */
+const MIN_REFRESH_TOKEN_VALIDITY = Duration.minutes(60);
+const MAX_REFRESH_TOKEN_VALIDITY = Duration.days(3650);
+
+/**
+ * An absolute web origin: scheme, host and optional port, with nothing after it. A wildcard, a
+ * trailing slash, a path or a bare hostname are all rejected - the value goes into an
+ * `Access-Control-Allow-Origin` header that is returned together with credentials, so it has to be
+ * exactly the origin the browser sends and never `*`.
+ */
+const WEB_ORIGIN = /^https?:\/\/[a-z0-9]([a-z0-9.-]*[a-z0-9])?(:\d{1,5})?$/i;
 
 /** Inclusive integer range, used to spell out the larger Fargate memory tiers compactly. */
 function range(start: number, end: number, step: number): number[] {
@@ -79,6 +102,103 @@ export function assertValidEnvironmentConfig(config: EnvironmentConfig): void {
   assertValidApplicationConfig(config.application, fail);
   assertValidDatabaseConfig(config.database, fail);
   assertValidDnsConfig(config, fail);
+  assertValidAuthConfig(config, fail);
+}
+
+/**
+ * Validates the authentication configuration against Cognito's real limits and the BFF's own
+ * constraints.
+ *
+ * The user pool and app client reject an out-of-range password length or token lifetime at deploy
+ * time, so the same rules are checked here. Two constraints are not Cognito's at all but the
+ * platform's: the BFF keeps its session in memory, so it must run as a single task (see
+ * {@link assertValidApplicationConfig}), and its `Secure` session cookie only works over HTTPS, so
+ * an authentication-enabled environment must have a delegated domain. Auth is never optional in
+ * this phase, so a configuration with `auth` but no `dns` is always rejected - the message says why,
+ * because "add a domain" is not an obvious fix for a missing CORS origin.
+ */
+function assertValidAuthConfig(config: EnvironmentConfig, fail: (message: string) => never): void {
+  const { auth } = config;
+
+  if (
+    !Number.isInteger(auth.passwordMinimumLength) ||
+    auth.passwordMinimumLength < MIN_PASSWORD_LENGTH ||
+    auth.passwordMinimumLength > MAX_PASSWORD_LENGTH
+  ) {
+    fail(
+      `auth.passwordMinimumLength must be between ${MIN_PASSWORD_LENGTH} and ${MAX_PASSWORD_LENGTH} ` +
+        `characters, got ${auth.passwordMinimumLength}.`,
+    );
+  }
+
+  assertTokenValidity('auth.accessTokenValidity', auth.accessTokenValidity, MIN_TOKEN_VALIDITY, MAX_TOKEN_VALIDITY, fail);
+  assertTokenValidity('auth.idTokenValidity', auth.idTokenValidity, MIN_TOKEN_VALIDITY, MAX_TOKEN_VALIDITY, fail);
+  assertTokenValidity(
+    'auth.refreshTokenValidity',
+    auth.refreshTokenValidity,
+    MIN_REFRESH_TOKEN_VALIDITY,
+    MAX_REFRESH_TOKEN_VALIDITY,
+    fail,
+  );
+
+  // The session must not outlive the refresh token, or the BFF could hold a session it can no
+  // longer refresh and the user would be signed out with an unhandled error instead of silently
+  // re-authenticated.
+  if (auth.sessionTimeout.toSeconds() <= 0) {
+    fail('auth.sessionTimeout must be a positive duration.');
+  }
+  if (auth.sessionTimeout.toSeconds() > auth.refreshTokenValidity.toSeconds()) {
+    fail(
+      'auth.sessionTimeout must not exceed auth.refreshTokenValidity, or the BFF could hold a ' +
+        'session it can no longer refresh.',
+    );
+  }
+
+  if (auth.allowedOrigins.length === 0) {
+    fail('auth.allowedOrigins must contain at least one frontend origin; the API answers with credentials.');
+  }
+  for (const origin of auth.allowedOrigins) {
+    if (origin === '*' || !WEB_ORIGIN.test(origin)) {
+      fail(
+        `auth.allowedOrigins entry "${origin}" is not an absolute origin. Expected "scheme://host[:port]" ` +
+          'and never "*", because credentials are allowed.',
+      );
+    }
+  }
+
+  // The post-logout target is registered with Cognito as an exact logout URI, so a relative or
+  // wildcard value would make the app client fail to create (or send the browser somewhere it
+  // should not go).
+  if (auth.logoutUrl === '*' || !WEB_ORIGIN.test(auth.logoutUrl)) {
+    fail(
+      `auth.logoutUrl "${auth.logoutUrl}" is not an absolute origin. Expected "scheme://host[:port]" ` +
+        'and never "*".',
+    );
+  }
+
+  if (config.dns === undefined) {
+    fail(
+      'authentication requires a delegated domain (config.dns): the BFF session cookie is `Secure`, ' +
+        'so the API must answer over HTTPS. Set the environment\'s domain variable, for example ' +
+        'ECOMMERCE_DEV_DOMAIN.',
+    );
+  }
+}
+
+/** Checks that a Cognito token lifetime falls inside the range the service accepts. */
+function assertTokenValidity(
+  name: string,
+  value: Duration,
+  minimum: Duration,
+  maximum: Duration,
+  fail: (message: string) => never,
+): void {
+  if (value.toSeconds() < minimum.toSeconds() || value.toSeconds() > maximum.toSeconds()) {
+    fail(
+      `${name} must be between ${minimum.toHumanString()} and ${maximum.toHumanString()}, got ` +
+        `${value.toHumanString()}.`,
+    );
+  }
 }
 
 /**
@@ -120,6 +240,19 @@ function assertValidApplicationConfig(
 ): void {
   if (!Number.isInteger(application.desiredCount) || application.desiredCount < 0) {
     fail(`application.desiredCount must be a non-negative integer, got ${application.desiredCount}.`);
+  }
+  // Phase 4 keeps the BFF's HTTP sessions in memory. Two tasks would each hold a different copy of
+  // the session store, so a request load balanced to the wrong task would look signed out - a bug
+  // that only appears under load. Until sessions move to an external store (Redis/ElastiCache,
+  // Phase 6) the service must run as exactly one task, and this guard makes that enforceable rather
+  // than a comment someone can overlook when enabling auto scaling. Remove it when the session
+  // store is externalised.
+  if (application.desiredCount > 1) {
+    fail(
+      `application.desiredCount must be 1 while the BFF holds sessions in memory (got ` +
+        `${application.desiredCount}). Auto scaling would split the session store and break login; ` +
+        'externalise sessions to Redis/ElastiCache (Phase 6) before raising it.',
+    );
   }
 
   const allowedMemory = FARGATE_TASK_SIZES[application.cpu];
