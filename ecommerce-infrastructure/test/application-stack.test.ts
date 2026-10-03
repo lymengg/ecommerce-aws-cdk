@@ -2,9 +2,10 @@ import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 
 import { getEnvironmentConfig } from '../lib/config';
-import { EnvironmentName } from '../lib/config/types';
+import { DnsConfig, EnvironmentConfig, EnvironmentName } from '../lib/config/types';
 import { ApplicationStack } from '../lib/stacks/application-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
+import { DnsStack } from '../lib/stacks/dns-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
@@ -13,6 +14,10 @@ import { NetworkStack } from '../lib/stacks/network-stack';
  * stacks themselves never hardcode an account id - test/config.test.ts enforces that.
  */
 const TEST_ACCOUNT = '123456789012';
+
+/** A delegated subdomain injected into the configuration, independent of the developer's shell. */
+const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api' };
+const TEST_FQDN = 'api.dev.example.com';
 
 interface ResourceEntry {
   readonly logicalId: string;
@@ -24,16 +29,20 @@ interface BuiltStacks {
   readonly network: NetworkStack;
   readonly database: DatabaseStack;
   readonly application: ApplicationStack;
+  readonly dns?: DnsStack;
 }
 
 /**
- * Builds the Phase 1 network stack, the Phase 2 registry stack, the Phase 3 database stack and the
- * application stack in one app, exactly as `bin/ecommerce.ts` does, so the cross-stack wiring is
- * exercised rather than stubbed.
+ * Builds the Phase 1 network stack, the Phase 2 registry stack, the Phase 3 database stack, the
+ * Phase 3.5 DNS stack (when the configuration has a delegated subdomain) and the application stack
+ * in one app, exactly as `bin/ecommerce.ts` does, so the cross-stack wiring is exercised rather than
+ * stubbed. `dnsOverride` injects a subdomain for the tests that need the TLS path without depending
+ * on `ECOMMERCE_<ENV>_DOMAIN` being set in the developer's shell.
  */
-function buildStacks(environment: EnvironmentName): BuiltStacks {
+function buildStacks(environment: EnvironmentName, dnsOverride?: DnsConfig): BuiltStacks {
   const app = new App();
-  const config = getEnvironmentConfig(environment);
+  const base = getEnvironmentConfig(environment);
+  const config: EnvironmentConfig = dnsOverride === undefined ? base : { ...base, dns: dnsOverride };
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
@@ -44,6 +53,8 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
     vpc: network.vpc,
     databaseSecurityGroup: network.securityGroups.database,
   });
+  const dns =
+    config.dns === undefined ? undefined : new DnsStack(app, `test-dns-${environment}`, { env, config });
   const application = new ApplicationStack(app, `test-application-${environment}`, {
     env,
     config,
@@ -57,9 +68,20 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
       databaseName: config.database.databaseName,
       secret: database.credentialsSecret,
     },
+    dns:
+      dns === undefined ? undefined : { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
   });
 
-  return { template: Template.fromStack(application), network, database, application };
+  return { template: Template.fromStack(application), network, database, application, dns };
+}
+
+/** Finds the single listener on a given port, or fails the test if there is not exactly one. */
+function listenerOnPort(template: Template, port: number): ResourceEntry {
+  const listeners = resourcesOfType(template, 'AWS::ElasticLoadBalancingV2::Listener').filter(
+    ({ properties }) => properties.Port === port,
+  );
+  expect(listeners).toHaveLength(1);
+  return listeners[0];
 }
 
 function resourcesOfType(template: Template, type: string): ResourceEntry[] {
@@ -480,5 +502,92 @@ describe('ApplicationStack outputs', () => {
 
     expect(outputs.ServiceName.Export.Name).toBe('ecommerce-prod-ecs-service-name');
     expect(outputs.ApiUrl.Export.Name).toBe('ecommerce-prod-api-url');
+  });
+});
+
+describe('ApplicationStack DNS and TLS', () => {
+  test('leaves the plaintext HTTP path unchanged when no dns is configured', () => {
+    // dev with no delegated subdomain: exactly what Phase 2 produced.
+    const template = buildStacks('dev').template;
+    const listener = single(template, 'AWS::ElasticLoadBalancingV2::Listener');
+
+    expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
+    expect(listener.properties.DefaultActions[0].Type).toBe('forward');
+    template.resourceCountIs('AWS::Route53::RecordSet', 0);
+
+    // ApiUrl is still the load balancer's own plaintext name, and there is no secondary HTTP output.
+    const outputs = template.toJSON().Outputs;
+    expect(json(outputs.ApiUrl.Value)).toContain('http://');
+    expect(outputs.HttpApiUrl).toBeUndefined();
+  });
+
+  test('terminates TLS on 443 and forwards to the existing target group', () => {
+    const { template, dns } = buildStacks('dev', TEST_DNS);
+    const listener = listenerOnPort(template, 443);
+
+    expect(listener.properties).toMatchObject({
+      Port: 443,
+      Protocol: 'HTTPS',
+      // TLS 1.2 floor: the older RECOMMENDED policy still negotiates TLS 1.0/1.1.
+      SslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
+    });
+    expect(listener.properties.DefaultActions).toHaveLength(1);
+    expect(listener.properties.DefaultActions[0].Type).toBe('forward');
+    expect(json(listener.properties.DefaultActions[0].TargetGroupArn)).toContain('ApiTargetGroup');
+
+    // The certificate is consumed from the DNS stack by reference, never as a literal ARN string.
+    expect(listener.properties.Certificates).toHaveLength(1);
+    expect(json(listener.properties.Certificates[0].CertificateArn)).toContain(dns!.stackName);
+  });
+
+  test('redirects plaintext HTTP to HTTPS with a permanent redirect', () => {
+    const template = buildStacks('dev', TEST_DNS).template;
+    const listener = listenerOnPort(template, 80);
+
+    // A redirect action, not a forward: no plaintext request ever reaches the application.
+    expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
+    expect(listener.properties.DefaultActions).toEqual([
+      { Type: 'redirect', RedirectConfig: { Protocol: 'HTTPS', Port: '443', StatusCode: 'HTTP_301' } },
+    ]);
+  });
+
+  test('creates an alias A record to the load balancer, never an IP address', () => {
+    const { template, dns } = buildStacks('dev', TEST_DNS);
+    const record = single(template, 'AWS::Route53::RecordSet');
+
+    expect(record.properties).toMatchObject({ Name: `${TEST_FQDN}.`, Type: 'A' });
+    // Alias to the load balancer: its DNS name and canonical hosted zone id, resolved by Route 53.
+    expect(json(record.properties.AliasTarget)).toContain('ApiLoadBalancer');
+    expect(json(record.properties.AliasTarget)).toContain('DNSName');
+    expect(record.properties.ResourceRecords).toBeUndefined();
+    expect(record.properties.TTL).toBeUndefined();
+    // The zone comes from the DNS stack by reference.
+    expect(json(record.properties.HostedZoneId)).toContain(dns!.stackName);
+  });
+
+  test('defines neither the hosted zone nor the certificate, only references them', () => {
+    const template = buildStacks('dev', TEST_DNS).template;
+
+    template.resourceCountIs('AWS::Route53::HostedZone', 0);
+    template.resourceCountIs('AWS::CertificateManager::Certificate', 0);
+  });
+
+  test('publishes the HTTPS URL and keeps the plaintext URL for the redirect check', () => {
+    const template = buildStacks('dev', TEST_DNS).template;
+    const outputs = template.toJSON().Outputs;
+
+    expect(outputs.ApiUrl.Value).toBe(`https://${TEST_FQDN}`);
+    expect(outputs.ApiUrl.Export.Name).toBe('ecommerce-dev-api-url');
+    expect(json(outputs.HttpApiUrl.Value)).toContain('http://');
+    expect(outputs.HttpApiUrl.Export.Name).toBe('ecommerce-dev-api-http-url');
+  });
+
+  test('adds no duplicate rule for 443 - the Phase 1 security group already allows it', () => {
+    const template = buildStacks('dev', TEST_DNS).template;
+
+    const ingress = resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress');
+    expect(ingress).toHaveLength(1);
+    expect(ingress[0].properties).toMatchObject({ FromPort: 80, ToPort: 80, CidrIp: '0.0.0.0/0' });
+    expect(ingress.some(({ properties }) => properties.FromPort === 443)).toBe(false);
   });
 });

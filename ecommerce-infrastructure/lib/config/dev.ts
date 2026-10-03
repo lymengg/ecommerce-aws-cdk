@@ -54,4 +54,10 @@ export const devConfig: EnvironmentConfig = {
     deletionProtection: false,
     removalPolicy: RemovalPolicy.DESTROY,
   },
+  // The public subdomain is read from the environment, like the account id, so the domain never
+  // ends up in source. It is omitted entirely when unset, which is what lets dev synthesise and
+  // deploy HTTP-only before a subdomain has been delegated to Route 53.
+  dns: process.env.ECOMMERCE_DEV_DOMAIN
+    ? { zoneName: process.env.ECOMMERCE_DEV_DOMAIN, apiSubdomain: 'api' }
+    : undefined,
 };

@@ -191,6 +191,52 @@ describe('database configuration', () => {
   });
 });
 
+describe('dns configuration', () => {
+  test('production requires a delegated domain, because plaintext HTTP is not an option', () => {
+    const prod = getEnvironmentConfig('prod');
+
+    expect(prod.dns).toBeDefined();
+    expect(prod.dns?.apiSubdomain).toBe('api');
+    expect(() => assertValidEnvironmentConfig({ ...prod, dns: undefined })).toThrow(/dns is required in production/);
+  });
+
+  test('dev and uat may omit dns so they can still synthesise HTTP-only', () => {
+    for (const environment of ['dev', 'uat'] as EnvironmentName[]) {
+      const config = getEnvironmentConfig(environment);
+
+      expect(() => assertValidEnvironmentConfig({ ...config, dns: undefined })).not.toThrow();
+    }
+  });
+
+  test('accepts a well formed delegated subdomain', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    expect(() =>
+      assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain: 'api' } }),
+    ).not.toThrow();
+  });
+
+  test('rejects a zone name that is not a DNS host name', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    for (const zoneName of ['bad_name', '-bad.example.com', 'example', 'bad..com', 'trailing-.com', '']) {
+      expect(() =>
+        assertValidEnvironmentConfig({ ...dev, dns: { zoneName, apiSubdomain: 'api' } }),
+      ).toThrow(/dns.zoneName/);
+    }
+  });
+
+  test('rejects an API subdomain that is not a single DNS label', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    for (const apiSubdomain of ['bad_label', '-api', 'api.', 'api.example.com', '']) {
+      expect(() =>
+        assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain } }),
+      ).toThrow(/dns.apiSubdomain/);
+    }
+  });
+});
+
 describe('image tag resolution', () => {
   test('reads the image tag from CDK context', () => {
     const app = new App({ context: { imageTag: 'v9.9.9' } });

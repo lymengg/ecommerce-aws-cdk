@@ -1,4 +1,5 @@
 import { Duration, RemovalPolicy } from 'aws-cdk-lib';
+import { ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
 import { ISecurityGroup, IVpc, Peer, Port, SubnetType } from 'aws-cdk-lib/aws-ec2';
 import { IRepository } from 'aws-cdk-lib/aws-ecr';
 import {
@@ -16,7 +17,9 @@ import {
   ApplicationLoadBalancer,
   ApplicationProtocol,
   ApplicationTargetGroup,
+  ListenerAction,
   Protocol as ElbProtocol,
+  SslPolicy,
   TargetType,
 } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
@@ -26,8 +29,11 @@ import { Construct } from 'constructs';
 
 import { ApplicationConfig } from '../config/types';
 
-/** Port the load balancer accepts public HTTP traffic on. HTTPS is added in a later phase. */
+/** Port the load balancer accepts public HTTP traffic on. With a certificate it redirects to 443. */
 const LISTENER_PORT = 80;
+
+/** Port the load balancer accepts public HTTPS traffic on once a certificate is supplied. */
+const HTTPS_LISTENER_PORT = 443;
 
 /**
  * Everything the container needs to reach the database (Phase 3).
@@ -81,13 +87,27 @@ export interface LoadBalancedApiProps {
   /** Where the container finds the database and the secret holding its credentials (Phase 3). */
   readonly database: DatabaseConnection;
 
+  /**
+   * ACM certificate covering {@link domainName}. When supplied, the load balancer terminates TLS on
+   * 443 and the port 80 listener becomes a permanent redirect. When omitted (dev before a domain
+   * has been delegated), the load balancer keeps today's plaintext HTTP path.
+   */
+  readonly certificate?: ICertificate;
+
+  /**
+   * Fully qualified domain name the certificate covers, for example `api.dev.example.com`. Only
+   * used to document the listener; the load balancer does not need it to serve the certificate.
+   */
+  readonly domainName?: string;
+
   /** Removal policy for resources that support one: the log group. */
   readonly removalPolicy: RemovalPolicy;
 }
 
 /**
  * The Phase 2 application tier: a Spring Boot API running as a single Fargate task behind an
- * internet-facing Application Load Balancer, now reading and writing PostgreSQL (Phase 3).
+ * internet-facing Application Load Balancer, now reading and writing PostgreSQL (Phase 3) and, when
+ * a certificate is supplied, terminating TLS (Phase 3.5).
  *
  *   Internet -> ALB (public subnets) -> target group -> ECS service (private subnets) -> Fargate task
  *                                                                                          |
@@ -107,8 +127,18 @@ export class LoadBalancedApi extends Construct {
   /** Target group the ECS service registers its tasks with. */
   public readonly targetGroup: ApplicationTargetGroup;
 
-  /** HTTP listener that forwards to {@link targetGroup}. */
+  /**
+   * Port 80 listener. Forwards to {@link targetGroup} when no certificate is configured; with a
+   * certificate it answers a permanent redirect to HTTPS instead, so no plaintext request reaches
+   * the application.
+   */
   public readonly listener: ApplicationListener;
+
+  /**
+   * Port 443 listener that terminates TLS with {@link LoadBalancedApiProps.certificate} and forwards
+   * to {@link targetGroup}. Absent when no certificate is configured.
+   */
+  public readonly httpsListener?: ApplicationListener;
 
   /** The ECS service running the API. */
   public readonly service: FargateService;
@@ -174,17 +204,51 @@ export class LoadBalancedApi extends Construct {
       },
     });
 
-    // `open: false` keeps the listener from quietly adding a 0.0.0.0/0 rule; the ingress rule below
-    // is added explicitly instead, so the one public entry point is visible in the template.
-    this.listener = this.loadBalancer.addListener('HttpListener', {
-      port: LISTENER_PORT,
-      protocol: ApplicationProtocol.HTTP,
-      defaultTargetGroups: [this.targetGroup],
-      open: false,
-    });
+    // `open: false` keeps the listeners from quietly adding a 0.0.0.0/0 rule; the ingress rules
+    // below are added explicitly instead, so the public entry points are visible in the template.
+    if (props.certificate === undefined) {
+      // No certificate yet (dev before a domain has been delegated): the plaintext Phase 2 path.
+      this.listener = this.loadBalancer.addListener('HttpListener', {
+        port: LISTENER_PORT,
+        protocol: ApplicationProtocol.HTTP,
+        defaultTargetGroups: [this.targetGroup],
+        open: false,
+      });
+    } else {
+      // With a certificate, port 80 only redirects. A redirect action keeps the plaintext listener
+      // out of the request path entirely - it never forwards to the target group, so no request
+      // reaches the application unencrypted.
+      this.listener = this.loadBalancer.addListener('HttpListener', {
+        port: LISTENER_PORT,
+        protocol: ApplicationProtocol.HTTP,
+        defaultAction: ListenerAction.redirect({
+          port: String(HTTPS_LISTENER_PORT),
+          protocol: ApplicationProtocol.HTTPS,
+          permanent: true,
+        }),
+        open: false,
+      });
 
-    // The Phase 1 load balancer security group only accepts HTTPS. The Phase 2 listener speaks plain
-    // HTTP, so port 80 is opened here. This is the single CIDR-based inbound rule in Phase 2.
+      // TLS terminates at the load balancer and the request continues to the task over plain HTTP
+      // inside the private subnets, which is standard: the hop that crosses the internet is the one
+      // that must be encrypted, and the target group is not reachable from outside the VPC.
+      this.httpsListener = this.loadBalancer.addListener('HttpsListener', {
+        port: HTTPS_LISTENER_PORT,
+        protocol: ApplicationProtocol.HTTPS,
+        certificates: [props.certificate],
+        // TLS 1.2 as the floor (the ELBSecurityPolicy-TLS13-1-2-2021-06 policy). The older
+        // `RECOMMENDED` policy still negotiates TLS 1.0/1.1, which is not acceptable for an endpoint
+        // that will soon carry bearer tokens.
+        sslPolicy: SslPolicy.RECOMMENDED_TLS,
+        defaultTargetGroups: [this.targetGroup],
+        open: false,
+      });
+    }
+
+    // The Phase 1 load balancer security group already accepts HTTPS on 443; port 80 is opened here
+    // because Phase 2 added the HTTP listener. With a certificate, port 80 is still needed: it is
+    // where the redirect to HTTPS answers. These are the only CIDR-based inbound rules in the
+    // application stack.
     albSecurityGroup.addIngressRule(Peer.anyIpv4(), Port.tcp(LISTENER_PORT), 'HTTP from the internet');
 
     this.service = this.createService(cluster, applicationSecurityGroup, serviceName, config);

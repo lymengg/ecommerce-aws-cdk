@@ -1,12 +1,30 @@
 import { CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
+import { ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
 import { ISecurityGroup, IVpc, SecurityGroup } from 'aws-cdk-lib/aws-ec2';
 import { IRepository } from 'aws-cdk-lib/aws-ecr';
 import { Cluster } from 'aws-cdk-lib/aws-ecs';
+import { ARecord, IHostedZone, RecordTarget } from 'aws-cdk-lib/aws-route53';
+import { LoadBalancerTarget } from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
 import { DatabaseConnection, LoadBalancedApi } from '../constructs/load-balanced-api';
 import { applyPlatformTags } from '../tags';
+
+/**
+ * Phase 3.5 DNS/TLS wiring, consumed from the DNS stack by reference. Present only when the
+ * environment has a delegated subdomain; without it the stack builds today's HTTP-only endpoint.
+ */
+export interface ApplicationDnsProps {
+  /** The hosted zone the API record is created in. */
+  readonly zone: IHostedZone;
+
+  /** ACM certificate covering {@link domainName}, terminating TLS on the load balancer. */
+  readonly certificate: ICertificate;
+
+  /** Fully qualified domain name the API answers on, for example `api.dev.example.com`. */
+  readonly domainName: string;
+}
 
 export interface ApplicationStackProps extends StackProps {
   /** Environment specific configuration. No environment value is hardcoded in this stack. */
@@ -29,6 +47,12 @@ export interface ApplicationStackProps extends StackProps {
    * so this stack never defines a database resource itself.
    */
   readonly database: DatabaseConnection;
+
+  /**
+   * Phase 3.5 DNS and TLS, read from the DNS stack by reference. Omitted in dev until a subdomain
+   * has been delegated, which keeps the HTTP-only path working.
+   */
+  readonly dns?: ApplicationDnsProps;
 }
 
 /**
@@ -42,6 +66,12 @@ export interface ApplicationStackProps extends StackProps {
  *
  * The database connection details travel as environment variables and the credentials are injected
  * from Secrets Manager by the ECS agent, so this stack - like every other - contains no credential.
+ *
+ * Phase 3.5 optionally points the API at a name: when a DNS/TLS block is supplied the load balancer
+ * gets an HTTPS listener and a port 80 redirect, and an alias record is created in the DNS stack's
+ * hosted zone. Both are consumed by reference, so this stack still defines neither the zone nor the
+ * certificate.
+ *
  * No cache, queue or auto scaling is created here: those are later phases.
  */
 export class ApplicationStack extends Stack {
@@ -82,18 +112,31 @@ export class ApplicationStack extends Stack {
       albSecurityGroup,
       applicationSecurityGroup: props.applicationSecurityGroup,
       database,
+      certificate: props.dns?.certificate,
+      domainName: props.dns?.domainName,
       removalPolicy: config.removalPolicy,
     });
 
+    if (props.dns !== undefined) {
+      // An alias record, never an IP: the load balancer's address changes without notice, and an
+      // alias is free of charge and updated by Route 53 whenever the endpoint changes.
+      new ARecord(this, 'ApiRecord', {
+        zone: props.dns.zone,
+        recordName: props.dns.domainName,
+        target: RecordTarget.fromAlias(new LoadBalancerTarget(this.api.loadBalancer)),
+        comment: `Alias to the ${namePrefix} application load balancer`,
+      });
+    }
+
     applyPlatformTags(this, config);
-    this.createOutputs(config, serviceName);
+    this.createOutputs(config, serviceName, props.dns);
   }
 
   /**
    * Publishes where the API answers and how to find the ECS resources. Export names are environment
    * specific so dev, uat and prod coexist in one account.
    */
-  private createOutputs(config: EnvironmentConfig, serviceName: string): void {
+  private createOutputs(config: EnvironmentConfig, serviceName: string, dns: ApplicationDnsProps | undefined): void {
     const exportPrefix = `ecommerce-${config.environment}`;
 
     new CfnOutput(this, 'ClusterName', {
@@ -115,10 +158,22 @@ export class ApplicationStack extends Stack {
     });
 
     new CfnOutput(this, 'ApiUrl', {
-      value: `http://${this.api.loadBalancer.loadBalancerDnsName}`,
-      description: 'Public HTTP endpoint of the API',
+      // With a certificate the API is reached by name over TLS; without one it is still the load
+      // balancer's own DNS name over plain HTTP, exactly as in Phase 2.
+      value: dns === undefined ? `http://${this.api.loadBalancer.loadBalancerDnsName}` : `https://${dns.domainName}`,
+      description: dns === undefined ? 'Public HTTP endpoint of the API' : 'Public HTTPS endpoint of the API',
       exportName: `${exportPrefix}-api-url`,
     });
+
+    if (dns !== undefined) {
+      // Kept alongside the HTTPS URL because it is what the redirect is verified against: a request
+      // to this plain HTTP endpoint must answer 301 with a Location of the HTTPS URL above.
+      new CfnOutput(this, 'HttpApiUrl', {
+        value: `http://${this.api.loadBalancer.loadBalancerDnsName}`,
+        description: 'Plain HTTP endpoint of the load balancer, which redirects to HTTPS',
+        exportName: `${exportPrefix}-api-http-url`,
+      });
+    }
 
     new CfnOutput(this, 'TargetGroupArn', {
       value: this.api.targetGroup.targetGroupArn,

@@ -20,6 +20,17 @@ const MAX_BACKUP_RETENTION_DAYS = 35;
 /** Smallest storage RDS accepts for a gp3 volume. */
 const MIN_ALLOCATED_STORAGE_GB = 20;
 
+/**
+ * A DNS host name: one or more labels separated by dots, each starting and ending with a letter or
+ * digit and at most 63 characters, with a top level label of at least two letters. Deliberately
+ * conservative - it rejects the underscores, leading dashes and empty labels that Route 53 would
+ * accept into a zone name but that would never resolve.
+ */
+const DNS_HOSTNAME = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,}$/i;
+
+/** A single DNS label: the leftmost part of a name, with no dots. */
+const DNS_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/i;
+
 /** Inclusive integer range, used to spell out the larger Fargate memory tiers compactly. */
 function range(start: number, end: number, step: number): number[] {
   const values: number[] = [];
@@ -67,6 +78,35 @@ export function assertValidEnvironmentConfig(config: EnvironmentConfig): void {
 
   assertValidApplicationConfig(config.application, fail);
   assertValidDatabaseConfig(config.database, fail);
+  assertValidDnsConfig(config, fail);
+}
+
+/**
+ * Validates the optional DNS/TLS configuration. DNS is optional so dev can still synthesise and
+ * deploy HTTP-only, but production must have it: an environment that serves real traffic over
+ * plaintext HTTP is not a production option, and failing at synth is the only way to guarantee the
+ * TLS listener is never forgotten. When a `dns` block is present, the zone name and the API label
+ * are checked against the DNS rules Route 53 would otherwise enforce at deploy time.
+ */
+function assertValidDnsConfig(config: EnvironmentConfig, fail: (message: string) => never): void {
+  const { dns } = config;
+
+  if (dns === undefined) {
+    if (config.environment === 'prod') {
+      fail(
+        'dns is required in production; plaintext HTTP is not a production option. ' +
+          'Set ECOMMERCE_PROD_DOMAIN to the delegated subdomain, for example "prod.example.com".',
+      );
+    }
+    return;
+  }
+
+  if (!DNS_HOSTNAME.test(dns.zoneName)) {
+    fail(`dns.zoneName "${dns.zoneName}" is not a valid DNS host name.`);
+  }
+  if (!DNS_LABEL.test(dns.apiSubdomain)) {
+    fail(`dns.apiSubdomain "${dns.apiSubdomain}" is not a valid DNS label.`);
+  }
 }
 
 /**

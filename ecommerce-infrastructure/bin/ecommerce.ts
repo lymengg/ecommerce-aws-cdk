@@ -6,6 +6,7 @@ import { App } from 'aws-cdk-lib';
 import { EnvironmentConfig, getEnvironmentConfig, resolveEnvironmentName, resolveImageTag } from '../lib/config';
 import { ApplicationStack } from '../lib/stacks/application-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
+import { DnsStack } from '../lib/stacks/dns-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
@@ -59,9 +60,33 @@ const database = new DatabaseStack(app, `ecommerce-database-${environment}`, {
   description: `E-commerce platform PostgreSQL database (${environment})`,
 });
 
-// The application stack consumes the network stack's VPC and security groups, the registry, and the
-// database stack's endpoint and credentials secret, so the CDK CLI orders the stacks: network,
-// registry and database must exist before compute can attach to them.
+// Phase 3.5 DNS and TLS, created only when the environment has a delegated subdomain. It depends on
+// no other stack - the hosted zone is created, never looked up - so it can be deployed in parallel
+// with the network, registry and database stacks.
+//
+// Deploy-order contract: the zone must be delegated before the certificate can finish issuing. After
+// this stack is deployed, copy the HostedZoneNameServers output into NS records at the registrar;
+// ACM then completes the DNS validation on its own and the certificate becomes usable. Deploying the
+// application stack before that leaves the HTTPS listener waiting on a certificate that is still
+// pending, which is why the order below matters.
+const dns =
+  config.dns === undefined
+    ? undefined
+    : new DnsStack(app, `ecommerce-dns-${environment}`, {
+        env: {
+          account: config.account,
+          region: config.region,
+        },
+        config: deployedConfig,
+        description: `E-commerce platform public DNS and TLS certificate (${environment})`,
+      });
+
+// The application stack consumes the network stack's VPC and security groups, the registry, the
+// database stack's endpoint and credentials secret, and - when configured - the DNS stack's hosted
+// zone and certificate, so the CDK CLI orders the stacks: network, registry, database and dns must
+// exist before compute can attach to them. The references are by object, never by ARN string, and
+// there is no path back from the DNS stack to the application stack, so the dependency graph stays
+// acyclic.
 new ApplicationStack(app, `ecommerce-application-${environment}`, {
   env: {
     account: config.account,
@@ -78,5 +103,9 @@ new ApplicationStack(app, `ecommerce-application-${environment}`, {
     databaseName: config.database.databaseName,
     secret: database.credentialsSecret,
   },
+  dns:
+    dns === undefined
+      ? undefined
+      : { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
   description: `E-commerce platform application compute (${environment})`,
 });

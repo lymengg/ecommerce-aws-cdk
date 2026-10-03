@@ -17,6 +17,11 @@ with the master credentials generated and stored in AWS Secrets Manager and inje
 container by ECS. The Spring Boot API now reads and writes PostgreSQL through Spring Data JPA, and
 owns its schema with Flyway migrations.
 
+**Phase 3.5** delivers TLS and DNS: a Route 53 hosted zone for the platform's delegated subdomain, an
+ACM certificate validated by DNS, an HTTPS listener on the load balancer that forwards to the
+existing target group, and a permanent redirect from HTTP to HTTPS. The API is now reached at
+`https://api.<env-domain>` instead of by the load balancer's plaintext DNS name.
+
 No cache, queue, authentication, CI/CD or auto scaling exists yet. Those are Phase 4+ and are listed
 at the end of this document.
 
@@ -30,33 +35,37 @@ at the end of this document.
 4. [Core concepts: the network](#core-concepts-the-network)
 5. [Core concepts: the application tier](#core-concepts-the-application-tier)
 6. [Core concepts: the data tier](#core-concepts-the-data-tier)
-7. [The Spring Boot application](#the-spring-boot-application)
-8. [The container image](#the-container-image)
-9. [ECR: how an image is tagged and pushed](#ecr-how-an-image-is-tagged-and-pushed)
-10. [IAM: execution role versus task role](#iam-execution-role-versus-task-role)
-11. [Database credentials and Secrets Manager](#database-credentials-and-secrets-manager)
-12. [Security group model](#security-group-model)
-13. [Environments and configuration](#environments-and-configuration)
-14. [Tags](#tags)
-15. [Stack outputs](#stack-outputs)
-16. [Removal policies and resource protection](#removal-policies-and-resource-protection)
-17. [Commands](#commands)
-18. [Deployment and verification procedure](#deployment-and-verification-procedure)
-19. [Testing](#testing)
-20. [Cost expectations](#cost-expectations)
-21. [Phase 4 and beyond](#phase-4-and-beyond)
+7. [Core concepts: DNS and TLS](#core-concepts-dns-and-tls)
+8. [The Spring Boot application](#the-spring-boot-application)
+9. [The container image](#the-container-image)
+10. [ECR: how an image is tagged and pushed](#ecr-how-an-image-is-tagged-and-pushed)
+11. [IAM: execution role versus task role](#iam-execution-role-versus-task-role)
+12. [Database credentials and Secrets Manager](#database-credentials-and-secrets-manager)
+13. [Security group model](#security-group-model)
+14. [Environments and configuration](#environments-and-configuration)
+15. [Tags](#tags)
+16. [Stack outputs](#stack-outputs)
+17. [Removal policies and resource protection](#removal-policies-and-resource-protection)
+18. [Commands](#commands)
+19. [Deployment and verification procedure](#deployment-and-verification-procedure)
+20. [Testing](#testing)
+21. [Cost expectations](#cost-expectations)
+22. [Phase 4 and beyond](#phase-4-and-beyond)
 
 ---
 
 ## Architecture
 
-The Phase 3 request path:
+The Phase 3.5 request path. HTTP on port 80 is answered with a permanent redirect to HTTPS, so the
+only path that reaches the application is encrypted:
 
 ```
                               Internet
                                  │
-                                 │ HTTP :80
-                                 ▼
+                 ┌───────────────┴────────────────┐
+                 │ HTTP :80                       │ HTTPS :443
+                 │ (301 -> https://api.<env-domain>)│ (TLS 1.2+, ACM certificate)
+                 ▼                                ▼
                     ┌────────────────────────┐
                     │ Application Load       │
                     │ Balancer               │
@@ -138,9 +147,9 @@ Traffic paths created by the stacks:
 Security group chain:
 
 ```
-Internet ──80──▶ ALB SG ──8080──▶ Application SG ──5432──▶ Database SG
-                                     │
-                                     └──443──▶ Internet (via NAT, e.g. image pulls)
+Internet ──443─▶ ALB SG ──8080──▶ Application SG ──5432──▶ Database SG
+Internet ──80──▶ ALB SG              │
+ (301 redirect)                      └──443──▶ Internet (via NAT, e.g. image pulls)
 ```
 
 ---
@@ -154,7 +163,7 @@ aws-cdk/
 │   │   └── ecommerce.ts              # CDK app entry point: resolve env, build the stacks
 │   ├── lib/
 │   │   ├── config/
-│   │   │   ├── types.ts              # EnvironmentConfig + ApplicationConfig + DatabaseConfig
+│   │   │   ├── types.ts              # EnvironmentConfig + Application/Database/DnsConfig
 │   │   │   ├── validation.ts         # fail-fast validation of an environment config
 │   │   │   ├── dev.ts                # dev values
 │   │   │   ├── uat.ts                # uat values
@@ -168,13 +177,16 @@ aws-cdk/
 │   │   │   ├── network-stack.ts      # VPC, public/private/isolated subnets, routing, SGs
 │   │   │   ├── ecr-stack.ts          # container registry
 │   │   │   ├── database-stack.ts     # RDS PostgreSQL instance + Secrets Manager credentials
-│   │   │   └── application-stack.ts  # ECS cluster, service, ALB, IAM, logs
+│   │   │   ├── dns-stack.ts          # Route 53 hosted zone + ACM certificate (Phase 3.5)
+│   │   │   └── application-stack.ts  # ECS cluster, service, ALB, IAM, logs, DNS record
 │   │   └── tags.ts                   # the shared tag contract
 │   ├── test/
+│   │   ├── setup-env.ts              # sets ECOMMERCE_PROD_DOMAIN before the config is imported
 │   │   ├── network-stack.test.ts     # network contract tests (CDK assertions)
 │   │   ├── ecr-stack.test.ts         # registry contract tests
 │   │   ├── database-stack.test.ts    # database contract tests
-│   │   ├── application-stack.test.ts # compute + database wiring contract tests
+│   │   ├── dns-stack.test.ts         # hosted zone + certificate contract tests
+│   │   ├── application-stack.test.ts # compute + database + TLS wiring contract tests
 │   │   └── config.test.ts            # configuration tests
 │   ├── cdk.json
 │   ├── jest.config.js
@@ -215,7 +227,8 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 | Network | `ecommerce-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
 | Registry | `ecommerce-ecr-<env>` | ECR repository |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
-| Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listener, log group, IAM roles |
+| DNS | `ecommerce-dns-<env>` | Route 53 hosted zone, ACM certificate (created only when a domain is configured) |
+| Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listeners, alias record, log group, IAM roles |
 
 The registry is a **separate stack from the compute** on purpose. An ECS service cannot start until
 an image exists, and an image can only be pushed once the repository exists, so the repository has
@@ -229,10 +242,24 @@ database holds the only state in the platform and outlives many deployments of t
 it. Keeping them apart means a `cdk deploy ecommerce-application-dev` never touches the instance,
 and the instance's removal policy and deletion protection are decided in one small stack.
 
+The DNS stack is a **separate stack from the compute** because a certificate is long-lived and
+replaceable: the application can be torn down and recreated at will without re-validating TLS, and
+the zone can be delegated and left in place while the compute is redeployed. It depends on no other
+stack — the hosted zone is created, never looked up — so it can be deployed in parallel with the
+network, registry and database.
+
+Deployment order is therefore: **network → registry → database → dns → application**. The DNS stack
+sits between the database and the application because the application consumes its zone and
+certificate; nothing consumes the application, so there is no path back and the graph stays acyclic.
+One manual step sits inside that order: the zone must be delegated at the registrar (see
+[Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificate finishes issuing,
+which is why `ecommerce-dns-<env>` is deployed and delegated before `ecommerce-application-<env>`.
+
 The application stack consumes the network stack's VPC and security groups, the registry stack's
-repository and the database stack's endpoint and credentials secret **by reference** (CDK cross-stack
-references), so the CDK CLI orders the stacks automatically and there is exactly one definition of
-each resource.
+repository, the database stack's endpoint and credentials secret, and the DNS stack's zone and
+certificate **by reference** (CDK cross-stack references), so the CDK CLI orders the stacks
+automatically and there is exactly one definition of each resource. No ARN is ever plumbed between
+stacks as a string.
 
 > Cross-stack references use **weak** strength (`"@aws-cdk/core:defaultCrossStackReferences": "weak"`
 > in `cdk.json`). A weak reference reads the producer's output directly instead of locking an export
@@ -433,10 +460,25 @@ address is ever managed by hand. The health check is what decides whether a task
 
 ### Listener
 
-Accepts connections on a port and forwards them. Phase 2 creates one HTTP listener on **port 80**
-that forwards to the target group. HTTPS (a certificate, a port 443 listener and a redirect from 80)
-is a later phase; until then the endpoint is plaintext, which is fine for a learning deployment but
-must not carry real user data.
+Accepts connections on a port and acts on them. There are two listeners once a certificate is
+configured:
+
+| Listener | Port | Protocol | Default action |
+| -------- | ---- | -------- | -------------- |
+| `HttpsListener` | 443 | HTTPS | **forward** to the target group |
+| `HttpListener` | 80 | HTTP | **redirect** (HTTP 301) to `https://<fqdn>` |
+
+The redirect is a listener *action*, not a target group: a plaintext request is answered by the load
+balancer itself and never reaches the application. TLS terminates at the load balancer with the ACM
+certificate and the request continues to the task over plain HTTP inside the private subnets — the
+hop that crosses the internet is the one that must be encrypted, and the target group is not
+reachable from outside the VPC. The listener pins `SslPolicy.RECOMMENDED_TLS`
+(`ELBSecurityPolicy-TLS13-1-2-2021-06`), which sets TLS 1.2 as the floor; the older `RECOMMENDED`
+policy still negotiates TLS 1.0/1.1 and is deliberately not used.
+
+Until a domain has been delegated, `LoadBalancedApi` is built without a certificate and the single
+port 80 listener forwards to the target group exactly as it did in Phase 2 — the HTTP-only path is
+unchanged, it is simply no longer what production uses.
 
 ### CloudWatch Logs
 
@@ -559,6 +601,71 @@ environment variables set from the database stack's outputs.
 
 ---
 
+## Core concepts: DNS and TLS
+
+Phase 3.5 gives the API a name and a certificate. Both are created in `ecommerce-dns-<env>`, ahead of
+the compute that uses them.
+
+```
+   registrar (example.com)
+        │  NS records for the subdomain, added by hand once
+        ▼
+   Route 53 hosted zone (dev.example.com)          ← ecommerce-dns-dev
+        │  ACM writes and renews the validation CNAME itself
+        ▼
+   ACM certificate (api.dev.example.com)           ← ecommerce-dns-dev
+        │  attached to the HTTPS listener
+        ▼
+   ALB :443  ──8080──▶  ECS task                  ← ecommerce-application-dev
+        ▲
+        │  A alias record api.dev.example.com -> ALB   ← ecommerce-application-dev
+```
+
+### Route 53 hosted zone
+
+A hosted zone is the DNS container for a domain: Route 53 answers queries for it from the records it
+holds. The stack creates a **public** zone for the configured subdomain (`dev.example.com`) — not a
+private zone, because the API is reached from the internet.
+
+### The delegation model
+
+The platform owns a *subdomain*, not the apex domain, because a registrar can only delegate a whole
+zone. The domain's registrar keeps NS records for `dev.example.com` that point at the four name
+servers of this zone; everything underneath is then answered by Route 53. This is why
+`HostedZoneNameServers` is exported: it is the one value a human has to copy into the registrar (see
+[Delegating the subdomain](#delegating-the-subdomain)).
+
+### ACM certificate and DNS validation
+
+**AWS Certificate Manager (ACM)** issues the certificate covering exactly `api.<zoneName>`. It is
+validated **by DNS**, and the validation CNAME is created inside the hosted zone by ACM itself:
+
+```ts
+validation: CertificateValidation.fromDns(zone)
+```
+
+That is the whole reason to hand ACM the zone. Compared with email validation there is no approval
+link to click, no record to add by hand and no renewal to remember: ACM creates the CNAME, waits for
+it to resolve, issues the certificate, and renews it automatically.
+
+Managed renewal has one condition worth knowing: ACM only renews a certificate that is **in use by an
+integrated service** (or exported). Until the application stack attaches it to the load balancer
+listener, the certificate reports `RenewalEligibility: INELIGIBLE` — that is expected, not a fault,
+and it flips to `ELIGIBLE` once the listener references it. The scope is deliberately minimal — one
+name, no wildcard, no extra subject alternative names, and no CAA records (a deferred hardening item).
+
+The certificate is also **created, never looked up**: there is no `fromLookup` anywhere in this app,
+so `cdk synth` runs with zero AWS credentials and no context lookups.
+
+### Region, and the CloudFront exception
+
+This certificate lives in the deployment region (`ap-southeast-1`) because an ALB certificate must.
+A future CloudFront distribution (Phase 6) would need its **own** certificate in `us-east-1`,
+because CloudFront only reads certificates from there. That is a separate certificate and a separate
+stack decision, noted here so it is not discovered at deploy time.
+
+---
+
 ## The Spring Boot application
 
 `application/` is a Spring Boot API. It uses **Java 21** (the current LTS) and **Spring Boot 4.1.1**,
@@ -599,22 +706,24 @@ and not before.
 | `POST` | `/api/products` | Validates and creates a product, returns `201` with the assigned id |
 | `GET` | `/actuator/health` | Returns `{"status":"UP"}` — the ALB health check target |
 
-Example (the table starts empty — the data is no longer seeded):
+Example (the table starts empty — the data is no longer seeded). `<api-fqdn>` is `api.<env-domain>`
+once Phase 3.5 is deployed; a request to the load balancer's plaintext name is answered with a `301`
+to the same path over HTTPS:
 
 ```bash
-curl http://<alb-dns-name>/api/products
+curl https://<api-fqdn>/api/products
 # []
 
-curl -X POST http://<alb-dns-name>/api/products \
+curl -X POST https://<api-fqdn>/api/products \
      -H 'Content-Type: application/json' \
      -d '{"name":"Tablet","description":"10 inch","price":450.00,"quantity":12}'
 # {"id":1,"name":"Tablet","description":"10 inch","price":450.00,"quantity":12,
 #  "createdAt":"2026-01-01T09:15:00.123456Z","updatedAt":"2026-01-01T09:15:00.123456Z"}
 
-curl http://<alb-dns-name>/api/products/1
+curl https://<api-fqdn>/api/products/1
 # {"id":1,"name":"Tablet",...}
 
-curl http://<alb-dns-name>/actuator/health
+curl https://<api-fqdn>/actuator/health
 # {"status":"UP"}
 ```
 
@@ -863,6 +972,8 @@ Rules and rationale:
 - **Only the load balancer accepts traffic from `0.0.0.0/0`.** Phase 1 opened 443; Phase 2 adds 80 for
   the HTTP listener. Port 80 is added by the *application* stack, not the network stack: the load
   balancer security group is re-imported there so the Phase 2 rule is owned by the Phase 2 stack.
+  Phase 3.5 needs no new rule at all — 443 was already open, and 80 is still where the redirect to
+  HTTPS answers, so the application stack adds no duplicate ingress rule.
 - **The application and database stacks create no security group of their own** — they reference the
   Phase 1 groups, so there is exactly one definition of each.
 - **`allowAllOutbound: false` everywhere**, with egress granted explicitly.
@@ -902,6 +1013,8 @@ is exactly the rule set intended.
 | Database deletion protection | off | on | on |
 | Database removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
 | Image tag | `v0.1.0` | `v0.1.0` | `v0.1.0` |
+| Public DNS subdomain | `ECOMMERCE_DEV_DOMAIN` (optional) | `ECOMMERCE_UAT_DOMAIN` (optional) | `ECOMMERCE_PROD_DOMAIN` (**required**) |
+| API endpoint | `https://api.<dev-domain>` (or plaintext if unset) | `https://api.<uat-domain>` (or plaintext if unset) | `https://api.<prod-domain>` |
 | Removal policy | `DESTROY` | `RETAIN` | `RETAIN` |
 
 All three environments live in Asia Pacific (Singapore) `ap-southeast-1`, which has three
@@ -923,7 +1036,10 @@ zero-AZ deployment, more NAT Gateways than Availability Zones, an empty region, 
 pair ECS would refuse, an out-of-range port, a health check path that is not absolute, a `latest`
 image tag, a database or user name that is not a valid PostgreSQL identifier, a user name RDS
 reserves (`postgres`, `admin`, `rdsadmin`, ...), storage below the gp3 minimum, a backup retention
-outside 1–35 days, and deletion protection combined with `RemovalPolicy.DESTROY`.
+outside 1–35 days, deletion protection combined with `RemovalPolicy.DESTROY`, a `dns.zoneName` that
+is not a valid DNS host name, an `apiSubdomain` that is not a single DNS label, and a **production
+environment with no `dns` block at all** — plaintext HTTP is not a production option, so a missing
+`ECOMMERCE_PROD_DOMAIN` fails the synth before anything is deployed.
 
 ### Pinning the account
 
@@ -946,6 +1062,18 @@ ECOMMERCE_PROD_ACCOUNT=123456789012 npx cdk deploy ecommerce-network-prod -c env
 A `.env` file will not work: nothing in the CDK CLI or this app reads one. Pin the account before
 deploying anything other than dev, so `-c environment=prod` cannot target whichever account the
 current credentials happen to resolve to.
+
+The public subdomain is read the same way — `ECOMMERCE_DEV_DOMAIN`, `ECOMMERCE_UAT_DOMAIN`,
+`ECOMMERCE_PROD_DOMAIN` — so the domain stays out of source control too. Omitting it in dev or uat
+simply leaves that environment HTTP-only; omitting it in prod fails validation.
+
+```powershell
+$env:ECOMMERCE_PROD_DOMAIN = "prod.example.com"; npx cdk deploy ecommerce-dns-prod -c environment=prod
+```
+
+```bash
+ECOMMERCE_PROD_DOMAIN=prod.example.com npx cdk deploy ecommerce-dns-prod -c environment=prod
+```
 
 ---
 
@@ -986,10 +1114,14 @@ account without clashing.
 | Database | `DatabasePort` | `ecommerce-dev-db-port` | ECS task env `DB_PORT` |
 | Database | `DatabaseName` | `ecommerce-dev-db-name` | ECS task env `DB_NAME` |
 | Database | `CredentialsSecretArn` | `ecommerce-dev-db-secret-arn` | ECS secret injection, operators |
+| DNS | `HostedZoneNameServers` | `ecommerce-dev-hosted-zone-name-servers` | registrar delegation (by hand, once) |
+| DNS | `CertificateArn` | `ecommerce-dev-certificate-arn` | the application stack's HTTPS listener |
+| DNS | `ApiDomainName` | `ecommerce-dev-api-domain-name` | the application stack's alias record and `ApiUrl` |
 | Application | `ClusterName` | `ecommerce-dev-ecs-cluster-name` | operations |
 | Application | `ServiceName` | `ecommerce-dev-ecs-service-name` | operations |
-| Application | `LoadBalancerDnsName` | `ecommerce-dev-alb-dns-name` | the API endpoint |
-| Application | `ApiUrl` | `ecommerce-dev-api-url` | the API endpoint |
+| Application | `LoadBalancerDnsName` | `ecommerce-dev-alb-dns-name` | the load balancer's own name |
+| Application | `ApiUrl` | `ecommerce-dev-api-url` | the API endpoint (`https://<fqdn>` when configured) |
+| Application | `HttpApiUrl` | `ecommerce-dev-api-http-url` | the plaintext endpoint, for the redirect check (only when DNS is configured) |
 | Application | `TargetGroupArn` | `ecommerce-dev-target-group-arn` | operations |
 
 ---
@@ -1008,6 +1140,11 @@ account without clashing.
   uat/prod keep the instance and its recovery window.
 - The **database credentials secret** follows the same removal policy, so dev leaves no secret
   behind and uat/prod keep the credential that matches the retained instance.
+- The **Route 53 hosted zone** follows the removal policy: dev deletes it with the stack, uat and
+  prod retain it. It is the one resource whose removal is not finished by `cdk destroy` alone — the
+  registrar's NS records still have to be removed by hand (see the destroy caveat below). The ACM
+  certificate is not given a removal policy: it is stateless, re-issued automatically, and deleting
+  it with the stack leaves nothing behind to pay for or clean up.
 
 Everything else is either ephemeral by nature (subnets, route tables, security groups) or replaced
 rather than deleted.
@@ -1096,16 +1233,23 @@ npx cdk deploy ecommerce-ecr-dev -c environment=dev
 # 3. Database (instance + generated credentials secret)
 npx cdk deploy ecommerce-database-dev -c environment=dev
 
-# 4. Build and push the image (see "ECR: how an image is tagged and pushed")
+# 4. DNS and TLS (hosted zone + ACM certificate) - only when a subdomain is configured
+export ECOMMERCE_DEV_DOMAIN=dev.example.com
+npx cdk deploy ecommerce-dns-dev -c environment=dev
+#    Then delegate the zone at the registrar (see "Delegating the subdomain") and wait for the
+#    certificate to finish issuing before the next step.
+
+# 5. Build and push the image (see "ECR: how an image is tagged and pushed")
 #    ...
 
-# 5. Compute (the service finds the image, the secret and the database endpoint)
+# 6. Compute (the service finds the image, the secret, the database endpoint and the certificate)
 npx cdk deploy ecommerce-application-dev -c environment=dev
 ```
 
-`npx cdk deploy --all -c environment=dev` deploys all four stacks in the correct order in one go, but
+`npx cdk deploy --all -c environment=dev` deploys all five stacks in the correct order in one go, but
 only after an image has been pushed for the first time; otherwise the ECS service starts with no
-image to run.
+image to run. The DNS stack only exists when `ECOMMERCE_DEV_DOMAIN` is set, and the application stack
+will wait on a certificate that is still validating until the zone is delegated.
 
 Things that are easy to get wrong:
 
@@ -1115,6 +1259,9 @@ Things that are easy to get wrong:
   deploys the `cdk.json` default. Read the stack name in the output.
 - **Push the image before deploying the compute.** The service cannot start without it.
 - **Deploy the database before the compute.** The application stack imports its endpoint and secret.
+- **Delegate the zone before expecting HTTPS.** The ACM certificate stays `PENDING_VALIDATION` until
+  the registrar's NS records for the subdomain resolve; until then the HTTPS listener has nothing to
+  serve, even though the application stack deploys successfully.
 - **Pin the account per environment** before deploying anything other than dev.
 - **Deploy from a dedicated IAM principal or Identity Center role, not the account root user.**
 - **Deploying is not free:** NAT Gateways, an ALB, a running Fargate task and an RDS instance all
@@ -1192,20 +1339,20 @@ npx cdk deploy ecommerce-application-dev -c environment=dev
 ### 5. Confirm the migration ran and the API reads and writes PostgreSQL
 
 ```bash
-ALB=$(aws cloudformation list-exports \
+API=$(aws cloudformation list-exports \
   --query "Exports[?Name=='ecommerce-dev-api-url'].Value" --output text)
 
-curl "$ALB/api/products"
+curl "$API/api/products"
 # []
 
-curl -X POST "$ALB/api/products" -H 'Content-Type: application/json' \
+curl -X POST "$API/api/products" -H 'Content-Type: application/json' \
      -d '{"name":"Tablet","description":"10 inch","price":450.00,"quantity":12}'
 # {"id":1,...,"createdAt":"...","updatedAt":"..."}
 
-curl "$ALB/api/products/1"
+curl "$API/api/products/1"
 # {"id":1,"name":"Tablet",...}
 
-curl "$ALB/actuator/health"
+curl "$API/actuator/health"
 # {"status":"UP"}
 ```
 
@@ -1225,7 +1372,7 @@ row survive — the data is in RDS, not in the container:
 aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-api --force-new-deployment
 aws ecs wait services-stable --cluster ecommerce-dev-cluster --services ecommerce-dev-api
 
-curl "$ALB/api/products/1"
+curl "$API/api/products/1"
 # {"id":1,"name":"Tablet",...}   <- still there, from a different task
 ```
 
@@ -1245,23 +1392,99 @@ repository.
 
 ```bash
 npx cdk destroy ecommerce-application-dev -c environment=dev
+npx cdk destroy ecommerce-dns-dev         -c environment=dev   # only when a domain was configured
 npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
 npx cdk destroy ecommerce-ecr-dev         -c environment=dev
 npx cdk destroy ecommerce-network-dev     -c environment=dev
 ```
 
 Dev has `deletionProtection: false` and `RemovalPolicy.DESTROY` precisely so this works. In uat/prod
-the destroy is refused until deletion protection is switched off — which is the point.
+the destroy is refused until deletion protection is switched off — which is the point. The hosted
+zone needs one extra manual step; see [Destroy caveat](#10-destroy-caveat-dns-and-the-registrar).
+
+### 9. Phase 3.5: delegate the subdomain and verify TLS
+
+With `ECOMMERCE_DEV_DOMAIN` set, the DNS stack creates the hosted zone and the certificate and the
+application stack attaches them. The certificate cannot finish issuing until the zone is delegated,
+so the order is: deploy the DNS stack, delegate, wait, then deploy the compute.
+
+```bash
+export ECOMMERCE_DEV_DOMAIN=dev.example.com   # PowerShell: $env:ECOMMERCE_DEV_DOMAIN = "dev.example.com"
+
+# 1. Create the hosted zone and start the certificate request.
+npx cdk deploy ecommerce-dns-dev -c environment=dev
+
+# 2. Copy the four name servers the zone exported.
+aws cloudformation list-exports \
+  --query "Exports[?Name=='ecommerce-dev-hosted-zone-name-servers'].Value" --output text
+# ns-123.awsdns-45.com,ns-678.awsdns-90.net,ns-234.awsdns-12.co.uk,ns-567.awsdns-34.org
+
+# 3. Add them as the NS record for dev.example.com at the registrar (one record, four values).
+#    This is the only manual DNS step; ACM writes and renews the validation CNAME itself.
+
+# 4. Wait for the certificate to issue (minutes to an hour, depending on the registrar).
+aws acm list-certificates --query "CertificateSummaryList[?DomainName=='api.dev.example.com']"
+# Status: ISSUED
+
+# 5. Deploy the compute; it now has a certificate and a zone to create the alias record in.
+npx cdk deploy ecommerce-application-dev -c environment=dev
+```
+
+Verification:
+
+```bash
+# The plaintext endpoint answers a permanent redirect, not a response from the application.
+curl -I "http://api.dev.example.com/api/products"
+# HTTP/1.1 301 Moved Permanently
+# Location: https://api.dev.example.com:443/api/products
+
+# The HTTPS endpoint serves the API over TLS.
+curl "https://api.dev.example.com/actuator/health"
+# {"status":"UP"}
+
+curl "https://api.dev.example.com/api/products"
+# []
+```
+
+A `301` whose `Location` is the HTTPS URL proves the redirect; `{"status":"UP"}` over `https://`
+proves the certificate, the listener and the alias record are all working. `curl -v` shows the
+certificate chain and the negotiated protocol if you want to confirm TLS 1.2 is the floor.
+
+The redirect preserves the host you requested rather than hardcoding the API domain — a request to
+`http://<alb-dns-name>/...` is answered with `Location: https://<alb-dns-name>:443/...`. That is the
+right behaviour (it never sends a client to a name it did not ask for), and it is why the redirect is
+verified against the custom domain rather than the load balancer's own name.
+
+### 10. Destroy caveat: DNS and the registrar
+
+`cdk destroy` removes the hosted zone in dev, but it cannot remove the NS records you added at the
+registrar — those live in the registrar's zone, not in Route 53. Tearing an environment down
+completely is therefore two commands plus one manual step:
+
+```bash
+npx cdk destroy ecommerce-application-dev -c environment=dev
+npx cdk destroy ecommerce-dns-dev         -c environment=dev
+# then: delete the NS records for dev.example.com at the registrar by hand
+```
+
+In uat and prod the hosted zone is retained (its removal policy follows the environment), so
+`cdk destroy` leaves the zone — and the delegation — in place. That is deliberate: the zone is the
+platform's public identity, and recreating it means a fresh set of name servers and another manual
+registrar change.
 
 ---
 
 ## Testing
 
-`npm test` in `ecommerce-infrastructure/` runs **115 Jest tests** over the synthesised CloudFormation
-templates and the configuration modules — 33 for the network stack, 18 for the database stack, 29 for
-the application stack, 6 for the registry stack and 29 for the configuration. `mvn test` in
-`application/` runs **13 Spring Boot tests** — 9 end-to-end HTTP tests against a real PostgreSQL and 4
-service unit tests — and needs a Docker daemon.
+`npm test` in `ecommerce-infrastructure/` runs **139 Jest tests** over the synthesised CloudFormation
+templates and the configuration modules — 33 for the network stack, 18 for the database stack, 36 for
+the application stack, 12 for the DNS stack, 6 for the registry stack and 34 for the configuration.
+`mvn test` in `application/` runs **13 Spring Boot tests** — 9 end-to-end HTTP tests against a real
+PostgreSQL and 4 service unit tests — and needs a Docker daemon.
+
+`test/setup-env.ts` sets `ECOMMERCE_PROD_DOMAIN` before `lib/config` is first imported, because the
+production configuration requires a domain and the module reads its environment once, at import. The
+suites that prove the missing-domain failure build their own configuration instead of relying on it.
 
 Network (Phase 1, Phase 3):
 
@@ -1305,7 +1528,19 @@ Database (Phase 3):
 - the instance and the secret carry the project, environment and management tags
 - the endpoint, port, database name and secret ARN are exported
 
-Application (Phase 2, Phase 3):
+DNS and TLS (Phase 3.5):
+
+- a public hosted zone is created for the configured subdomain, with no lookup and no parameter
+  other than CDK's bootstrap version — so `cdk synth` needs no credentials
+- the certificate covers `api.<zoneName>` and only that name: no wildcard, no extra subject
+  alternative names
+- the certificate is DNS validated against the zone it created (`DomainValidationOptions` points at
+  the hosted zone), so ACM manages the validation record
+- the hosted zone is destroyed with dev and retained in uat/prod
+- the zone and the certificate carry the project, environment and management tags
+- the name servers, certificate ARN and API domain name are exported
+
+Application (Phase 2, Phase 3, Phase 3.5):
 
 - the cluster, task definition and service exist; the task is Fargate with `awsvpc` networking
 - the task is sized 512/1024 in dev and 1024/2048 in prod, and never references a `latest` image
@@ -1319,7 +1554,15 @@ Application (Phase 2, Phase 3):
 - the service runs exactly one task, in the private subnets, without a public IP, in the application
   security group, with the circuit breaker enabled
 - the load balancer is internet-facing in the public subnets and opens only port 80 to the internet
-- the listener forwards to the target group; the target group health checks `/actuator/health` on 8080
+  (the application stack adds no duplicate rule for 443, which Phase 1 already opened)
+- with no `dns` configured the single port 80 listener forwards to the target group, `ApiUrl` is the
+  plaintext ALB name and there is no alias record — the Phase 2 behaviour is unchanged
+- with `dns` configured the port 443 listener terminates TLS (`ELBSecurityPolicy-TLS13-1-2-2021-06`)
+  and forwards to the target group, the port 80 listener is a permanent redirect to HTTPS, an alias
+  `A` record points at the load balancer (never an IP), and `ApiUrl` becomes `https://<fqdn>` with the
+  plaintext URL kept as `HttpApiUrl` for the redirect check
+- the application stack defines neither the hosted zone nor the certificate, only references them
+- the target group health checks `/actuator/health` on 8080
 - the project, environment and management tags are present on every resource
 
 Configuration:
@@ -1329,6 +1572,8 @@ Configuration:
 - invalid Fargate cpu/memory pairs, ports, health check paths and `latest` image tags are rejected
 - invalid PostgreSQL identifiers, reserved master user names, too-small storage, a backup retention
   outside 1–35 days, and deletion protection combined with `DESTROY` are all rejected
+- an invalid DNS zone name, an API subdomain that is not a single label, and a production environment
+  with no `dns` block are all rejected; dev and uat may omit `dns` and still validate
 - the database configuration never contains a password
 - the image tag is resolved from CDK context, then `IMAGE_TAG`, then configuration
 
@@ -1368,6 +1613,8 @@ nothing is running.
 | **Secrets Manager** | per secret-month, plus a small charge per 10,000 API calls |
 | **CloudWatch Logs** | ingestion per GB, plus storage per retention period |
 | ECR storage | per GB-month, plus a small charge for scanning |
+| **Route 53 hosted zone** | per hosted zone-month, plus a small charge per million DNS queries |
+| **ACM certificate** | no charge for a public certificate attached to an AWS service; it renews automatically |
 | The default-SG cleanup Lambda | one invocation per stack create/update |
 
 The `dev` configuration is deliberately the cheapest (one NAT Gateway, no flow logs, the smallest
@@ -1393,11 +1640,9 @@ The platform is designed so the next phase attaches resources without redesignin
                     │
             Auto scaling (ECS)          ← varies the desired count at runtime
                     │
-            HTTPS: certificate + 443 listener + 80 → 443 redirect
-                    │
             S3, SQS/SNS, customer managed KMS keys
                     │
-            API Gateway, Cognito, CloudFront/Route 53/WAF, CI/CD
+            CloudFront (+ a us-east-1 certificate), Cognito, WAF, CI/CD
 ```
 
 Phase 3 delivered the database, the schema migrations and the credential path. What is still ahead:
@@ -1407,11 +1652,15 @@ Phase 3 delivered the database, the schema migrations and the credential path. W
 - **ECS auto scaling**, which is what actually makes production resilient to losing a task. The one
   deliberate remaining limitation is `desiredCount = 1` everywhere: losing the task briefly removes
   the only instance, and the ECS service replaces it, but there is a gap.
-- **TLS on the load balancer**: an ACM certificate, a 443 listener and a redirect from 80. Today the
-  listener speaks plain HTTP on port 80 only.
 - **Object storage, queues and topics**, plus customer managed KMS keys for the database, the secret
   and those resources.
-- **API Gateway, Cognito, CloudFront/Route 53/WAF and CI/CD** in the phases after that.
+- **CloudFront** (Phase 6), which needs its own certificate in `us-east-1` rather than the ALB
+  certificate in `ap-southeast-1` created here.
+- **API Gateway, Cognito, WAF and CI/CD** in the phases after that.
+
+TLS and DNS landed in Phase 3.5: the API now answers at `https://api.<env-domain>`, HTTP redirects to
+it, and the certificate renews itself for as long as the hosted zone exists. DNSSEC signing and CAA
+records are deliberately deferred hardening items.
 
 Nothing built so far needs to change for those to land. The network already separates public,
 private and isolated subnets; the security groups already model the tiers by reference; the outputs,

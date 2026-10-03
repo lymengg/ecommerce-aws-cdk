@@ -56,4 +56,10 @@ export const prodConfig: EnvironmentConfig = {
     deletionProtection: true,
     removalPolicy: RemovalPolicy.RETAIN,
   },
+  // Unlike dev and uat this is not really optional: the configuration validator refuses a
+  // production environment without a `dns` block, because production must not serve plaintext HTTP.
+  // Setting ECOMMERCE_PROD_DOMAIN is therefore a required step of a production deployment.
+  dns: process.env.ECOMMERCE_PROD_DOMAIN
+    ? { zoneName: process.env.ECOMMERCE_PROD_DOMAIN, apiSubdomain: 'api' }
+    : undefined,
 };

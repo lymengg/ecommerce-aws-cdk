@@ -138,6 +138,31 @@ export interface DatabaseConfig {
 }
 
 /**
+ * Public DNS and TLS configuration of the platform (Phase 3.5).
+ *
+ * The platform owns a *subdomain* rather than the apex domain. A registrar can only delegate a
+ * whole zone, so the domain's registrar keeps NS records for `dev.example.com` that point at the
+ * four name servers of the Route 53 hosted zone this configuration names. Route 53 then answers
+ * every name underneath that subdomain, and the certificate's DNS validation record is created
+ * inside it automatically. Nothing is ever looked up: the zone is created, not imported.
+ *
+ * DNS is optional because dev still needs to synthesise and deploy HTTP-only when no domain has
+ * been delegated yet. It is not optional in production: plaintext HTTP is not a production option,
+ * so the configuration validator refuses a production environment without a `dns` block.
+ */
+export interface DnsConfig {
+  /**
+   * Name of the delegated subdomain, for example `dev.example.com`. Route 53 creates a public
+   * hosted zone for exactly this name; the registrar's NS records must point at the name servers
+   * the zone exports before the certificate can finish validating.
+   */
+  readonly zoneName: string;
+
+  /** Leftmost label the API answers on inside the zone, for example `api` for `api.dev.example.com`. */
+  readonly apiSubdomain: string;
+}
+
+/**
  * Everything a stack needs to know about the environment it is deployed to.
  *
  * Values are supplied per environment (see `dev.ts`, `uat.ts`, `prod.ts`) so that no stack ever
@@ -187,4 +212,10 @@ export interface EnvironmentConfig {
 
   /** Relational data tier configuration (Phase 3). */
   readonly database: DatabaseConfig;
+
+  /**
+   * Public DNS and TLS configuration (Phase 3.5). Omitted in dev until a domain has been delegated,
+   * which keeps `cdk synth` and an HTTP-only deployment working; required in production.
+   */
+  readonly dns?: DnsConfig;
 }

@@ -52,4 +52,9 @@ export const uatConfig: EnvironmentConfig = {
     deletionProtection: true,
     removalPolicy: RemovalPolicy.RETAIN,
   },
+  // Same delegation model as dev: the subdomain comes from the environment so it is never committed
+  // to source, and omitting it keeps UAT HTTP-only until a zone has been delegated.
+  dns: process.env.ECOMMERCE_UAT_DOMAIN
+    ? { zoneName: process.env.ECOMMERCE_UAT_DOMAIN, apiSubdomain: 'api' }
+    : undefined,
 };
