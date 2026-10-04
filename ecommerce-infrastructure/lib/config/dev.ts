@@ -17,10 +17,21 @@ const domain = process.env.ECOMMERCE_DEV_DOMAIN;
 const frontendOrigin = process.env.ECOMMERCE_DEV_FRONTEND_ORIGIN;
 
 /**
+ * Optional dev-only cost switch for the NAT gateway, the single largest line on a paused dev bill.
+ * The gateway is only needed while the compute runs - image pulls, Secrets Manager and Cognito all
+ * leave through it - so an environment stopped to save money can drop it with
+ * `ECOMMERCE_DEV_NAT_GATEWAYS=0`. Unset keeps the documented single-NAT topology, so a normal
+ * deployment and the test suite are unaffected.
+ */
+const natGateways =
+  process.env.ECOMMERCE_DEV_NAT_GATEWAYS === undefined ? 1 : Number(process.env.ECOMMERCE_DEV_NAT_GATEWAYS);
+
+/**
  * Development environment: the cheapest footprint that still mirrors the production topology.
  *
  * - A single NAT Gateway, so an Availability Zone failure breaks outbound traffic. This is a
- *   deliberate cost decision for dev only; uat and prod are redundant.
+ *   deliberate cost decision for dev only; uat and prod are redundant. Set
+ *   `ECOMMERCE_DEV_NAT_GATEWAYS=0` to remove it while the environment is paused.
  * - Flow Logs disabled to keep CloudWatch ingestion cost at zero.
  * - Resources are destroyable so `cdk destroy` leaves nothing behind.
  * - The database is a single small instance with a one day backup window. It is still encrypted,
@@ -33,7 +44,7 @@ export const devConfig: EnvironmentConfig = {
   region: 'ap-southeast-1',
   vpcCidr: '10.0.0.0/16',
   maxAzs: 2,
-  natGateways: 1,
+  natGateways,
   removalPolicy: RemovalPolicy.DESTROY,
   flowLogs: {
     enabled: false,
