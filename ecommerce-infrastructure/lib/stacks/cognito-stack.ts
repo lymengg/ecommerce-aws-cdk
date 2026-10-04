@@ -1,5 +1,14 @@
 import { CfnOutput, Duration, Stack, StackProps } from 'aws-cdk-lib';
-import { CfnUserPoolClient, OAuthScope, UserPool, UserPoolClient, UserPoolDomain } from 'aws-cdk-lib/aws-cognito';
+import {
+  CfnManagedLoginBranding,
+  CfnUserPoolClient,
+  FeaturePlan,
+  ManagedLoginVersion,
+  OAuthScope,
+  UserPool,
+  UserPoolClient,
+  UserPoolDomain,
+} from 'aws-cdk-lib/aws-cognito';
 import { ComparisonOperator, Metric, TreatMissingData } from 'aws-cdk-lib/aws-cloudwatch';
 import { ISecret, Secret } from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
@@ -101,6 +110,16 @@ export class CognitoStack extends Stack {
     this.userPool = new UserPool(this, 'UserPool', {
       userPoolName: `${namePrefix}-users`,
       selfSignUpEnabled: auth.selfSignUpEnabled,
+      // Email is required and auto-verified. Cognito only sends a confirmation code for an attribute
+      // it is told to auto-verify, and it can only verify an attribute the user actually supplies.
+      // Without both, a self-signed-up user stays UNCONFIRMED forever and every sign-in fails with
+      // "User is not confirmed" - and the pool's `verified_email` account recovery can never fire.
+      // Email is therefore required (so the managed login sign-up page collects it) and auto-verified
+      // (so Cognito emails the code the user enters to confirm). Sign-in stays by username.
+      autoVerify: { email: true },
+      standardAttributes: {
+        email: { required: true, mutable: true },
+      },
       // The password policy is configuration, not a magic number: production asks for a long
       // password across all four character classes, dev asks for the shortest Cognito allows.
       passwordPolicy: {
@@ -114,6 +133,10 @@ export class CognitoStack extends Stack {
       // Time-based one-time passwords only. SMS MFA would need a verified phone number and an SNS
       // role, and TOTP is both stronger and free of those moving parts.
       mfaSecondFactor: { sms: false, otp: true },
+      // Managed login (the modern hosted UI enabled on the domain below) is an Essentials-tier
+      // feature. A new pool already defaults to Essentials, but the tier is pinned explicitly so a
+      // future plan change cannot silently break the login page.
+      featurePlan: FeaturePlan.ESSENTIALS,
       // The pool holds users, so it is stateful: the removal policy follows the environment (dev
       // destroys it, uat and prod retain it). Deletion protection is deliberately not set, so the
       // pool can always be torn down with its stack. The L2 UserPool supports a removal policy
@@ -124,6 +147,11 @@ export class CognitoStack extends Stack {
     this.userPoolDomain = new UserPoolDomain(this, 'Domain', {
       userPool: this.userPool,
       cognitoDomain: { domainPrefix: `${namePrefix}-users` },
+      // Managed login (version 2), not the classic hosted UI that Cognito uses by default. It is the
+      // modern sign-in experience and the only version with the branding designer. The version is a
+      // domain setting, so it applies to every app client hosted here, and Cognito updates it in
+      // place rather than replacing the domain.
+      managedLoginVersion: ManagedLoginVersion.NEWER_MANAGED_LOGIN,
     });
 
     this.userPoolClient = this.userPool.addClient('ApiClient', {
@@ -181,6 +209,17 @@ export class CognitoStack extends Stack {
     // configured; Cognito's own default would otherwise enable it.
     const cfnClient = this.userPoolClient.node.defaultChild as CfnUserPoolClient;
     cfnClient.addPropertyOverride('ExplicitAuthFlows', ['ALLOW_USER_SRP_AUTH']);
+
+    // Managed login version 2 does not render for an app client that has no branding style: the
+    // console creates one automatically, CloudFormation does not. `useCognitoProvidedValues` seeds
+    // Cognito's default style so the login page works immediately and can be re-branded later in the
+    // console's visual editor. It depends on the domain so the version-2 update lands first.
+    const branding = new CfnManagedLoginBranding(this, 'ManagedLoginBranding', {
+      userPoolId: this.userPool.userPoolId,
+      clientId: this.userPoolClient.userPoolClientId,
+      useCognitoProvidedValues: true,
+    });
+    branding.node.addDependency(this.userPoolDomain);
 
     this.issuerUrl = this.userPool.userPoolProviderUrl;
 

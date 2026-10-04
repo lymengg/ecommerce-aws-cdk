@@ -120,6 +120,20 @@ describe('CognitoStack user pool', () => {
     expect(prod.properties.AdminCreateUserConfig.AllowAdminCreateUserOnly).toBe(true);
   });
 
+  test('auto-verifies a required email, so self-signed-up users can confirm themselves', () => {
+    for (const environment of ['dev', 'uat', 'prod'] as EnvironmentName[]) {
+      const pool = single(buildStacks(environment).template, 'AWS::Cognito::UserPool');
+
+      // Cognito sends the confirmation code only for an auto-verified attribute, and only to an
+      // attribute the user supplied; without both a self-signed-up user stays UNCONFIRMED and every
+      // sign-in fails with "User is not confirmed". Requiring email makes the sign-up page collect
+      // it; auto-verifying makes Cognito send the code. Sign-in itself stays by username.
+      expect(pool.properties.AutoVerifiedAttributes).toEqual(['email']);
+      const email = pool.properties.Schema.find((attribute: { Name: string }) => attribute.Name === 'email');
+      expect(email).toMatchObject({ Name: 'email', Required: true, Mutable: true });
+    }
+  });
+
   test('follows the environment removal policy, retaining the pool in uat and prod', () => {
     buildStacks('dev').template.hasResource('AWS::Cognito::UserPool', { DeletionPolicy: 'Delete' });
     buildStacks('uat').template.hasResource('AWS::Cognito::UserPool', { DeletionPolicy: 'Retain' });
@@ -246,6 +260,33 @@ describe('CognitoStack domain and secret', () => {
     expect(json(secret.properties.SecretString)).toContain('UserPoolClient.ClientSecret');
     // The value itself never appears: there is no literal to leak.
     expect(json(template.toJSON())).not.toContain('"clientSecret":"');
+  });
+});
+
+describe('CognitoStack managed login', () => {
+  test('serves managed login (version 2), not the classic hosted UI Cognito defaults to', () => {
+    for (const environment of ['dev', 'uat', 'prod'] as EnvironmentName[]) {
+      const domain = single(buildStacks(environment).template, 'AWS::Cognito::UserPoolDomain');
+
+      expect(domain.properties.ManagedLoginVersion).toBe(2);
+    }
+  });
+
+  test('pins the Essentials feature plan, which managed login requires', () => {
+    const pool = single(buildStacks('dev').template, 'AWS::Cognito::UserPool');
+
+    expect(pool.properties.UserPoolTier).toBe('ESSENTIALS');
+  });
+
+  test('seeds a branding style per app client, without which managed login does not render', () => {
+    const branding = single(buildStacks('dev').template, 'AWS::Cognito::ManagedLoginBranding');
+
+    // The console auto-creates a branding style; CloudFormation does not, and a version-2 domain
+    // renders a broken page for any client that has none. `UseCognitoProvidedValues` seeds the
+    // default style, which the visual editor can re-brand later.
+    expect(branding.properties.UseCognitoProvidedValues).toBe(true);
+    expect(json(branding.properties.UserPoolId)).toContain('UserPool');
+    expect(json(branding.properties.ClientId)).toContain('UserPoolApiClient');
   });
 });
 

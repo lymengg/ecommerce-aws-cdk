@@ -822,10 +822,37 @@ point later is additive rather than a rewrite.
 
 | Resource | Purpose |
 | -------- | ------- |
-| `cognito.UserPool` `ecommerce-<env>-users` | The users. Password policy, MFA mode and self sign-up come from `config.auth`; the removal policy comes from `config.removalPolicy`. Deletion protection is deliberately not enabled. |
-| `cognito.UserPoolDomain` | A Cognito **prefix** domain hosting the managed login pages. A custom domain would need its own `us-east-1` certificate and DNS record — branding, not security, and a non-goal this phase. |
+| `cognito.UserPool` `ecommerce-<env>-users` | The users. Password policy, MFA mode and self sign-up come from `config.auth`; the removal policy comes from `config.removalPolicy`. Email is a required, auto-verified attribute. The plan is pinned to **Essentials**, which managed login requires. Deletion protection is deliberately not enabled. |
+| `cognito.UserPoolDomain` | A Cognito **prefix** domain serving **managed login (version 2)** rather than the classic hosted UI Cognito uses by default. A custom domain would need its own `us-east-1` certificate and DNS record — branding, not security, and a non-goal this phase. |
+| `cognito.ManagedLoginBranding` | Seeds a Cognito-provided branding style for the app client. Managed login version 2 does not render for a client that has none — the console creates one automatically, CloudFormation does not. |
 | `cognito.UserPoolClient` `ecommerce-<env>-api-client` | The confidential app client: `generateSecret: true`, authorization code grant only, `openid email profile` scopes. |
 | `secretsmanager.Secret` | Holds the generated client secret under the `clientSecret` key. ECS injects it into the container exactly like the database password. |
+
+The login pages are Cognito's **managed login** (`ManagedLoginVersion` 2), not the classic hosted UI a
+domain defaults to. Managed login is the modern sign-in experience and the only version with the
+no-code branding designer (logo, background, colours, custom CSS); the visual editor and CSS
+customisation are Essentials-tier features, which is why the plan is pinned. Version 2 will not
+render for an app client that has no branding style, so a `ManagedLoginBranding` resource seeds
+Cognito's defaults for the API client; the style can be re-branded later in the console. A fully
+custom login page in the SPA was rejected: it would make the browser an OAuth client holding tokens
+(or require the password grant), undoing the BFF. The domain version is a domain setting, so it
+applies to every app client hosted there, and Cognito updates it in place.
+
+Email is a **required, auto-verified** attribute (`autoVerify: { email: true }` plus a required
+`email` schema attribute). Cognito only sends a confirmation code for an attribute it is told to
+auto-verify, and only to an attribute the user actually supplied; without both, a self-signed-up user
+stays `UNCONFIRMED` and every sign-in fails with `User is not confirmed`. Requiring email makes the
+managed login sign-up page collect it, and auto-verifying makes Cognito email the code the user
+enters to confirm the account before the first sign-in. The same verification is what lets the pool's
+`verified_email` account-recovery mechanism work. Sign-in stays by **username**. Dev and uat use
+Cognito's built-in email sender (50 messages/day); production should move to SES when notifications
+land in Phase 7.
+
+A user pool's attribute schema is **create-only**: `UpdateUserPool` has no `Schema` parameter, so
+CloudFormation **replaces** the pool when the schema changes. Applying the required-email change to
+an existing pool therefore recreates it — in dev, destroy the Cognito stack first
+(`cdk destroy ecommerce-cognito-dev -c environment=dev`) so the replacement and the old pool do not
+contend for the same prefix domain, then deploy and re-register.
 
 Only the **authorization code grant** is enabled. Every other flow is explicitly `false` in
 `oAuth.flows`, so a future edit cannot quietly re-enable one. The client's explicit auth flow is
@@ -2000,7 +2027,10 @@ curl -sI "https://api.dev.example.com/actuator/health" | grep -i strict-transpor
 Then the browser flow, by hand (there is no automated browser test this phase):
 
 1. Create an admin user and add it to the `admin` group (dev has self sign-up on, so a user can
-   register through the hosted UI; group membership is still an operator action):
+   register through the hosted UI; group membership is still an operator action). A self-registered
+   user must confirm the account first: the sign-up page collects an email and Cognito emails a code,
+   which the hosted UI asks for before the first sign-in. An already-`UNCONFIRMED` user can be
+   confirmed directly with `aws cognito-idp admin-confirm-sign-up`:
    ```bash
    aws cognito-idp admin-create-user --user-pool-id "$(aws cloudformation list-exports \
      --query "Exports[?Name=='ecommerce-dev-user-pool-id'].Value" --output text)" \
@@ -2037,9 +2067,9 @@ registrar change.
 
 ## Testing
 
-`npm test` in `ecommerce-infrastructure/` runs **201 Jest tests** over the synthesised CloudFormation
+`npm test` in `ecommerce-infrastructure/` runs **205 Jest tests** over the synthesised CloudFormation
 templates and the configuration modules — 33 for the network stack, 18 for the database stack, 41 for
-the application stack, 12 for the DNS stack, 22 for the Cognito stack, 17 for the frontend stack, 7
+the application stack, 12 for the DNS stack, 26 for the Cognito stack, 17 for the frontend stack, 7
 for the registry stack and 51 for the configuration. `mvn test` in `application/` runs **28 Spring
 Boot tests** — 9 product end-to-end HTTP tests against a real PostgreSQL, 13 access-control tests, 2
 logout-handler tests, and 4 service unit tests — and needs a Docker daemon. `npm test` in `frontend/`
