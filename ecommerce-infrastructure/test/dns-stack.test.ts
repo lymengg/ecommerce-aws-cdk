@@ -12,7 +12,7 @@ import { DnsStack } from '../lib/stacks/dns-stack';
 const TEST_ACCOUNT = '123456789012';
 
 /** A delegated subdomain injected into the configuration, independent of the developer's shell. */
-const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api' };
+const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api', authSubdomain: 'auth' };
 
 interface ResourceEntry {
   readonly logicalId: string;
@@ -93,7 +93,7 @@ describe('DnsStack hosted zone', () => {
   });
 
   test('names the zone from the configured subdomain, not a literal', () => {
-    const zone = single(buildStacks('uat', { zoneName: 'uat.example.org', apiSubdomain: 'api' }).template,
+    const zone = single(buildStacks('uat', { zoneName: 'uat.example.org', apiSubdomain: 'api', authSubdomain: 'auth' }).template,
       'AWS::Route53::HostedZone');
 
     expect(zone.properties.Name).toBe('uat.example.org.');
@@ -112,7 +112,7 @@ describe('DnsStack certificate', () => {
 
   test('uses the API subdomain from configuration', () => {
     const certificate = single(
-      buildStacks('dev', { zoneName: 'dev.example.com', apiSubdomain: 'www' }).template,
+      buildStacks('dev', { zoneName: 'dev.example.com', apiSubdomain: 'www', authSubdomain: 'auth' }).template,
       'AWS::CertificateManager::Certificate',
     );
 

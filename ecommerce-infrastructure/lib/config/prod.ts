@@ -79,7 +79,7 @@ export const prodConfig: EnvironmentConfig = {
   // Unlike dev and uat this is not really optional: the configuration validator refuses a
   // production environment without a `dns` block, because production must not serve plaintext HTTP.
   // Setting ECOMMERCE_PROD_DOMAIN is therefore a required step of a production deployment.
-  dns: domain ? { zoneName: domain, apiSubdomain: 'api' } : undefined,
+  dns: domain ? { zoneName: domain, apiSubdomain: 'api', authSubdomain: 'auth' } : undefined,
   // Production is the strict end of every authentication lever:
   //
   // - a long password with all four character classes,

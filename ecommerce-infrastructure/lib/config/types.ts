@@ -202,6 +202,13 @@ export interface DnsConfig {
 
   /** Leftmost label the API answers on inside the zone, for example `api` for `api.dev.example.com`. */
   readonly apiSubdomain: string;
+
+  /**
+   * Leftmost label the Cognito managed login pages answer on inside the zone, for example `auth`
+   * for `auth.dev.example.com`. It fronts a Cognito-managed CloudFront distribution behind the
+   * custom domain - see the auth-domain stack - so it must not collide with `apiSubdomain`.
+   */
+  readonly authSubdomain: string;
 }
 
 /**

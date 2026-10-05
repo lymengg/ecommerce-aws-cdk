@@ -12,7 +12,7 @@ import { CognitoStack } from '../lib/stacks/cognito-stack';
 const TEST_ACCOUNT = '123456789012';
 
 /** A delegated subdomain injected into the configuration, independent of the developer's shell. */
-const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api' };
+const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api', authSubdomain: 'auth' };
 const TEST_FQDN = 'api.dev.example.com';
 
 interface ResourceEntry {
@@ -243,11 +243,11 @@ describe('CognitoStack app client', () => {
 });
 
 describe('CognitoStack domain and secret', () => {
-  test('uses a Cognito prefix domain for the managed login pages', () => {
-    const domain = single(buildStacks('dev').template, 'AWS::Cognito::UserPoolDomain');
-
-    expect(domain.properties.Domain).toBe('ecommerce-dev-users');
-    expect(json(domain.properties.UserPoolId)).toContain('UserPool');
+  test('creates no domain: the managed login domain is a custom domain owned by the auth-domain stack', () => {
+    // A Cognito custom domain is validated against the parent domain's A record, which only exists
+    // once the frontend stack is deployed - so the domain is a leaf stack of its own rather than a
+    // resource here. See auth-domain-stack.test.ts for the domain itself.
+    buildStacks('dev').template.resourceCountIs('AWS::Cognito::UserPoolDomain', 0);
   });
 
   test('stores the client secret in Secrets Manager, not in the template', () => {
@@ -264,14 +264,6 @@ describe('CognitoStack domain and secret', () => {
 });
 
 describe('CognitoStack managed login', () => {
-  test('serves managed login (version 2), not the classic hosted UI Cognito defaults to', () => {
-    for (const environment of ['dev', 'uat', 'prod'] as EnvironmentName[]) {
-      const domain = single(buildStacks(environment).template, 'AWS::Cognito::UserPoolDomain');
-
-      expect(domain.properties.ManagedLoginVersion).toBe(2);
-    }
-  });
-
   test('pins the Essentials feature plan, which managed login requires', () => {
     const pool = single(buildStacks('dev').template, 'AWS::Cognito::UserPool');
 

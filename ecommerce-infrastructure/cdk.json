@@ -16,6 +16,7 @@
   },
   "context": {
     "environment": "dev",
-    "@aws-cdk/core:defaultCrossStackReferences": "weak"
+    "@aws-cdk/core:defaultCrossStackReferences": "weak",
+    "@aws-cdk/aws-route53-targets:userPoolDomainNameMethodWithoutCustomResource": true
   }
 }

@@ -239,8 +239,11 @@ aws-cdk/
 │   │   │   ├── ecr-stack.ts          # container registry
 │   │   │   ├── database-stack.ts     # RDS PostgreSQL instance + Secrets Manager credentials
 │   │   │   ├── dns-stack.ts          # Route 53 hosted zone + ACM certificate (Phase 3.5)
+│   │   │   ├── auth-certificate-stack.ts # us-east-1 ACM certificate for the Cognito custom domain
 │   │   │   ├── cognito-stack.ts      # user pool, confidential app client, client secret (Phase 4)
-│   │   │   └── application-stack.ts  # ECS cluster, service, ALB, IAM, logs, DNS record
+│   │   │   ├── auth-domain-stack.ts  # Cognito custom domain + alias records (Phase 4)
+│   │   │   ├── application-stack.ts  # ECS cluster, service, ALB, IAM, logs, DNS record
+│   │   │   └── frontend-stack.ts     # nginx ECS service, host rule, apex records (Phase 4.5)
 │   │   └── tags.ts                   # the shared tag contract
 │   ├── test/
 │   │   ├── setup-env.ts              # sets ECOMMERCE_<ENV>_DOMAIN before the config is imported
@@ -248,8 +251,11 @@ aws-cdk/
 │   │   ├── ecr-stack.test.ts         # registry contract tests
 │   │   ├── database-stack.test.ts    # database contract tests
 │   │   ├── dns-stack.test.ts         # hosted zone + certificate contract tests
+│   │   ├── auth-certificate-stack.test.ts # us-east-1 certificate contract tests
 │   │   ├── cognito-stack.test.ts     # user pool, app client and secret contract tests
+│   │   ├── auth-domain-stack.test.ts # custom domain + alias record contract tests
 │   │   ├── application-stack.test.ts # compute + database + TLS + auth wiring contract tests
+│   │   ├── frontend-stack.test.ts    # storefront service + listener rule contract tests
 │   │   └── config.test.ts            # configuration tests
 │   ├── cdk.json
 │   ├── jest.config.js
@@ -310,9 +316,11 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 | Registry | `ecommerce-ecr-<env>` | ECR repository |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
 | DNS | `ecommerce-dns-<env>` | Route 53 hosted zone, ACM certificate |
-| Cognito | `ecommerce-cognito-<env>` | Cognito user pool, prefix domain, confidential app client, client-secret secret, baseline alarm |
+| Auth certificate | `ecommerce-auth-cert-<env>` | ACM certificate for `auth.<env-domain>` in `us-east-1`, the only region a Cognito custom domain reads certificates from |
+| Cognito | `ecommerce-cognito-<env>` | Cognito user pool, confidential app client, client-secret secret, baseline alarm |
 | Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listeners, alias record, log group, IAM roles |
 | Frontend | `ecommerce-frontend-<env>` | nginx ECS service + target group, host rule on the application stack's HTTPS listener, apex alias records, IAM roles, log group |
+| Auth domain | `ecommerce-auth-domain-<env>` | Cognito custom domain (`auth.<env-domain>`, managed login v2), `auth` A/AAAA alias records |
 
 The registry is a **separate stack from the compute** on purpose. An ECS service cannot start until
 an image exists, and an image can only be pushed once the repository exists, so the repository has
@@ -340,6 +348,18 @@ from `config.dns`, never imported as a string — and because the application co
 app client and the client secret by reference. (The logout URI points at the frontend, which needs
 no DNS from this stack.)
 
+The Cognito **domain** is two more stacks of its own, and this is the only place the platform
+crosses a region boundary. A custom domain for managed login needs a certificate that a
+Cognito-managed CloudFront distribution can read — and CloudFront, being global, only reads
+certificates from `us-east-1`. The auth-certificate stack therefore lives there and validates
+against the shared hosted zone over a **cross-region reference** (`crossRegionReferences` hands the
+zone id and certificate ARN between regions through SSM, since CloudFormation exports cannot cross
+regions). The auth-domain stack then creates the `UserPoolDomain` custom domain and the `auth`
+alias records, and it deploys **last**: Cognito verifies at domain-creation time that the parent
+domain resolves an A record, and the frontend stack is what publishes the apex alias. Putting the
+domain inside the Cognito stack would either create it before the apex exists or force a circular
+dependency — a leaf stack keeps the graph acyclic.
+
 The frontend stack is **separate from the compute** even though it shares the load balancer: the SPA
 is deployed on its own cadence (a content change is not an API change) and the two services scale
 independently. It consumes the ECS cluster, the HTTPS listener, the load balancer, the application
@@ -347,14 +367,15 @@ security group, the frontend repository and the hosted zone **by reference**, so
 the application and can be redeployed alone. See
 [Core concepts: frontend hosting](#core-concepts-frontend-hosting).
 
-Deployment order is therefore: **network → registry → database → dns → cognito → application →
-frontend**. The DNS stack sits between the database and the application because the application
-consumes its zone and certificate; the Cognito stack sits between DNS and the application because the
-application consumes the pool and the client secret; the frontend sits last because it consumes the
-load balancer the application creates. Nothing consumes the frontend, so there is no path back and the
-graph stays acyclic. One manual step sits inside that order: the zone must be delegated at the
-registrar (see [Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificate
-finishes issuing.
+Deployment order is therefore: **network → registry → database → dns → auth-certificate → cognito →
+application → frontend → auth-domain**. The DNS stack sits between the database and the application
+because the application consumes its zone and certificate; the Cognito stack sits between DNS and the
+application because the application consumes the pool and the client secret; the frontend sits after
+the application because it consumes the load balancer the application creates; and the auth domain
+closes the graph because Cognito requires the apex A record the frontend publishes. Nothing consumes
+the auth domain, so there is no path back and the graph stays acyclic. One manual step sits inside
+that order: the zone must be delegated at the registrar (see
+[Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificates finish issuing.
 
 The application stack consumes the network stack's VPC and security groups, the registry stack's
 repository, the database stack's endpoint and credentials secret, the DNS stack's zone and
@@ -823,7 +844,7 @@ point later is additive rather than a rewrite.
 | Resource | Purpose |
 | -------- | ------- |
 | `cognito.UserPool` `ecommerce-<env>-users` | The users. Password policy, MFA mode and self sign-up come from `config.auth`; the removal policy comes from `config.removalPolicy`. Email is a required, auto-verified attribute. The plan is pinned to **Essentials**, which managed login requires. Deletion protection is deliberately not enabled. |
-| `cognito.UserPoolDomain` | A Cognito **prefix** domain serving **managed login (version 2)** rather than the classic hosted UI Cognito uses by default. A custom domain would need its own `us-east-1` certificate and DNS record — branding, not security, and a non-goal this phase. |
+| `cognito.UserPoolDomain` | A **custom domain** (`auth.<env-domain>`) serving **managed login (version 2)** rather than the classic hosted UI Cognito uses by default. It lives in the auth-domain stack — see [Stacks and deployment order](#stacks-and-deployment-order) for why it deploys last. |
 | `cognito.ManagedLoginBranding` | Seeds a Cognito-provided branding style for the app client. Managed login version 2 does not render for a client that has none — the console creates one automatically, CloudFormation does not. |
 | `cognito.UserPoolClient` `ecommerce-<env>-api-client` | The confidential app client: `generateSecret: true`, authorization code grant only, `openid email profile` scopes. |
 | `secretsmanager.Secret` | Holds the generated client secret under the `clientSecret` key. ECS injects it into the container exactly like the database password. |
@@ -835,8 +856,21 @@ customisation are Essentials-tier features, which is why the plan is pinned. Ver
 render for an app client that has no branding style, so a `ManagedLoginBranding` resource seeds
 Cognito's defaults for the API client; the style can be re-branded later in the console. A fully
 custom login page in the SPA was rejected: it would make the browser an OAuth client holding tokens
-(or require the password grant), undoing the BFF. The domain version is a domain setting, so it
-applies to every app client hosted there, and Cognito updates it in place.
+(or require the password grant), undoing the BFF.
+
+The pages are served from a **custom domain** — `https://auth.<env-domain>` — rather than the
+`<prefix>.auth.<region>.amazoncognito.com` address a prefix domain produces. Cognito fronts a custom
+domain with a managed CloudFront distribution, which is why the certificate lives in `us-east-1`
+(the auth-certificate stack) and an alias record points `auth.<env-domain>` at the distribution's
+name (the auth-domain stack). A user pool has exactly one domain: switching from a prefix domain
+replaces it, so the old address stops working when the custom domain lands. Cognito also verifies at
+creation time that the parent domain (`<env-domain>`) resolves an A record — which is why the
+auth-domain stack deploys after the frontend stack that publishes the apex alias, and why the custom
+domain can stop being accepted if the environment is paused by tearing the frontend down.
+
+Once provisioned the distribution takes a while to activate (up to about an hour); the domain
+reports `Status: CREATING` until then and `auth.<env-domain>` will not answer before it flips to
+`ACTIVE`.
 
 Email is a **required, auto-verified** attribute (`autoVerify: { email: true }` plus a required
 `email` schema attribute). Cognito only sends a confirmation code for an attribute it is told to
@@ -852,7 +886,7 @@ A user pool's attribute schema is **create-only**: `UpdateUserPool` has no `Sche
 CloudFormation **replaces** the pool when the schema changes. Applying the required-email change to
 an existing pool therefore recreates it — in dev, destroy the Cognito stack first
 (`cdk destroy ecommerce-cognito-dev -c environment=dev`) so the replacement and the old pool do not
-contend for the same prefix domain, then deploy and re-register.
+contend, then deploy and re-register.
 
 Only the **authorization code grant** is enabled. Every other flow is explicitly `false` in
 `oAuth.flows`, so a future edit cannot quietly re-enable one. The client's explicit auth flow is
@@ -1939,7 +1973,10 @@ repository.
 ### 8. Tear down (dev only)
 
 ```bash
+npx cdk destroy ecommerce-auth-domain-dev -c environment=dev   # the custom domain + auth records
+npx cdk destroy ecommerce-frontend-dev    -c environment=dev
 npx cdk destroy ecommerce-application-dev -c environment=dev
+npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev   # the us-east-1 certificate
 npx cdk destroy ecommerce-dns-dev         -c environment=dev   # only when a domain was configured
 npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
 npx cdk destroy ecommerce-ecr-dev         -c environment=dev
@@ -2052,8 +2089,11 @@ registrar — those live in the registrar's zone, not in Route 53. Tearing an en
 completely is therefore a few commands plus one manual step:
 
 ```bash
+npx cdk destroy ecommerce-auth-domain-dev -c environment=dev
+npx cdk destroy ecommerce-frontend-dev    -c environment=dev
 npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-cognito-dev     -c environment=dev
+npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev
 npx cdk destroy ecommerce-dns-dev         -c environment=dev
 # then: delete the NS records for dev.example.com at the registrar by hand
 ```
@@ -2067,10 +2107,11 @@ registrar change.
 
 ## Testing
 
-`npm test` in `ecommerce-infrastructure/` runs **205 Jest tests** over the synthesised CloudFormation
+`npm test` in `ecommerce-infrastructure/` runs **214 Jest tests** over the synthesised CloudFormation
 templates and the configuration modules — 33 for the network stack, 18 for the database stack, 41 for
-the application stack, 12 for the DNS stack, 26 for the Cognito stack, 17 for the frontend stack, 7
-for the registry stack and 51 for the configuration. `mvn test` in `application/` runs **28 Spring
+the application stack, 12 for the DNS stack, 4 for the auth certificate stack, 25 for the Cognito
+stack, 5 for the auth domain stack, 17 for the frontend stack, 7 for the registry stack and 52 for
+the configuration. `mvn test` in `application/` runs **28 Spring
 Boot tests** — 9 product end-to-end HTTP tests against a real PostgreSQL, 13 access-control tests, 2
 logout-handler tests, and 4 service unit tests — and needs a Docker daemon. `npm test` in `frontend/`
 runs **13 Vitest tests** over the cart store, the formatting/error helpers and the post-login
@@ -2151,7 +2192,10 @@ Cognito (Phase 4):
 - refresh token rotation and revocation are enabled
 - the client secret is stored in Secrets Manager (its value never appears in the template) under the
   `clientSecret` key
-- a Cognito prefix domain hosts the managed login pages
+- a Cognito **custom domain** (`auth.<env-domain>`, managed login version 2) hosts the login pages —
+  the certificate lives in `us-east-1` because a Cognito-managed CloudFront distribution fronts it,
+  and the domain's stack deploys last because Cognito requires the parent domain's apex A record to
+  exist first
 - **no identity pool** is created
 - one baseline CloudWatch alarm exists (`SignInThrottles`)
 - the pool and the secret carry the project, environment and management tags

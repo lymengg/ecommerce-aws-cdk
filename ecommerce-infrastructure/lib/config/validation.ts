@@ -228,6 +228,14 @@ function assertValidDnsConfig(config: EnvironmentConfig, fail: (message: string)
   if (!DNS_LABEL.test(dns.apiSubdomain)) {
     fail(`dns.apiSubdomain "${dns.apiSubdomain}" is not a valid DNS label.`);
   }
+  if (!DNS_LABEL.test(dns.authSubdomain)) {
+    fail(`dns.authSubdomain "${dns.authSubdomain}" is not a valid DNS label.`);
+  }
+  // Both labels get an alias record in the zone; identical values would make two stacks fight over
+  // the same record name.
+  if (dns.authSubdomain === dns.apiSubdomain) {
+    fail(`dns.authSubdomain must differ from dns.apiSubdomain, got "${dns.authSubdomain}" for both.`);
+  }
 }
 
 /**

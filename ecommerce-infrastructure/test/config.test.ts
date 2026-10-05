@@ -267,7 +267,10 @@ describe('dns configuration', () => {
     const dev = getEnvironmentConfig('dev');
 
     expect(() =>
-      assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain: 'api' } }),
+      assertValidEnvironmentConfig({
+        ...dev,
+        dns: { zoneName: 'dev.example.com', apiSubdomain: 'api', authSubdomain: 'auth' },
+      }),
     ).not.toThrow();
   });
 
@@ -276,7 +279,7 @@ describe('dns configuration', () => {
 
     for (const zoneName of ['bad_name', '-bad.example.com', 'example', 'bad..com', 'trailing-.com', '']) {
       expect(() =>
-        assertValidEnvironmentConfig({ ...dev, dns: { zoneName, apiSubdomain: 'api' } }),
+        assertValidEnvironmentConfig({ ...dev, dns: { zoneName, apiSubdomain: 'api', authSubdomain: 'auth' } }),
       ).toThrow(/dns.zoneName/);
     }
   });
@@ -286,9 +289,27 @@ describe('dns configuration', () => {
 
     for (const apiSubdomain of ['bad_label', '-api', 'api.', 'api.example.com', '']) {
       expect(() =>
-        assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain } }),
+        assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain, authSubdomain: 'auth' } }),
       ).toThrow(/dns.apiSubdomain/);
     }
+  });
+
+  test('rejects an auth subdomain that is not a single DNS label or collides with the API', () => {
+    const dev = getEnvironmentConfig('dev');
+
+    for (const authSubdomain of ['bad_label', '-auth', 'auth.', 'auth.example.com', '']) {
+      expect(() =>
+        assertValidEnvironmentConfig({ ...dev, dns: { zoneName: 'dev.example.com', apiSubdomain: 'api', authSubdomain } }),
+      ).toThrow(/dns.authSubdomain/);
+    }
+
+    // Both labels get an alias record in the zone, so the same name twice is a record collision.
+    expect(() =>
+      assertValidEnvironmentConfig({
+        ...dev,
+        dns: { zoneName: 'dev.example.com', apiSubdomain: 'auth', authSubdomain: 'auth' },
+      }),
+    ).toThrow(/dns.authSubdomain must differ/);
   });
 });
 

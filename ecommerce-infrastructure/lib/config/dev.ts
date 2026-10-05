@@ -91,7 +91,7 @@ export const devConfig: EnvironmentConfig = {
   // ends up in source. From Phase 4 it is required rather than optional: the BFF's session cookie
   // is `Secure`, so an authentication-enabled environment must answer over HTTPS. Setting
   // ECOMMERCE_DEV_DOMAIN is therefore a required step of a dev deployment too.
-  dns: domain ? { zoneName: domain, apiSubdomain: 'api' } : undefined,
+  dns: domain ? { zoneName: domain, apiSubdomain: 'api', authSubdomain: 'auth' } : undefined,
   // Dev is deliberately the permissive end of every lever so a fresh environment is quick to sign
   // in to: the shortest password Cognito allows, no MFA, self sign-up on, and long-lived tokens.
   // None of this is a production posture - see prod.ts for the other end of each lever.

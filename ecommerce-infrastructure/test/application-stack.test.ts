@@ -18,7 +18,7 @@ import { NetworkStack } from '../lib/stacks/network-stack';
 const TEST_ACCOUNT = '123456789012';
 
 /** A delegated subdomain injected into the configuration, independent of the developer's shell. */
-const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api' };
+const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api', authSubdomain: 'auth' };
 const TEST_FQDN = 'api.dev.example.com';
 
 interface ResourceEntry {

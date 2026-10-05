@@ -5,12 +5,22 @@ import { App } from 'aws-cdk-lib';
 
 import { EnvironmentConfig, getEnvironmentConfig, resolveEnvironmentName, resolveImageTag } from '../lib/config';
 import { ApplicationStack } from '../lib/stacks/application-stack';
+import { AuthCertificateStack } from '../lib/stacks/auth-certificate-stack';
+import { AuthDomainStack } from '../lib/stacks/auth-domain-stack';
 import { CognitoStack } from '../lib/stacks/cognito-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { EcrStack } from '../lib/stacks/ecr-stack';
 import { FrontendStack } from '../lib/stacks/frontend-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
+
+/**
+ * The one region Cognito custom domains can read a certificate from. A custom domain is fronted by
+ * a Cognito-managed CloudFront distribution, and CloudFront - a global service - only reads ACM
+ * certificates from `us-east-1`, wherever the user pool itself lives. This is a fixed AWS
+ * constraint, not an environment decision, which is why it is a constant and not configuration.
+ */
+const COGNITO_CUSTOM_DOMAIN_CERTIFICATE_REGION = 'us-east-1';
 
 const app = new App();
 
@@ -82,6 +92,10 @@ const dns =
           account: config.account,
           region: config.region,
         },
+        // The auth-certificate stack reads the hosted zone id from `us-east-1`; cross-region
+        // references hand it over via SSM instead of a CloudFormation export, which cannot cross
+        // regions.
+        crossRegionReferences: true,
         config: deployedConfig,
         description: `E-commerce platform public DNS and TLS certificate (${environment})`,
       });
@@ -101,6 +115,21 @@ if (config.dns === undefined || dns === undefined) {
 }
 // The SPA: where the browser lands after login and after logout, and a registered logout URI.
 const frontendUrl = config.auth.frontendUrl;
+
+// The certificate for the Cognito custom domain lives in `us-east-1`, the only region a
+// Cognito-managed CloudFront distribution can read it from. It is its own stack because a stack is
+// bound to a single region; the hosted zone it validates against is global Route 53, so the
+// validation records work from there. Deploy order: dns -> auth-certificate -> auth-domain.
+const authCertificate = new AuthCertificateStack(app, `ecommerce-auth-cert-${environment}`, {
+  env: {
+    account: config.account,
+    region: COGNITO_CUSTOM_DOMAIN_CERTIFICATE_REGION,
+  },
+  crossRegionReferences: true,
+  config: deployedConfig,
+  zone: dns.zone,
+  description: `E-commerce platform Cognito custom domain certificate (${environment})`,
+});
 
 const cognito = new CognitoStack(app, `ecommerce-cognito-${environment}`, {
   env: {
@@ -160,7 +189,7 @@ if (httpsListener === undefined) {
   throw new Error(`The frontend requires the HTTPS listener for environment "${environment}".`);
 }
 
-new FrontendStack(app, `ecommerce-frontend-${environment}`, {
+const frontend = new FrontendStack(app, `ecommerce-frontend-${environment}`, {
   env: {
     account: config.account,
     region: config.region,
@@ -175,3 +204,23 @@ new FrontendStack(app, `ecommerce-frontend-${environment}`, {
   zone: dns.zone,
   description: `E-commerce platform frontend hosting (${environment})`,
 });
+
+// The Cognito custom domain (`auth.<zone>`) is a leaf stack deployed last on purpose. Cognito
+// verifies at domain creation that the parent domain resolves an A record, and the frontend stack
+// is what publishes the apex alias - so the domain cannot exist before the frontend. Object
+// references already force this stack after cognito (the pool), dns (the zone) and
+// auth-certificate (the cert, via a cross-region reference); only the apex-record ordering is not
+// expressible as a value, hence the explicit dependency.
+const authDomain = new AuthDomainStack(app, `ecommerce-auth-domain-${environment}`, {
+  env: {
+    account: config.account,
+    region: config.region,
+  },
+  crossRegionReferences: true,
+  config: deployedConfig,
+  userPool: cognito.userPool,
+  certificate: authCertificate.certificate,
+  zone: dns.zone,
+  description: `E-commerce platform Cognito custom domain (${environment})`,
+});
+authDomain.addStackDependency(frontend);

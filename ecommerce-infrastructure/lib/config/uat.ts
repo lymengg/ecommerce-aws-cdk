@@ -76,7 +76,7 @@ export const uatConfig: EnvironmentConfig = {
   },
   // Same delegation model as dev: the subdomain comes from the environment so it is never committed
   // to source. Required from Phase 4 on, because auth needs an HTTPS origin.
-  dns: domain ? { zoneName: domain, apiSubdomain: 'api' } : undefined,
+  dns: domain ? { zoneName: domain, apiSubdomain: 'api', authSubdomain: 'auth' } : undefined,
   // UAT sits between dev and prod: a real password policy and MFA available (but not forced, so a
   // tester without an authenticator can still sign in), and token lifetimes short enough that the
   // refresh path is exercised during acceptance testing.
