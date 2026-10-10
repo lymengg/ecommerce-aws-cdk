@@ -1,7 +1,7 @@
 import { CfnOutput, Duration, Stack, StackProps } from 'aws-cdk-lib';
 import { ISecurityGroup, SubnetType } from 'aws-cdk-lib/aws-ec2';
 import { Cluster, ContainerImage, FargateService, FargateTaskDefinition, LogDrivers, Protocol as EcsProtocol, PropagatedTagSource } from 'aws-cdk-lib/aws-ecs';
-import { IRepository } from 'aws-cdk-lib/aws-ecr';
+import { IRepository, Repository } from 'aws-cdk-lib/aws-ecr';
 import {
   ApplicationListener,
   ApplicationListenerRule,
@@ -20,6 +20,7 @@ import { LoadBalancerTarget } from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig, FrontendConfig } from '../config/types';
+import { FRONTEND_REPOSITORY_NAME, RegistryLocation } from './ecr-stack';
 import { applyPlatformTags } from '../tags';
 
 /** Priority of the host rule that sends the SPA's host to this service. */
@@ -32,8 +33,12 @@ export interface FrontendStackProps extends StackProps {
   /** Environment specific configuration. No environment value is hardcoded in this stack. */
   readonly config: EnvironmentConfig;
 
-  /** Registry holding the static frontend image, consumed from the ECR stack by reference. */
-  readonly repository: IRepository;
+  /**
+   * Where the shared registry lives. The frontend image (`ecommerce-frontend`) is pulled from the
+   * registry account, which may differ from this stack's - the repository is imported by ARN for
+   * the same reason as the application's: a construct reference cannot cross a stage boundary.
+   */
+  readonly registry: RegistryLocation;
 
   /** The ECS cluster the application tier runs in. The frontend joins it rather than adding one. */
   readonly cluster: Cluster;
@@ -104,8 +109,19 @@ export class FrontendStack extends Stack {
   constructor(scope: Construct, id: string, props: FrontendStackProps) {
     super(scope, id, props);
 
-    const { config, repository, cluster, applicationSecurityGroup, loadBalancer, albSecurityGroup, httpsListener, zone } =
-      props;
+    const { config, cluster, applicationSecurityGroup, loadBalancer, albSecurityGroup, httpsListener, zone } = props;
+    // The repository is imported by ARN, like the API's: it lives in the shared registry stage
+    // (possibly another account), which deploys - and the pipeline pushes into - before this stack.
+    const repository = Repository.fromRepositoryAttributes(this, 'FrontendRepository', {
+      repositoryName: FRONTEND_REPOSITORY_NAME,
+      repositoryArn: this.formatArn({
+        service: 'ecr',
+        region: props.registry.region,
+        account: props.registry.account,
+        resource: 'repository',
+        resourceName: FRONTEND_REPOSITORY_NAME,
+      }),
+    });
     const { dns, frontend } = config;
     const namePrefix = `ecommerce-${config.environment}`;
 

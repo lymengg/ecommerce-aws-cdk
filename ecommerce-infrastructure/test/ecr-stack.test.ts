@@ -1,24 +1,23 @@
 import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 
-import { getEnvironmentConfig } from '../lib/config';
-import { EnvironmentName } from '../lib/config/types';
 import { EcrStack } from '../lib/stacks/ecr-stack';
 
 /** Account used in the tests only, so that the synthesised template is environment specific. */
 const TEST_ACCOUNT = '123456789012';
+const UAT_ACCOUNT = '222222222222';
+const PROD_ACCOUNT = '333333333333';
 
 interface ResourceEntry {
   readonly logicalId: string;
   readonly properties: Record<string, any>;
 }
 
-function buildTemplate(environment: EnvironmentName): Template {
+function buildTemplate(pullAccountIds: string[] = []): Template {
   const app = new App();
-  const config = getEnvironmentConfig(environment);
-  const stack = new EcrStack(app, `test-ecr-${environment}`, {
-    env: { account: TEST_ACCOUNT, region: config.region },
-    config,
+  const stack = new EcrStack(app, 'test-ecr', {
+    env: { account: TEST_ACCOUNT, region: 'ap-southeast-1' },
+    pullAccountIds,
   });
   return Template.fromStack(stack);
 }
@@ -46,60 +45,76 @@ function tagMap(properties: Record<string, any>): Record<string, string> {
 }
 
 describe('EcrStack repositories', () => {
-  test('creates one repository per image, named per environment', () => {
-    const template = buildTemplate('dev');
+  test('creates one repository per image, shared across environments', () => {
+    const template = buildTemplate();
 
-    // The API and the frontend have different lifecycles, so they get their own repositories.
+    // The API and the frontend have different lifecycles, so they get their own repositories -
+    // but the pair is environment-agnostic: an image is promoted between environments, never
+    // rebuilt into an environment-named repository.
     template.resourceCountIs('AWS::ECR::Repository', 2);
-    template.hasResourceProperties('AWS::ECR::Repository', { RepositoryName: 'ecommerce-dev-api' });
-    template.hasResourceProperties('AWS::ECR::Repository', { RepositoryName: 'ecommerce-dev-frontend' });
-  });
-
-  test('uses a different repository name per environment', () => {
-    const prod = buildTemplate('prod');
-
-    expect(repository(prod, 'ecommerce-prod-api').properties.RepositoryName).toBe('ecommerce-prod-api');
-    expect(repository(prod, 'ecommerce-prod-frontend').properties.RepositoryName).toBe('ecommerce-prod-frontend');
+    template.hasResourceProperties('AWS::ECR::Repository', { RepositoryName: 'ecommerce-api' });
+    template.hasResourceProperties('AWS::ECR::Repository', { RepositoryName: 'ecommerce-frontend' });
   });
 
   test('scans every pushed image in every repository', () => {
-    for (const { properties } of repositories(buildTemplate('dev'))) {
+    for (const { properties } of repositories(buildTemplate())) {
       expect(properties.ImageScanningConfiguration).toEqual({ ScanOnPush: true });
     }
   });
 
   test('expires untagged images but keeps tagged ones', () => {
-    const policyText = repository(buildTemplate('dev'), 'ecommerce-dev-api').properties
+    const policyText = repository(buildTemplate(), 'ecommerce-api').properties
       .LifecyclePolicy.LifecyclePolicyText as string;
 
     expect(policyText).toContain('"tagStatus":"untagged"');
     expect(policyText).toContain('"type":"expire"');
   });
 
-  test('is emptied on delete in dev but retained in production', () => {
-    expect(repository(buildTemplate('dev'), 'ecommerce-dev-api').properties.EmptyOnDelete).toBe(true);
-    expect(repository(buildTemplate('dev'), 'ecommerce-dev-frontend').properties.EmptyOnDelete).toBe(true);
-    buildTemplate('prod').hasResource('AWS::ECR::Repository', { DeletionPolicy: 'Retain' });
+  test('retains the repositories - deleting the stack must not delete the images every environment pulls', () => {
+    const template = buildTemplate();
+    template.hasResource('AWS::ECR::Repository', { DeletionPolicy: 'Retain' });
+    template.hasResource('AWS::ECR::Repository', { UpdateReplacePolicy: 'Retain' });
   });
 
-  test('tags the repositories with the project, environment and management tool', () => {
-    for (const resource of repositories(buildTemplate('uat'))) {
+  test('tags the repositories as shared platform infrastructure', () => {
+    for (const resource of repositories(buildTemplate())) {
       expect(tagMap(resource.properties)).toMatchObject({
         Project: 'Ecommerce',
-        Environment: 'uat',
+        Environment: 'shared',
         ManagedBy: 'CDK',
       });
     }
   });
 });
 
+describe('EcrStack cross-account pull', () => {
+  test('grants each configured account pull on both repositories', () => {
+    const template = buildTemplate([UAT_ACCOUNT, PROD_ACCOUNT]);
+
+    // The pull grant lives inline on each repository's RepositoryPolicyText, not as a separate
+    // AWS::ECR::RepositoryPolicy resource.
+    for (const { properties } of repositories(template)) {
+      const rendered = JSON.stringify(properties.RepositoryPolicyText?.Statement ?? []);
+      expect(rendered).toContain(`:iam::${UAT_ACCOUNT}:root`);
+      expect(rendered).toContain(`:iam::${PROD_ACCOUNT}:root`);
+      expect(rendered).toContain('ecr:BatchGetImage');
+    }
+  });
+
+  test('creates no repository policy when no pull accounts are configured', () => {
+    for (const { properties } of repositories(buildTemplate())) {
+      expect(properties.RepositoryPolicyText).toBeUndefined();
+    }
+  });
+});
+
 describe('EcrStack outputs', () => {
   test('exports where to push each image', () => {
-    const template = buildTemplate('dev');
+    const template = buildTemplate();
 
-    template.hasOutput('RepositoryUri', { Export: { Name: 'ecommerce-dev-ecr-repository-uri' } });
-    template.hasOutput('RepositoryName', { Export: { Name: 'ecommerce-dev-ecr-repository-name' } });
-    template.hasOutput('FrontendRepositoryUri', { Export: { Name: 'ecommerce-dev-ecr-frontend-repository-uri' } });
-    template.hasOutput('FrontendRepositoryName', { Export: { Name: 'ecommerce-dev-ecr-frontend-repository-name' } });
+    template.hasOutput('RepositoryUri', { Export: { Name: 'ecommerce-ecr-repository-uri' } });
+    template.hasOutput('RepositoryName', { Export: { Name: 'ecommerce-ecr-repository-name' } });
+    template.hasOutput('FrontendRepositoryUri', { Export: { Name: 'ecommerce-ecr-frontend-repository-uri' } });
+    template.hasOutput('FrontendRepositoryName', { Export: { Name: 'ecommerce-ecr-frontend-repository-name' } });
   });
 });

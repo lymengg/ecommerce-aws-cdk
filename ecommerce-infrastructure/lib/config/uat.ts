@@ -102,4 +102,11 @@ export const uatConfig: EnvironmentConfig = {
     // machine may call the API.
     frontendUrl: frontendOrigin ?? (domain ? `https://${domain}` : 'http://localhost:5173'),
   },
+  // Same posture as dev, a wider ceiling: UAT runs two NAT gateways and keeps flow logs and
+  // retained resources, so it legitimately costs more. Crossing this means the environment is
+  // spending like production while doing acceptance work.
+  cost: {
+    monthlyBudgetUsd: 150,
+    alertEmail: process.env.ECOMMERCE_UAT_ALERT_EMAIL,
+  },
 };

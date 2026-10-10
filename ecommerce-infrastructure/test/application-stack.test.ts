@@ -8,7 +8,7 @@ import { ApplicationStack } from '../lib/stacks/application-stack';
 import { CognitoStack } from '../lib/stacks/cognito-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
-import { EcrStack } from '../lib/stacks/ecr-stack';
+import { RegistryLocation } from '../lib/stacks/ecr-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
 /**
@@ -16,6 +16,9 @@ import { NetworkStack } from '../lib/stacks/network-stack';
  * stacks themselves never hardcode an account id - test/config.test.ts enforces that.
  */
 const TEST_ACCOUNT = '123456789012';
+
+/** The shared registry the test stacks pull from - same account here, a different one in uat/prod. */
+const TEST_REGISTRY: RegistryLocation = { account: TEST_ACCOUNT, region: 'ap-southeast-1' };
 
 /** A delegated subdomain injected into the configuration, independent of the developer's shell. */
 const TEST_DNS: DnsConfig = { zoneName: 'dev.example.com', apiSubdomain: 'api', authSubdomain: 'auth' };
@@ -36,9 +39,10 @@ interface BuiltStacks {
 }
 
 /**
- * Builds the Phase 1 network stack, the Phase 2 registry stack, the Phase 3 database stack, the
- * Phase 3.5 DNS stack, the Phase 4 Cognito stack and the application stack in one app, exactly as
- * `bin/ecommerce.ts` does, so the cross-stack wiring is exercised rather than stubbed.
+ * Builds the Phase 1 network stack, the Phase 3 database stack, the Phase 3.5 DNS stack, the
+ * Phase 4 Cognito stack and the application stack in one app, exactly as `bin/ecommerce.ts` does,
+ * so the cross-stack wiring is exercised rather than stubbed. The Phase 2 registry is not built:
+ * the application consumes it by name, which is the whole contract.
  *
  * `options.dns` overrides the subdomain for the tests that need a specific TLS path without
  * depending on `ECOMMERCE_<ENV>_DOMAIN`; `options.dns === null` strips it entirely, which is the
@@ -53,7 +57,6 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
-  const registry = new EcrStack(app, `test-ecr-${environment}`, { env, config });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,
@@ -69,7 +72,7 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
     env,
     config,
     vpc: network.vpc,
-    repository: registry.repository,
+    registry: TEST_REGISTRY,
     albSecurityGroup: network.securityGroups.alb,
     applicationSecurityGroup: network.securityGroups.application,
     database: {
@@ -158,9 +161,10 @@ describe('ApplicationStack container image', () => {
     const template = buildStacks('dev').template;
     const container = single(template, 'AWS::ECS::TaskDefinition').properties.ContainerDefinitions[0];
 
-    // The repository is referenced, not redefined, so this stack must create no repository itself.
+    // The repository is imported by name, not redefined, so this stack must create no repository
+    // itself and the image URI names exactly `ecommerce-dev-api`.
     template.resourceCountIs('AWS::ECR::Repository', 0);
-    expect(json(container.Image)).toContain('Repository');
+    expect(json(container.Image)).toContain('ecommerce-api');
   });
 });
 
@@ -387,7 +391,8 @@ describe('ApplicationStack IAM', () => {
     expect(wildcardResources).toHaveLength(1);
     expect(json(wildcardResources[0].Action)).toContain('ecr:GetAuthorizationToken');
 
-    expect(json(statements)).toContain('Repository');
+    // The repository is imported by name, so the grant scopes to the literal ARN suffix.
+    expect(json(statements)).toContain('repository/ecommerce-api');
     expect(json(statements)).toContain('ApiLogGroup');
     // Both secrets are read: the Phase 3 database credentials and the Phase 4 Cognito client secret.
     expect(json(statements)).toContain('Credentials');

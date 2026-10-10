@@ -118,4 +118,12 @@ export const devConfig: EnvironmentConfig = {
     // the apex; a local run falls back to the Vite dev server.
     frontendUrl: frontendOrigin ?? (domain ? `https://${domain}` : 'http://localhost:5173'),
   },
+  // A small ceiling for the small environment: the running dev platform costs well under this,
+  // so crossing it means something was left on (the classic: a resumed NAT, an oversized instance)
+  // rather than growth. The forecasted alert at 100% is the useful one - it fires before the money
+  // is spent, which is exactly the feedback a learning environment needs.
+  cost: {
+    monthlyBudgetUsd: 100,
+    alertEmail: process.env.ECOMMERCE_DEV_ALERT_EMAIL,
+  },
 };

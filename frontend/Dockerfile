@@ -6,12 +6,10 @@
 FROM node:24-alpine AS build
 WORKDIR /app
 
-# A static SPA has no server to read runtime configuration from, so the API's public origin is baked
-# into the bundle at build time. Pass it per environment:
-#   docker build --build-arg NUXT_PUBLIC_API_BASE_URL=https://api.dev.example.com .
-ARG NUXT_PUBLIC_API_BASE_URL
-ENV NUXT_PUBLIC_API_BASE_URL=${NUXT_PUBLIC_API_BASE_URL}
-
+# The image is environment-agnostic: the SPA derives its API origin from the host it is served
+# on (apex -> `api.<apex>`), so the identical image promotes dev -> uat -> prod. `apiBaseUrl`
+# remains the local-development fallback.
+#
 # Dependencies first, so the (slow) install layer is only repeated when they change.
 COPY package.json package-lock.json ./
 RUN npm ci

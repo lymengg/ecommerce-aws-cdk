@@ -315,6 +315,32 @@ export interface AuthConfig {
 }
 
 /**
+ * Cost guardrails of the environment (Phase 9).
+ *
+ * Every environment gets a monthly budget and cost-anomaly detection, because the whole point of
+ * the numbers is that a reviewable configuration decides when the platform is spending more than
+ * intended - not a surprise bill. In the multi-account model each environment is its own account,
+ * so the budget monitors the account the stack deploys to; the `Environment` tag still drives the
+ * cost allocation report for whatever else shares a payer.
+ */
+export interface CostConfig {
+  /**
+   * Expected monthly spend of the environment in USD. Two notifications ride on it: an *actual*
+   * alert at 80% (spend already happened) and a *forecasted* alert at 100% (the month ends over
+   * budget at the current rate - the earlier of the two warnings).
+   */
+  readonly monthlyBudgetUsd: number;
+
+  /**
+   * Address budget and anomaly alerts are emailed to, read from the
+   * `ECOMMERCE_<ENV>_ALERT_EMAIL` variable. Optional because an alert inbox is an operational
+   * decision; without it the guardrails still exist and are visible in the console - they just
+   * cannot reach anyone.
+   */
+  readonly alertEmail?: string;
+}
+
+/**
  * Everything a stack needs to know about the environment it is deployed to.
  *
  * Values are supplied per environment (see `dev.ts`, `uat.ts`, `prod.ts`) so that no stack ever
@@ -377,4 +403,7 @@ export interface EnvironmentConfig {
 
   /** Authentication and authorisation configuration (Phase 4). Always present; auth is not optional. */
   readonly auth: AuthConfig;
+
+  /** Cost guardrails (Phase 9). Always present; an environment without a budget is a blind spot. */
+  readonly cost: CostConfig;
 }

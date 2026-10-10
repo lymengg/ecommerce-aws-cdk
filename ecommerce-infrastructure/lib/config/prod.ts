@@ -110,4 +110,12 @@ export const prodConfig: EnvironmentConfig = {
     // The SPA is the deployed apex. Empty without a domain, which the `dns` check rejects first.
     frontendUrl: frontendOrigin ?? (domain ? `https://${domain}` : ''),
   },
+  // The largest legitimate bill: three NAT gateways, a Multi-AZ database and flow logs mean
+  // production costs meaningfully more than the other environments even before traffic. The
+  // budget is therefore sized for the architecture, not for dev parity - anything under it is
+  // normal, and crossing it is either growth (good, then raise it) or waste (act on it).
+  cost: {
+    monthlyBudgetUsd: 400,
+    alertEmail: process.env.ECOMMERCE_PROD_ALERT_EMAIL,
+  },
 };

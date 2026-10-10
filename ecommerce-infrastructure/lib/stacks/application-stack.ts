@@ -1,7 +1,7 @@
 import { CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
 import { ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
 import { ISecurityGroup, IVpc, SecurityGroup } from 'aws-cdk-lib/aws-ec2';
-import { IRepository } from 'aws-cdk-lib/aws-ecr';
+import { Repository } from 'aws-cdk-lib/aws-ecr';
 import { Cluster } from 'aws-cdk-lib/aws-ecs';
 import { ARecord, IHostedZone, RecordTarget } from 'aws-cdk-lib/aws-route53';
 import { LoadBalancerTarget } from 'aws-cdk-lib/aws-route53-targets';
@@ -10,6 +10,7 @@ import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
 import { DatabaseConnection, LoadBalancedApi } from '../constructs/load-balanced-api';
+import { API_REPOSITORY_NAME, RegistryLocation } from './ecr-stack';
 import { applyPlatformTags } from '../tags';
 
 /**
@@ -52,8 +53,13 @@ export interface ApplicationStackProps extends StackProps {
   /** The Phase 1 VPC. */
   readonly vpc: IVpc;
 
-  /** The container registry created by the ECR stack, which must be deployed first. */
-  readonly repository: IRepository;
+  /**
+   * Where the shared registry lives. The application image (`ecommerce-api`) is pulled from the
+   * registry account, which may differ from this stack's: the repository is imported by ARN rather
+   * than referenced as a construct - a construct reference cannot cross a stage boundary, and an
+   * account-id string never has to be smuggled between accounts.
+   */
+  readonly registry: RegistryLocation;
 
   /** The Phase 1 load balancer security group, whose HTTP rule is added by this stack. */
   readonly albSecurityGroup: ISecurityGroup;
@@ -116,9 +122,23 @@ export class ApplicationStack extends Stack {
   constructor(scope: Construct, id: string, props: ApplicationStackProps) {
     super(scope, id, props);
 
-    const { config, vpc, repository, database } = props;
+    const { config, vpc, database } = props;
     const namePrefix = `ecommerce-${config.environment}`;
     const serviceName = `${namePrefix}-api`;
+
+    // The repository is imported by ARN: it lives in the shared registry stage (and possibly a
+    // different account), which deploys - and the pipeline pushes images into - before this stack
+    // runs. Importing produces the same IAM grant and image URI a construct reference would.
+    const repository = Repository.fromRepositoryAttributes(this, 'ApiRepository', {
+      repositoryName: API_REPOSITORY_NAME,
+      repositoryArn: this.formatArn({
+        service: 'ecr',
+        region: props.registry.region,
+        account: props.registry.account,
+        resource: 'repository',
+        resourceName: API_REPOSITORY_NAME,
+      }),
+    });
 
     this.cluster = new Cluster(this, 'Cluster', {
       clusterName: `${namePrefix}-cluster`,

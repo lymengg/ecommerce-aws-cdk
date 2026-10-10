@@ -27,9 +27,9 @@ export default defineNuxtConfig({
 
   runtimeConfig: {
     public: {
-      // Base URL of the Spring API. Everything the browser sends goes here, including the OAuth
-      // login navigation. Production builds override it with NUXT_PUBLIC_API_BASE_URL
-      // (https://api.<env-domain>); the default is the local API.
+      // Base URL of the Spring API, used only where the api.<apex> convention cannot apply: local
+      // development. Served deployments derive it from the host instead (see useApi), which is what
+      // keeps the built image environment-agnostic.
       apiBaseUrl: 'http://localhost:8080',
       // Where the API starts the authorization code flow. A top-level navigation, not a fetch: the
       // browser has to visit Cognito's hosted UI.

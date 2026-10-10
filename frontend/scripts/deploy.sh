@@ -5,10 +5,9 @@
 # Usage:
 #   ECOMMERCE_DEV_DOMAIN=dev.example.com ./scripts/deploy.sh dev
 #
-# The API's public origin is baked into the bundle at build time (the app is a static SPA, so there
-# is no server to read runtime configuration from), which is why the environment has to be known
-# here. The image itself is environment-agnostic: nginx renders its Content-Security-Policy from the
-# API_ORIGIN the task definition passes it.
+# The image is environment-agnostic: the SPA derives its API origin from the host it is served on
+# (apex -> `api.<apex>`), and nginx renders its Content-Security-Policy from the API_ORIGIN the task
+# definition passes it.
 set -euo pipefail
 
 ENVIRONMENT="${1:-dev}"
@@ -33,7 +32,10 @@ export_url() {
     --query "Exports[?Name=='${EXPORT_PREFIX}-$1'].Value" --output text
 }
 
-REPOSITORY="$(export_url ecr-frontend-repository-uri)"
+# The registry is shared across environments, so its export is not environment-prefixed; the
+# cluster and service exports still are.
+REPOSITORY="$(aws cloudformation list-exports --region "$REGION" \
+  --query "Exports[?Name=='ecommerce-ecr-frontend-repository-uri'].Value" --output text)"
 CLUSTER="$(export_url ecs-cluster-name)"
 SERVICE="$(export_url frontend-service-name)"
 
@@ -44,8 +46,8 @@ for value in "$REPOSITORY" "$CLUSTER" "$SERVICE"; do
   fi
 done
 
-echo "Building the storefront against https://api.${DOMAIN} ..."
-docker build --build-arg "NUXT_PUBLIC_API_BASE_URL=https://api.${DOMAIN}" -t "ecommerce-frontend:${IMAGE_TAG}" .
+echo "Building the storefront ..."
+docker build -t "ecommerce-frontend:${IMAGE_TAG}" .
 
 echo "Pushing to ${REPOSITORY}:${IMAGE_TAG} ..."
 REGISTRY="${REPOSITORY%%/*}"

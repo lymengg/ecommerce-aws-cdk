@@ -1,4 +1,5 @@
 import { App } from 'aws-cdk-lib';
+import { Construct } from 'constructs';
 
 import { devConfig } from './dev';
 import { prodConfig } from './prod';
@@ -50,6 +51,18 @@ export function getEnvironmentConfig(environment: EnvironmentName = resolveEnvir
 }
 
 /**
+ * The account ids of every configured environment: the set the shared registry allows to pull
+ * images. An environment is "configured" the moment its `ECOMMERCE_<ENV>_ACCOUNT` variable exists -
+ * the same rule {@link ../../bin/pipeline.ts} uses to decide which environments the pipeline
+ * deploys, so the registry's pull policy always matches the pipeline's stage list.
+ */
+export function configuredAccountIds(): string[] {
+  return ENVIRONMENT_NAMES.map(
+    (name) => process.env[`ECOMMERCE_${name.toUpperCase()}_ACCOUNT`],
+  ).filter((account): account is string => account !== undefined && account !== '');
+}
+
+/**
  * Resolves the container image tag to deploy, in order of precedence:
  *
  * 1. CDK context - `cdk deploy -c imageTag=v1.2.3`
@@ -62,10 +75,10 @@ export function getEnvironmentConfig(environment: EnvironmentName = resolveEnvir
  */
 export function resolveImageTag(
   config: EnvironmentConfig,
-  app?: App,
+  scope?: Construct,
   defaultTag: string = config.application.imageTag,
 ): string {
-  const fromContext: unknown = app?.node.tryGetContext(IMAGE_TAG_CONTEXT_KEY);
+  const fromContext: unknown = scope?.node.tryGetContext(IMAGE_TAG_CONTEXT_KEY);
   const candidate = String(fromContext ?? process.env.IMAGE_TAG ?? defaultTag).trim();
 
   if (candidate === '') {

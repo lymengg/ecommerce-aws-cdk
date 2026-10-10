@@ -26,7 +26,14 @@ let cachedCsrfToken: CsrfToken | null = null
  */
 export function useApi() {
   const config = useRuntimeConfig()
-  const baseURL = config.public.apiBaseUrl
+  // The API always answers on the `api.` subdomain of the storefront's own host - that is the
+  // platform's fixed DNS convention (apex = SPA, api.<apex> = API), so the image stays
+  // environment-agnostic and the identical artifact promotes dev -> uat -> prod unchanged.
+  // `apiBaseUrl` remains the override for local development, where there is no api. subdomain.
+  const baseURL =
+    import.meta.client && !['localhost', '127.0.0.1'].includes(window.location.hostname)
+      ? `https://api.${window.location.hostname}`
+      : config.public.apiBaseUrl
 
   const client = $fetch.create({
     baseURL,

@@ -6,7 +6,7 @@ import { EnvironmentConfig, EnvironmentName } from '../lib/config/types';
 import { ApplicationStack } from '../lib/stacks/application-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
-import { EcrStack } from '../lib/stacks/ecr-stack';
+import { RegistryLocation } from '../lib/stacks/ecr-stack';
 import { FrontendStack } from '../lib/stacks/frontend-stack';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
@@ -15,6 +15,9 @@ import { NetworkStack } from '../lib/stacks/network-stack';
  * stacks themselves never hardcode an account id - test/config.test.ts enforces that.
  */
 const TEST_ACCOUNT = '123456789012';
+
+/** The shared registry the test stacks pull from - same account here, a different one in uat/prod. */
+const TEST_REGISTRY: RegistryLocation = { account: TEST_ACCOUNT, region: 'ap-southeast-1' };
 
 const TEST_SITE = 'dev.example.com';
 const TEST_API_ORIGIN = 'https://api.dev.example.com';
@@ -32,7 +35,8 @@ interface BuiltStacks {
 /**
  * Builds the whole platform and then the frontend stack, exactly as `bin/ecommerce.ts` does, so the
  * cross-stack wiring (cluster, listener, load balancer, security group, repository, zone) is
- * exercised rather than stubbed.
+ * exercised rather than stubbed. The registries are not built: both compute stacks consume them by
+ * name, which is the whole contract.
  */
 function buildStacks(environment: EnvironmentName): BuiltStacks {
   const app = new App();
@@ -40,7 +44,6 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
-  const registry = new EcrStack(app, `test-ecr-${environment}`, { env, config });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,
@@ -52,7 +55,7 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
     env,
     config,
     vpc: network.vpc,
-    repository: registry.repository,
+    registry: TEST_REGISTRY,
     albSecurityGroup: network.securityGroups.alb,
     applicationSecurityGroup: network.securityGroups.application,
     database: {
@@ -73,7 +76,7 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
   const stack = new FrontendStack(app, `test-frontend-${environment}`, {
     env,
     config,
-    repository: registry.frontendRepository,
+    registry: TEST_REGISTRY,
     cluster: application.cluster,
     applicationSecurityGroup: network.securityGroups.application,
     loadBalancer: application.api.loadBalancer,
@@ -172,7 +175,7 @@ describe('FrontendStack task definition', () => {
     const template = buildStacks('dev').template;
 
     template.resourceCountIs('AWS::ECR::Repository', 0);
-    expect(json(containerOf(template).Image)).toContain('FrontendRepository');
+    expect(json(containerOf(template).Image)).toContain('ecommerce-frontend');
     expect(json(containerOf(template).Image)).toContain(':v0.1.0');
     expect(json(containerOf(template).Image)).not.toContain(':latest');
   });
