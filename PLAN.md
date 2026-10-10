@@ -11,11 +11,11 @@ Phase 3   Database & Persistence         ✅ done
 Phase 3.5 TLS & DNS                      ✅ done
 Phase 4   Authentication & Authorization ✅ done
 Phase 4.5 Frontend (Nuxt SPA on AWS)     ✅ done
-Phase 5   Messaging & Event-Driven       ← next
+Phase 5   Messaging & Event-Driven       ⏸ deferred (skipped ahead to CI/CD; returns later)
 Phase 6   Caching & Performance
 Phase 7   Observability & Security
-Phase 8   CI/CD
-Phase 9   Production Architecture
+Phase 8   CI/CD                          ← in progress (dev live, uat/prod behind approval)
+Phase 9   Production Architecture        ← in progress (accounts + cost guardrails; DR deferred)
 ```
 
 Two rules apply to every phase:
@@ -237,44 +237,70 @@ The deep dive; baseline alarms have been landing with each phase since Phase 4.
 DLQ, spike 5xx) produces an alarm and a traceable diagnosis; cdk-nag runs clean or with justified
 suppressions.
 
-## Phase 8 — CI/CD ⬜
+## Phase 8 — CI/CD 🔄 in progress
 
-Replaces today's manual `docker build`/`push`/`cdk deploy` entirely.
+Replaces today's manual `docker build`/`push`/`cdk deploy` entirely. **CDK Pipelines** was chosen
+over GitHub Actions: the pipeline is infrastructure, deploys to multiple AWS accounts natively, and
+self-mutates on push.
 
-**Scope:**
+**Delivered:**
 
-- Pipeline: GitHub Actions + OIDC (no static AWS keys) **or** CDK Pipelines — pick one, do it
-  properly.
-- Stages: lint → `npm test` + `mvn test` → `cdk synth --strict` → build/push image with an
-  immutable tag → `cdk diff` gate → deploy dev → uat → prod behind manual approval.
-- Post-deploy integration tests (the README's curl checks, automated) against the deployed dev
-  environment.
-- `cdk drift --fail` as a scheduled job.
+- `PipelineStack` + `bin/pipeline.ts`: a self-mutating V2 CodePipeline fed by a CodeConnections
+  link to GitHub — no stored credentials anywhere.
+- Stacks refactored into `SharedRegistryStage` + `PlatformStage` (`lib/ecommerce-stage.ts`) with
+  explicit `stackName`s, so the pipeline adopts the live stacks instead of replacing them. The
+  registry is its own stage because the image build must sit between "repository exists" and
+  "compute deploys" — and construct references cannot cross stage boundaries, so the platform
+  imports the repositories by location (`{account, region}` + fixed names).
+- One **shared registry** (`ecommerce-ecr`: `ecommerce-api` + `ecommerce-frontend`) serves every
+  environment — an image is a build artifact, not an environment resource. Images build **once**
+  (`BuildImages`, pushed as the commit SHA — the same `CODEBUILD_RESOLVED_SOURCE_VERSION` the synth
+  baked into the task definitions) and each environment stage deploys the identical artifact:
+  promotion, not rebuild. Both images are environment-agnostic — the SPA derives its API origin at
+  runtime (`api.<apex>`), and nginx renders its CSP from the `API_ORIGIN` the task passes.
+- `registry` stage (gated by three test steps) → `dev` stage (pre: `BuildImages`, post:
+  `SmokeTests-dev`) → `uat`/`prod` stages, each gated by a `ManualApprovalStep`.
+- Cross-account by design: the registry's resource policies grant each configured environment
+  account pull (`pullAccountIds`), the build step pushes with its own role scoped to the two
+  repositories, and `crossAccountKeys` keeps the artifact bucket decryptable by other accounts'
+  deploy roles.
+- `uat`/`prod` join the pipeline automatically once `ECOMMERCE_<ENV>_ACCOUNT` + `_DOMAIN` exist.
+  The registry lives in the pipeline account today; Phase 9's tooling account is a `registry`
+  location change plus re-pointed pull policies.
 
-**Acceptance:** a merge to main lands in dev with no human step, promotes to prod with one
-approval; a failing post-deploy test blocks promotion; drift fires a notification.
+**Remaining:** `cdk drift --fail` as a scheduled job; first live deploy + a real `main` push.
 
-**Concepts:** OIDC federation, environment protection rules, self-mutating pipelines (if CDK
-Pipelines), image tag immutability in the pipeline context, drift-aware change sets.
+**Concepts:** self-mutating pipelines, stage-boundary constraints, `envFromCfnOutputs`, immutable
+image tags in the pipeline context, cross-account artifact keys, assume-role image publishing.
 
-## Phase 9 — Production Architecture ⬜
+## Phase 9 — Production Architecture 🔄 in progress
 
-**Scope:**
+**Delivered:**
 
-- Multi-account structure via AWS Organizations (dev/uat/prod accounts); the per-env
-  `ECOMMERCE_<ENV>_ACCOUNT` pins become real account ids.
-- DR posture: cross-region backup copy for RDS, a restore drill (actually restore and verify),
-  documented RTO/RPO.
+- Multi-account structure: `OrganizationStack` + `bin/organization.ts` synthesizes the AWS
+  Organization (ALL features), a `workloads` OU with one child OU per environment plus a `tooling`
+  OU, and a member account for every `ECOMMERCE_<NAME>_ACCOUNT_EMAIL` set — the emitted account
+  ids are exactly the `ECOMMERCE_<ENV>_ACCOUNT` values the pipeline and the shared registry's pull
+  policy already key on, and `tooling` is the pipeline/registry's eventual home (the management
+  account itself stays workload-free). Accounts are `RETAIN`ed; per-OU SCPs stay possible later.
+- Cost guardrails: `ecommerce-cost-<env>` in every platform stage — a monthly account budget
+  (actual 80% + forecasted 100% notifications), a per-service cost-anomaly monitor and daily
+  subscription, an `Environment` cost category for the tagged monthly report, and the shared
+  `ecommerce-<env>-alerts` SNS topic that Phase 7's alarm fan-out will reuse. Alert email comes
+  from `ECOMMERCE_<ENV>_ALERT_EMAIL`.
+- `RUNBOOK.md`: task won't start, pipeline smoke failures, RDS failover procedure, cert expiry,
+  pipeline self-mutation, budget/anomaly response, cross-account image pull.
+
+**Deferred within the phase (explicitly skipped):**
+
+- DR posture: cross-region backup copy for RDS, a restore drill, documented RTO/RPO.
 - Multi-AZ failover test on the prod database; AZ-loss game day for ECS.
-- Cost guardrails: budgets + cost anomaly detection, tagged-cost reports.
-- Runbooks for the known failure modes (task won't start, DLQ accumulating, RDS failover, cert
-  expiry).
 
-**Acceptance:** a prod database failover completes inside the RTO with no data loss; a restored
-backup passes the API smoke test; a monthly cost report by `Environment` tag exists.
+**Remaining:** deploy the organization + create the real uat/prod accounts; a monthly cost report
+by `Environment` reviewed once it's live.
 
-**Concepts:** Organizations/SCPs, cross-region backup, failover vs read replica, game days,
-cost allocation, operational readiness review.
+**Concepts:** Organizations/OUs, account vending via CloudFormation, budgets vs anomaly detection,
+cost allocation categories, SNS alert fan-out, operational readiness.
 
 ---
 

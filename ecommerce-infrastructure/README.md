@@ -234,9 +234,11 @@ aws-cdk/
 │   │   │   ├── tier-security-groups.ts   # ALB / application / database security groups
 │   │   │   ├── vpc-flow-logs.ts          # optional flow logging + its least-privilege role
 │   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB + auth wiring, IAM
+│   │   ├── ecommerce-stage.ts        # RegistryStage + PlatformStage (Phase 8 stage split)
 │   │   ├── stacks/
 │   │   │   ├── network-stack.ts      # VPC, public/private/isolated subnets, routing, SGs
 │   │   │   ├── ecr-stack.ts          # container registry
+│   │   │   ├── pipeline-stack.ts     # self-mutating CDK Pipeline (Phase 8)
 │   │   │   ├── database-stack.ts     # RDS PostgreSQL instance + Secrets Manager credentials
 │   │   │   ├── dns-stack.ts          # Route 53 hosted zone + ACM certificate (Phase 3.5)
 │   │   │   ├── auth-certificate-stack.ts # us-east-1 ACM certificate for the Cognito custom domain
@@ -256,6 +258,7 @@ aws-cdk/
 │   │   ├── auth-domain-stack.test.ts # custom domain + alias record contract tests
 │   │   ├── application-stack.test.ts # compute + database + TLS + auth wiring contract tests
 │   │   ├── frontend-stack.test.ts    # storefront service + listener rule contract tests
+│   │   ├── pipeline-stack.test.ts    # pipeline structure + stage stackName contract tests
 │   │   └── config.test.ts            # configuration tests
 │   ├── cdk.json
 │   ├── jest.config.js
@@ -313,7 +316,7 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 | Stack | Name | Creates |
 | ----- | ---- | ------- |
 | Network | `ecommerce-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
-| Registry | `ecommerce-ecr-<env>` | ECR repository |
+| Registry | `ecommerce-ecr` | **Shared** ECR repositories (`ecommerce-api`, `ecommerce-frontend`), one pair for every environment |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
 | DNS | `ecommerce-dns-<env>` | Route 53 hosted zone, ACM certificate |
 | Auth certificate | `ecommerce-auth-cert-<env>` | ACM certificate for `auth.<env-domain>` in `us-east-1`, the only region a Cognito custom domain reads certificates from |
@@ -321,12 +324,16 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 | Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listeners, alias record, log group, IAM roles |
 | Frontend | `ecommerce-frontend-<env>` | nginx ECS service + target group, host rule on the application stack's HTTPS listener, apex alias records, IAM roles, log group |
 | Auth domain | `ecommerce-auth-domain-<env>` | Cognito custom domain (`auth.<env-domain>`, managed login v2), `auth` A/AAAA alias records |
+| Cost | `ecommerce-cost-<env>` | Monthly budget, cost-anomaly monitor + subscription, `Environment` cost category, the shared `ecommerce-<env>-alerts` SNS topic |
 
-The registry is a **separate stack from the compute** on purpose. An ECS service cannot start until
-an image exists, and an image can only be pushed once the repository exists, so the repository has
-to be creatable — and an image pushable — before the application stack is deployed. Keeping the
-registry separate also means recreating the compute never touches the images, and in uat/prod the
-registry can be retained while everything else is disposable.
+The registry is a **separate, shared stack** — deliberately outside every environment. An image is
+a build artifact, not an environment resource: the pipeline builds it once per commit and promotes
+the *identical* image dev → uat → prod rather than rebuilding per environment (rebuilding would
+produce different digests and weaken the "what was tested is what ships" guarantee). Deploy order is
+unchanged: the repositories must exist before an image can be pushed, and an image before the
+compute can start. Each environment's account is granted pull through the repositories' resource
+policy (`pullAccountIds`), and the repositories are `RETAIN`ed — tearing down any environment must
+never delete the images the others pull.
 
 The database is a **separate stack from the compute** for the opposite reason: their lifecycles are
 unrelated. The application is replaced on every deployment and can be recreated at will; the
@@ -389,6 +396,209 @@ is ever plumbed between stacks as a string.
 > in place, which avoids the "deadly embrace" where a producer stack can no longer be updated or
 > deleted because a consumer still imports one of its exports. This is the recommended setting for a
 > new project; there is nothing deployed yet to migrate.
+
+### Stages
+
+From Phase 8 the stacks above are instantiated inside CDK **stages**, so the pipeline can deploy
+them as units — and so a stage is the thing that repeats per account. There are two stages per
+environment, and the split is deliberate:
+
+| Stage | Contains | Why it is separate |
+| ----- | -------- | ------------------ |
+| `registry` | `ecommerce-ecr` | The shared registry: deployed once, not per environment. In the pipeline the image-build step sits between this stage and the first environment, which is only possible if the registry is its own stage. |
+| `<env>` (`dev`) | the other nine stacks | Construct dependencies cannot cross a stage boundary: the load balancer depends on its subnets' route tables, so everything that wires constructs together stays in one stage. |
+
+The platform stage consumes the repositories **by location** — `{account, region}` + the fixed
+names `ecommerce-api` / `ecommerce-frontend`, imported with `Repository.fromRepositoryAttributes` —
+rather than by construct reference. A stack reference would create a dependency across the stage
+boundary, which the CDK forbids; the location is configuration, so nothing is lost. Ordering is the
+deploy-order contract the manual workflow already followed.
+
+Every stack carries an explicit `stackName`, so adopting stages did not rename the deployed
+CloudFormation stacks: `ecommerce-network-dev` is still `ecommerce-network-dev`. In CLI output they
+appear under their stage path (`dev/ecommerce-network-dev`); both `cdk deploy ecommerce-network-dev`
+(matching the stack name) and `cdk deploy dev/ecommerce-network-dev` (matching the path) select it.
+
+---
+
+## CI/CD pipeline (Phase 8)
+
+A self-mutating **CDK Pipeline** (`ecommerce-platform`) replaces the manual `docker build` / push /
+`cdk deploy` flow on every push to `main`:
+
+```
+Source (CodeConnections -> GitHub)
+  -> Synth            npm ci; IMAGE_TAG=<commit SHA>; cdk synth --strict
+  -> UpdatePipeline   the pipeline re-synthesises itself on every push
+  -> registry         pre: InfrastructureTests | FrontendTests | ApiTests (parallel)
+                      deploy ecommerce-ecr (the shared repositories)
+  -> dev              pre: BuildImages (docker build x2 -> push :<commit SHA>, once)
+                      deploy the eight platform stacks in dependency order
+                      post: SmokeTests-dev (curl the health, auth and 401 checks)
+  -> uat              pre: manual approval - promotes the identical images
+  -> prod             pre: manual approval
+```
+
+**Which environments deploy is configuration, not code.** `bin/pipeline.ts` includes `uat` and
+`prod` the moment their `ECOMMERCE_<ENV>_ACCOUNT` + `ECOMMERCE_<ENV>_DOMAIN` pair exists, and each
+later environment is gated by a **manual approval** — dev deploys on merge, uat and prod wait for a
+human in the CodePipeline console.
+
+**Promotion, not rebuild.** Images are built **once** per run into the shared registry
+(`ecommerce-api`, `ecommerce-frontend`), so every environment runs the identical artifact — the
+same digest that was built and tested. `IMAGE_TAG` is `CODEBUILD_RESOLVED_SOURCE_VERSION` — the
+commit SHA — in both the synth step (baked into the task definitions) and the build step (pushed to
+ECR), so the tag in the template is always the tag in the registry and `latest` is never involved.
+Both images are environment-agnostic: the SPA derives its API origin at runtime from the host it is
+served on (`api.<apex>`), and nginx renders its CSP from the `API_ORIGIN` the task definition
+passes — so even the frontend needs no per-environment build.
+
+**Cross-account deployments need no credentials.** The build step pushes with its own role, scoped
+to the two repositories — the registry lives in the pipeline account, so no role assumption is
+needed on the push side. Environments in other accounts *pull*: each configured
+`ECOMMERCE_<ENV>_ACCOUNT` is granted `ecr` pull actions on the repositories' resource policies
+(`pullAccountIds`), and the environment's task execution role carries the matching identity
+permission. Deploy actions assume the target account's CDK bootstrap roles, and the artifact
+bucket uses a customer-managed KMS key (`crossAccountKeys`) so those deploy actions can decrypt the
+cloud assembly.
+
+### One-time setup
+
+The two manual steps, both in the AWS console/CLI, before the pipeline can exist:
+
+1. **Create the CodeConnections connection.** AWS console → Developer Tools → Connections → create
+   a GitHub connection and complete the OAuth handshake until the status is `Available`. The
+   handshake cannot be automated; the resulting ARN is not a secret and is supplied as
+   `GITHUB_CONNECTION_ARN` (or `-c connectionArn=`).
+2. **Bootstrap every account/region the pipeline deploys to.** The pipeline account itself needs
+   `ap-southeast-1` *and* `us-east-1` (the Cognito custom-domain certificate lives there). Each
+   future uat/prod account needs both regions too, bootstrapped with `--trust <pipeline-account>`:
+
+   ```bash
+   cdk bootstrap aws://<pipeline-account>/ap-southeast-1
+   cdk bootstrap aws://<pipeline-account>/us-east-1
+   # per target account, once it exists:
+   cdk bootstrap aws://<uat-account>/ap-southeast-1 --trust <pipeline-account> \
+     --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
+   cdk bootstrap aws://<uat-account>/us-east-1 --trust <pipeline-account> \
+     --cloudformation-execution-policies arn:aws:iam::aws:policy/AdministratorAccess
+   ```
+
+### First deploy
+
+The pipeline deploys itself once, from local credentials; after that it self-mutates:
+
+```bash
+export ECOMMERCE_DEV_ACCOUNT=<account>
+export ECOMMERCE_DEV_DOMAIN=dev.example.com
+export GITHUB_CONNECTION_ARN=arn:aws:codeconnections:ap-southeast-1:<account>:connection/<id>
+npx cdk --app "npx ts-node --prefer-ts-exts bin/pipeline.ts" deploy ecommerce-pipeline
+```
+
+Every `ECOMMERCE_*` variable set in that shell is forwarded into the pipeline's synth build, so the
+pipeline synthesises exactly the configuration you deployed — including `ECOMMERCE_DEV_NAT_GATEWAYS`.
+Adding `ECOMMERCE_UAT_ACCOUNT`/`ECOMMERCE_UAT_DOMAIN` (and their prod counterparts) to the deploying
+environment is all that is needed to grow the pipeline; the approval steps appear automatically.
+
+> **Pipeline runs un-pause dev.** A paused environment (see `PAUSE-RESUME.md`) is scaled to zero by
+> hand; a pipeline deploy reasserts the synthesized template — `desiredCount` returns to the
+> configured value and the NAT gateway returns unless `ECOMMERCE_DEV_NAT_GATEWAYS=0` was set when the
+> pipeline was deployed. Treat a push to `main` as a resume.
+
+---
+
+## Multi-account and cost guardrails (Phase 9)
+
+### Account structure
+
+The target end state is a dedicated management account plus member accounts per role:
+
+Accounts are named like a real organization — `<company>-<service>-<env>` for workloads,
+`<company>-<function>` for shared services (`ECOMMERCE_COMPANY` overrides the `acme` placeholder).
+OUs nest service → environment so each service OU is a team blast-radius boundary an SCP can
+scope to, and each environment OU keeps "prod is stricter than dev" expressible:
+
+```
+Root                     management account - payer + org admin only, no workloads
+├── workloads (OU)       one child OU per service
+│   └── ecommerce (OU)
+│       ├── dev    → acme-ecommerce-dev
+│       ├── uat    → acme-ecommerce-uat
+│       └── prod   → acme-ecommerce-prod
+├── security (OU)
+│   ├── acme-log-archive   org-wide CloudTrail/Config aggregation, immutable
+│   └── acme-audit         read-only security tooling access into every account
+└── tooling (OU)
+    └── acme-tooling       the pipeline + shared registry migrate here
+```
+
+A second service joins by adding it to `services` (`['ecommerce', 'payments']`) — it gets its own
+`workloads/payments/{dev,uat,prod}` OUs, and its accounts are `acme-payments-<env>`.
+
+Three org-wide SCPs are attached at the root (they bind every member account; the management
+account is always exempt): `deny-leave-organization`, `deny-audit-trail-tampering`
+(CloudTrail/Config/GuardDuty), and `deny-unapproved-regions` (`ECOMMERCE_ALLOWED_REGIONS`
+overrides the `ap-southeast-1,us-east-1` default; global services are exempted). OU-scoped SCPs —
+deny networking writes on `workloads`, deny destructive ops on the per-service `prod` OUs — need
+deploy-role exemptions and are the next iteration.
+
+The account you deploy into **becomes the management account** — today that is the account hosting
+dev + pipeline + registry, which is a valid starting point but not the end state: AWS best practice
+is a management account that runs nothing but billing and org administration, which is why dev,
+uat, prod, the security pair *and* tooling are all modelled as member accounts. Migrating an
+existing account's workloads into members happens over time (and the registry move is a `registry`
+location change in `bin/pipeline.ts` when the tooling account exists).
+
+`bin/organization.ts` synthesizes the structure — the organization, the OUs, and a member account
+for every `ECOMMERCE_<NAME>_ACCOUNT_EMAIL` set (`DEV`/`UAT`/`PROD`/`TOOLING`/`LOG_ARCHIVE`/`AUDIT`;
+AWS requires a unique email per account). Deploy it once, from the management account's credentials:
+
+```bash
+export ECOMMERCE_DEV_ACCOUNT_EMAIL=dev@example.com
+export ECOMMERCE_UAT_ACCOUNT_EMAIL=uat@example.com
+export ECOMMERCE_PROD_ACCOUNT_EMAIL=prod@example.com
+export ECOMMERCE_TOOLING_ACCOUNT_EMAIL=tooling@example.com
+export ECOMMERCE_LOG_ARCHIVE_ACCOUNT_EMAIL=logs@example.com
+export ECOMMERCE_AUDIT_ACCOUNT_EMAIL=audit@example.com
+npx cdk --app "npx ts-node --prefer-ts-exts bin/organization.ts" deploy ecommerce-organization
+```
+
+Each new account gets an `OrganizationAccountAccessRole`, and its id is exported
+(`ecommerce-<env>-account-id`). To activate the environment afterwards:
+
+1. Set `ECOMMERCE_<ENV>_ACCOUNT` to that id and `ECOMMERCE_<ENV>_DOMAIN` to a delegated subdomain.
+2. Bootstrap the account for CDK **with a trust back to the pipeline account** (both regions the
+   platform deploys to):
+
+   ```bash
+   cdk bootstrap aws://<env-account>/ap-southeast-1 --trust <pipeline-account>
+   cdk bootstrap aws://<env-account>/us-east-1     --trust <pipeline-account>
+   ```
+
+3. Push — the pipeline grows the `<env>` stage (behind a manual approval), the shared registry's
+   pull policy gains the account, and images promote into it untouched.
+
+The long-term shape moves the shared registry into a dedicated tooling account; today it lives in
+the pipeline/dev account, which is a `registry` location change plus redeploy when that account
+exists.
+
+### Cost guardrails
+
+Every environment deploys `ecommerce-cost-<env>`:
+
+- **Monthly budget** (`ecommerce-<env>-monthly`) scoped to the deploying account — an environment
+  *is* an account in this model. Notifications fire at **80% actual** (money spent) and **100%
+  forecasted** (the month ends over budget at the current rate — the earlier warning).
+- **Cost anomaly detection** — a `DIMENSIONAL`/service monitor plus a daily subscription, so
+  "EC2 doubled" reaches you rather than "spend is up".
+- **`Environment` cost category** — Cost Explorer can break the bill down by the platform's tag
+  contract directly, which is what produces the monthly per-environment report.
+- **`ecommerce-<env>-alerts`** — the shared SNS topic all of the above publish to, and the topic
+  Phase 7's alarm fan-out will reuse. With `ECOMMERCE_<ENV>_ALERT_EMAIL` set an email subscription
+  is created (it must be confirmed once, by hand, before alerts reach the inbox).
+
+For the failure modes these guardrails surface — and the rest of the known ones (task won't start,
+RDS failover, cert expiry, pipeline self-mutation, cross-account pull failures) — see `RUNBOOK.md`.
 
 ---
 
@@ -542,7 +752,7 @@ revision, and the service is redeployed onto it. The task definition here uses:
 | Memory | 1024 MiB | 2048 MiB |
 | Network mode | `awsvpc` (required by Fargate) | same |
 | Container port | 8080 | same |
-| Image | `<registry>/ecommerce-<env>-api:<tag>` | same |
+| Image | `<registry>/ecommerce-api:<tag>` | same |
 
 The JVM needs more headroom than a typical process, which is why the smallest Fargate size (256 CPU
 / 512 MiB) is not used: 512/1024 comfortably runs a Spring Boot API, and production is sized up.
@@ -1121,9 +1331,9 @@ cross-origin part. In dev the SPA runs on `http://localhost:5173` and the API on
 ### Building and deploying it
 
 The image is built in two stages: a `node` stage runs `nuxt generate`, and the result is copied into
-an `nginx-unprivileged` runtime stage. The API base URL is baked in at build time (there is no server
-to read runtime configuration from), so it is a build argument. `frontend/scripts/deploy.sh` does the
-whole thing:
+an `nginx-unprivileged` runtime stage. The SPA derives its API origin at runtime from the host it is
+served on (apex → `api.<apex>`), so the image needs no per-environment build argument and the
+identical artifact promotes between environments. `frontend/scripts/deploy.sh` does the whole thing:
 
 ```bash
 ECOMMERCE_DEV_DOMAIN=dev.example.com ./scripts/deploy.sh dev
@@ -1131,8 +1341,9 @@ ECOMMERCE_DEV_DOMAIN=dev.example.com ./scripts/deploy.sh dev
 ```
 
 The runtime stage runs as a non-root user on port 8080, and renders its nginx configuration from a
-template at start, so the image itself is environment-agnostic. See `frontend/README.md` for the app
-itself.
+template at start — including the Content-Security-Policy from the `API_ORIGIN` the task definition
+passes — which is the rest of what keeps the image environment-agnostic. See `frontend/README.md` for
+the app itself.
 
 ---
 
@@ -1336,24 +1547,24 @@ The configured tag is `v0.1.0` (`application.imageTag`). It can be overridden pe
 editing source, via `-c imageTag=<tag>` or the `IMAGE_TAG` environment variable.
 
 ```bash
-# 1. Deploy the registry first, so the repository exists.
-npx cdk deploy ecommerce-ecr-dev -c environment=dev
+# 1. Deploy the shared registry first, so the repository exists.
+npx cdk deploy ecommerce-ecr -c environment=dev
 
 # 2. Build the image and tag it with the registry URI and the immutable tag.
 docker build -t ecommerce-api:v0.1.0 application
-docker tag ecommerce-api:v0.1.0 <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-dev-api:v0.1.0
+docker tag ecommerce-api:v0.1.0 <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-api:v0.1.0
 
 # 3. Authenticate Docker to ECR and push.
 aws ecr get-login-password --region ap-southeast-1 \
   | docker login --username AWS --password-stdin <account>.dkr.ecr.ap-southeast-1.amazonaws.com
-docker push <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-dev-api:v0.1.0
+docker push <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-api:v0.1.0
 
 # 4. Deploy the compute; the service now finds the image and starts a task.
 npx cdk deploy ecommerce-application-dev -c environment=dev
 ```
 
 `<account>` is the AWS account id. The repository URI is exported as
-`ecommerce-dev-ecr-repository-uri` if you would rather read it from the stack than construct it.
+`ecommerce-ecr-repository-uri` if you would rather read it from the stack than construct it.
 
 To ship a new version, push a **new** tag (for example `v0.2.0`) and deploy with
 `-c imageTag=v0.2.0`. Reusing a tag means a task replacement may run a different image than the one
@@ -1655,8 +1866,8 @@ account without clashing.
 | Network | `AlbSecurityGroupId` | `ecommerce-dev-alb-security-group-id` | Phase 2 load balancer |
 | Network | `ApplicationSecurityGroupId` | `ecommerce-dev-application-security-group-id` | Phase 2 ECS service |
 | Network | `DatabaseSecurityGroupId` | `ecommerce-dev-database-security-group-id` | Phase 3 RDS |
-| Registry | `RepositoryUri` | `ecommerce-dev-ecr-repository-uri` | image push |
-| Registry | `RepositoryName` | `ecommerce-dev-ecr-repository-name` | image push |
+| Registry | `RepositoryUri` | `ecommerce-ecr-repository-uri` | image push |
+| Registry | `RepositoryName` | `ecommerce-ecr-repository-name` | image push |
 | Database | `DatabaseEndpoint` | `ecommerce-dev-db-endpoint` | ECS task env `DB_HOST` |
 | Database | `DatabasePort` | `ecommerce-dev-db-port` | ECS task env `DB_PORT` |
 | Database | `DatabaseName` | `ecommerce-dev-db-name` | ECS task env `DB_NAME` |
@@ -1797,8 +2008,8 @@ Then deploy one environment at a time, in dependency order:
 # 1. Network foundation (VPC, subnets, security groups)
 npx cdk deploy ecommerce-network-dev -c environment=dev
 
-# 2. Registry (must exist before an image can be pushed)
-npx cdk deploy ecommerce-ecr-dev -c environment=dev
+# 2. Shared registry (must exist before an image can be pushed)
+npx cdk deploy ecommerce-ecr -c environment=dev
 
 # 3. Database (instance + generated credentials secret)
 npx cdk deploy ecommerce-database-dev -c environment=dev
@@ -1849,8 +2060,10 @@ Things that are easy to get wrong:
 - **Deploying is not free:** NAT Gateways, an ALB, a running Fargate task and an RDS instance all
   bill hourly.
 
-Deployment is **not** performed automatically by this repository: nothing in the build or test path
-runs `cdk deploy`.
+Deployment is not performed by the test path, but since Phase 8 the **pipeline** deploys on every
+push to `main` — see [CI/CD pipeline](#cicd-pipeline-phase-8). Manual deploys remain available for
+targeted work, with stacks now selected under their stage path (`dev/ecommerce-network-dev`) or by
+stack name as below.
 
 ---
 
@@ -1865,7 +2078,7 @@ Everything below is a manual operator action; nothing in this repository deploys
 export ECOMMERCE_DEV_ACCOUNT=<account>       # PowerShell: $env:ECOMMERCE_DEV_ACCOUNT = "<account>"
 
 npx cdk deploy ecommerce-network-dev    -c environment=dev
-npx cdk deploy ecommerce-ecr-dev        -c environment=dev
+npx cdk deploy ecommerce-ecr             -c environment=dev
 npx cdk deploy ecommerce-database-dev   -c environment=dev
 ```
 
@@ -1910,10 +2123,10 @@ There must be **no** `0.0.0.0/0` rule on the database security group.
 
 ```bash
 docker build -t ecommerce-api:v0.1.0 application
-docker tag ecommerce-api:v0.1.0 <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-dev-api:v0.1.0
+docker tag ecommerce-api:v0.1.0 <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-api:v0.1.0
 aws ecr get-login-password --region ap-southeast-1 \
   | docker login --username AWS --password-stdin <account>.dkr.ecr.ap-southeast-1.amazonaws.com
-docker push <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-dev-api:v0.1.0
+docker push <account>.dkr.ecr.ap-southeast-1.amazonaws.com/ecommerce-api:v0.1.0
 
 npx cdk deploy ecommerce-application-dev -c environment=dev
 ```
@@ -1979,7 +2192,7 @@ npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev   # the us-east-1 certificate
 npx cdk destroy ecommerce-dns-dev         -c environment=dev   # only when a domain was configured
 npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
-npx cdk destroy ecommerce-ecr-dev         -c environment=dev
+npx cdk destroy ecommerce-ecr             -c environment=dev   # shared registry: RETAINed, delete repos by hand
 npx cdk destroy ecommerce-network-dev     -c environment=dev
 ```
 

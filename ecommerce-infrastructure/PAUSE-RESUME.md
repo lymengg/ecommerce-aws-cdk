@@ -20,12 +20,18 @@ are stopped: the database, the Fargate tasks, and the NAT gateway.
 | Route 53 zone, Secrets Manager, ACM certs, Cognito pool + custom domain, ECR | kept | ~$1.30/mo | ~$1.30/mo |
 | **Total** | | **~$22/mo** | **~$117/mo** |
 
-All eight stacks remain deployed while paused. The site answers (the ALB and the managed login page
+All nine stacks remain deployed while paused. The site answers (the ALB and the managed login page
 stay up) but returns 503/empty responses — that is expected, not a bug.
 
 > **RDS auto-restarts after 7 days** — an AWS limit on stopped instances, not a bug. If the
 > environment stays paused longer, either stop it again each week or accept ~$18/mo of compute
 > billing once it comes back.
+
+> **A pipeline run un-pauses dev.** The Phase 8 pipeline deploys the synthesized template on every
+> push to `main`, which reasserts `desiredCount` (services scale back to 1) and the configured NAT
+> gateway count — unless the pipeline was deployed with `ECOMMERCE_DEV_NAT_GATEWAYS=0` in its
+> environment, in which case the NAT stays gone but the tasks still come back. Treat a push to
+> `main` as a resume: pause again afterwards if the environment should stay down.
 
 ## Pause
 
@@ -41,6 +47,7 @@ aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-a
 aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-frontend --desired-count 0
 
 # 3. Remove the NAT gateway and its Elastic IP (~2 min)
+#    (stacks live under the `dev/` stage path from Phase 8 on; the bare stack name still works)
 ECOMMERCE_DEV_NAT_GATEWAYS=0 \
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io \
 ECOMMERCE_DEV_ACCOUNT=572396340039 \
