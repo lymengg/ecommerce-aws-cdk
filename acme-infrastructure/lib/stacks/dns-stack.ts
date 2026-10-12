@@ -4,6 +4,7 @@ import { CfnHostedZone, HostedZone, IHostedZone } from 'aws-cdk-lib/aws-route53'
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
+import { DNS_EXPORTS, foundationExportName } from '../foundation-exports';
 import { applyPlatformTags } from '../tags';
 
 export interface DnsStackProps extends StackProps {
@@ -97,13 +98,13 @@ export class DnsStack extends Stack {
    * one account.
    */
   private createOutputs(config: EnvironmentConfig): void {
-    const exportPrefix = `acme-${config.environment}`;
+    const exportName = (key: string) => foundationExportName(config.environment, key);
 
     // The zone id is what service stacks import to write their own records into the shared zone.
     new CfnOutput(this, 'HostedZoneId', {
       value: this.zone.hostedZoneId,
       description: 'Id of the public hosted zone services attach their records to',
-      exportName: `${exportPrefix}-hosted-zone-id`,
+      exportName: exportName(DNS_EXPORTS.hostedZoneId),
     });
 
     new CfnOutput(this, 'HostedZoneNameServers', {
@@ -111,19 +112,19 @@ export class DnsStack extends Stack {
       // than Array.join: the latter would stringify the list token itself.
       value: Fn.join(',', this.zone.hostedZoneNameServers ?? []),
       description: 'Name servers to add as NS records at the registrar to delegate the subdomain',
-      exportName: `${exportPrefix}-hosted-zone-name-servers`,
+      exportName: exportName(DNS_EXPORTS.hostedZoneNameServers),
     });
 
     new CfnOutput(this, 'CertificateArn', {
       value: this.certificate.certificateArn,
       description: 'ARN of the ACM certificate covering the API domain',
-      exportName: `${exportPrefix}-certificate-arn`,
+      exportName: exportName(DNS_EXPORTS.certificateArn),
     });
 
     new CfnOutput(this, 'ApiDomainName', {
       value: this.apiDomainName,
       description: 'Fully qualified domain name the API answers on',
-      exportName: `${exportPrefix}-api-domain-name`,
+      exportName: exportName(DNS_EXPORTS.apiDomainName),
     });
   }
 }

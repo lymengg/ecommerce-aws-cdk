@@ -240,8 +240,10 @@ aws-cdk/
 │   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB + auth wiring, IAM
 │   │   ├── ecommerce-stage.ts        # SharedRegistryStage + EcommerceStage (the service, per env)
 │   │   ├── platform-stage.ts         # PlatformStage: the shared network + DNS foundation per env
+│   │   ├── foundation-exports.ts     # the acme-<env>-* export names both sides of the boundary use
 │   │   ├── stacks/
-│   │   │   ├── network-stack.ts      # VPC, public/private/isolated subnets, routing, SGs
+│   │   │   ├── network-stack.ts      # shared VPC, subnets, routing, flow logs (platform-owned)
+│   │   │   ├── security-stack.ts     # service-owned tier SGs + the shared-foundation imports
 │   │   │   ├── ecr-stack.ts          # container registry
 │   │   │   ├── pipeline-stack.ts     # self-mutating CDK Pipeline (Phase 8)
 │   │   │   ├── database-stack.ts     # RDS PostgreSQL instance + Secrets Manager credentials
@@ -323,7 +325,7 @@ by every service in the environment):
 
 | Stack | Name | Creates |
 | ----- | ---- | ------- |
-| Network | `acme-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
+| Network | `acme-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, flow logs — no security groups: those are a service's own rulebook |
 | DNS | `acme-dns-<env>` | Route 53 hosted zone, ACM certificate |
 | Registry | `acme-ecr` | **Shared** ECR repositories (`ecommerce-api`, `ecommerce-frontend`), one pair for every environment |
 
@@ -331,6 +333,7 @@ Service stacks (`bin/ecommerce.ts` — the ecommerce service's own resources):
 
 | Stack | Name | Creates |
 | ----- | ---- | ------- |
+| Security | `ecommerce-security-<env>` | The attachment point: imports the shared VPC/zone/certificate and creates the service's own ALB / application / database security groups inside it |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
 | Auth certificate | `ecommerce-auth-cert-<env>` | ACM certificate for `auth.<env-domain>` in `us-east-1`, the only region a Cognito custom domain reads certificates from |
 | Cognito | `ecommerce-cognito-<env>` | Cognito user pool, confidential app client, client-secret secret, baseline alarm |
@@ -397,12 +400,12 @@ the auth domain, so there is no path back and the graph stays acyclic. One manua
 that order: the zone must be delegated at the registrar (see
 [Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificates finish issuing.
 
-The application stack consumes the network stack's VPC and security groups, the registry stack's
-repository, the database stack's endpoint and credentials secret, the DNS stack's zone and
-certificate, and the Cognito stack's user pool, app client and client secret **by reference** (CDK
-cross-stack references); the frontend stacks consume the zone and the certificate the same way. The
-CDK CLI orders the stacks automatically and there is exactly one definition of each resource. No ARN
-is ever plumbed between stacks as a string.
+The application stack consumes the security stack's VPC import and service-owned security groups,
+the registry stack's repository (by location), the database stack's endpoint and credentials
+secret, the imported zone and certificate, and the Cognito stack's user pool, app client and
+client secret **by reference** (CDK cross-stack references); the frontend stacks consume the zone
+and the certificate the same way. The CDK CLI orders the stacks automatically and there is exactly
+one definition of each resource. No ARN is ever plumbed between stacks as a string.
 
 > Cross-stack references use **weak** strength (`"@aws-cdk/core:defaultCrossStackReferences": "weak"`
 > in `cdk.json`). A weak reference reads the producer's output directly instead of locking an export
@@ -421,7 +424,7 @@ deploys its own stacks on top.
 | ----- | -------- | ------------------ |
 | `registry` | `acme-ecr` | The shared registry: deployed once, not per environment. In the pipeline the image-build step sits between this stage and the first environment, which is only possible if the registry is its own stage. |
 | `<env>-foundation` (`dev-foundation`) | `acme-network-<env>`, `acme-dns-<env>` | The platform team's per-environment foundation: every service attaches to this VPC and writes records into this zone. Separate so a service team never deploys networking. |
-| `<env>` (`dev`) | the seven `ecommerce-*` stacks | The service stage: everything the ecommerce service owns. It imports the foundation's `acme-<env>-*` exports with `Fn.importValue`, so deploy fails fast if the foundation is missing. |
+| `<env>` (`dev`) | the eight `ecommerce-*` stacks | The service stage: everything the ecommerce service owns. `ecommerce-security-<env>` is the single attachment point - it imports the foundation's `acme-<env>-*` exports with `Fn.importValue` and creates the service's own security groups, so deploy fails fast if the foundation is missing. |
 
 The service stage consumes the repositories **by location** — `{account, region}` + the fixed
 names `ecommerce-api` / `ecommerce-frontend`, imported with `Repository.fromRepositoryAttributes` —
@@ -450,7 +453,7 @@ Source (CodeConnections -> GitHub)
                       deploy acme-ecr (the shared repositories)
   -> dev-foundation   pre: BuildImages (docker build x2 -> push :<commit SHA>, once)
                       deploy acme-network-dev + acme-dns-dev (shared VPC and zone)
-  -> dev              deploy the seven ecommerce-* stacks (import the foundation's exports)
+  -> dev              deploy the eight ecommerce-* stacks (import the foundation's exports)
                       post: SmokeTests-dev (curl the health, auth and 401 checks)
   -> uat-foundation   pre: manual approval - promotes the identical images
   -> uat
@@ -1887,9 +1890,6 @@ account without clashing.
 | Network | `PublicSubnetIds` | `acme-dev-public-subnet-ids` | ALB, NAT placement |
 | Network | `PrivateSubnetIds` | `acme-dev-private-subnet-ids` | ECS tasks |
 | Network | `DatabaseSubnetIds` | `acme-dev-database-subnet-ids` | RDS DB subnet group |
-| Network | `AlbSecurityGroupId` | `acme-dev-alb-security-group-id` | load balancers |
-| Network | `ApplicationSecurityGroupId` | `acme-dev-application-security-group-id` | ECS services |
-| Network | `DatabaseSecurityGroupId` | `acme-dev-database-security-group-id` | RDS |
 | Registry | `RepositoryUri` | `acme-ecr-repository-uri` | image push |
 | Registry | `RepositoryName` | `acme-ecr-repository-name` | image push |
 | Database | `DatabaseEndpoint` | `ecommerce-dev-db-endpoint` | ECS task env `DB_HOST` |
@@ -2142,10 +2142,10 @@ aws ec2 describe-route-tables \
 
 ```bash
 aws ec2 describe-security-groups \
-  --group-ids "$(aws cloudformation list-exports \
-      --query "Exports[?Name=='acme-dev-database-security-group-id'].Value" --output text)" \
+  --filters "Name=description,Values=Database tier, private subnets only" \
   --query "SecurityGroups[0].IpPermissions"
 # exactly one rule: TCP 5432, SourceSecurityGroupId = the application security group, no CidrIp
+# (the group lives in ecommerce-security-dev - service-owned, not exported by the platform)
 ```
 
 There must be **no** `0.0.0.0/0` rule on the database security group.
@@ -2222,6 +2222,8 @@ npx cdk destroy ecommerce-frontend-dev    -c environment=dev
 npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev   # the us-east-1 certificate
 npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
+npx cdk destroy ecommerce-cognito-dev     -c environment=dev   # only if the user pool should go too
+npx cdk destroy ecommerce-security-dev    -c environment=dev   # last: its SGs are what the others referenced
 npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" destroy acme-ecr   # shared registry: RETAINed, delete repos by hand
 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-dns-dev -c environment=dev   # only when a domain was configured
 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-network-dev -c environment=dev
@@ -2338,6 +2340,7 @@ npx cdk destroy ecommerce-frontend-dev    -c environment=dev
 npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-cognito-dev     -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev
+npx cdk destroy ecommerce-security-dev    -c environment=dev   # last: the other stacks referenced its SGs
 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-dns-dev -c environment=dev
 # then: delete the NS records for dev.example.com at the registrar by hand
 ```

@@ -4,6 +4,7 @@ import { Template } from 'aws-cdk-lib/assertions';
 import { getEnvironmentConfig } from '../lib/config';
 import { EnvironmentName } from '../lib/config/types';
 import { DatabaseStack } from '../lib/stacks/database-stack';
+import { TierSecurityGroups } from '../lib/constructs/tier-security-groups';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
 /**
@@ -34,11 +35,12 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
+  const securityGroups = new TierSecurityGroups(network, 'SecurityGroups', { vpc: network.vpc });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,
     vpc: network.vpc,
-    databaseSecurityGroup: network.securityGroups.database,
+    databaseSecurityGroup: securityGroups.database,
   });
 
   return { template: Template.fromStack(database), network, database };

@@ -3,8 +3,8 @@ import { IpAddresses, ISubnet, SubnetType, Vpc } from 'aws-cdk-lib/aws-ec2';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
-import { TierSecurityGroups } from '../constructs/tier-security-groups';
 import { VpcFlowLogs } from '../constructs/vpc-flow-logs';
+import { foundationExportName, NETWORK_EXPORTS } from '../foundation-exports';
 import { applyPlatformTags } from '../tags';
 
 /** CIDR mask for every subnet. /24 leaves 254 usable addresses per subnet. */
@@ -39,22 +39,19 @@ export interface NetworkStackProps extends StackProps {
  * of any one service.
  *
  * Creates the VPC, public and private subnets spread over the configured Availability Zones, the
- * internet and NAT gateways with the route tables that connect them, and the three tier security
- * groups services attach their resources to. Every service in the environment shares this VPC -
- * one NAT gateway bill for the whole environment, and the platform team owns the only place
- * networking is defined. It deliberately creates no compute, database or load balancer resources:
- * services consume this stack's exports via `Fn.importValue` and attach.
+ * internet and NAT gateways with the route tables that connect them. Every service in the
+ * environment shares this VPC - one NAT gateway bill for the whole environment, and the platform
+ * team owns the only place networking is defined. It deliberately creates no compute, database,
+ * load balancer or SECURITY GROUP resources: a security group is a service's own rulebook, so
+ * services import the subnet ids via `Fn.importValue` and attach groups of their own.
  *
  * Phase 3 added the isolated `database` subnet group. It is the smallest change that gives the
  * database tier a network of its own - the public and private application subnets are untouched, so
  * nothing built in Phase 1 or Phase 2 moved.
  */
 export class NetworkStack extends Stack {
-  /** The VPC every later stack places its resources in. */
+  /** The VPC every service in the environment attaches its resources to. */
   public readonly vpc: Vpc;
-
-  /** Security groups for the ALB, application and database tiers. */
-  public readonly securityGroups: TierSecurityGroups;
 
   /** Public subnets, one per Availability Zone. Host internet facing resources (ALB, NAT). */
   public readonly publicSubnets: ISubnet[];
@@ -121,8 +118,6 @@ export class NetworkStack extends Stack {
     this.privateSubnets = this.vpc.privateSubnets;
     this.databaseSubnets = this.vpc.isolatedSubnets;
 
-    this.securityGroups = new TierSecurityGroups(this, 'SecurityGroups', { vpc: this.vpc });
-
     if (config.flowLogs.enabled) {
       new VpcFlowLogs(this, 'FlowLogs', {
         vpc: this.vpc,
@@ -149,48 +144,30 @@ export class NetworkStack extends Stack {
    * and `acme-` prefixed because the network is platform infrastructure, not a service resource.
    */
   private createOutputs(config: EnvironmentConfig): void {
-    const exportPrefix = `acme-${config.environment}`;
+    const exportName = (key: string) => foundationExportName(config.environment, key);
 
     new CfnOutput(this, 'VpcId', {
       value: this.vpc.vpcId,
       description: 'Id of the VPC',
-      exportName: `${exportPrefix}-vpc-id`,
+      exportName: exportName(NETWORK_EXPORTS.vpcId),
     });
 
     new CfnOutput(this, 'PublicSubnetIds', {
       value: Fn.join(',', this.publicSubnets.map((subnet) => subnet.subnetId)),
       description: 'Comma separated ids of the public subnets, one per Availability Zone',
-      exportName: `${exportPrefix}-public-subnet-ids`,
+      exportName: exportName(NETWORK_EXPORTS.publicSubnetIds),
     });
 
     new CfnOutput(this, 'PrivateSubnetIds', {
       value: Fn.join(',', this.privateSubnets.map((subnet) => subnet.subnetId)),
       description: 'Comma separated ids of the private subnets, one per Availability Zone',
-      exportName: `${exportPrefix}-private-subnet-ids`,
+      exportName: exportName(NETWORK_EXPORTS.privateSubnetIds),
     });
 
     new CfnOutput(this, 'DatabaseSubnetIds', {
       value: Fn.join(',', this.databaseSubnets.map((subnet) => subnet.subnetId)),
       description: 'Comma separated ids of the isolated database subnets, one per Availability Zone',
-      exportName: `${exportPrefix}-database-subnet-ids`,
-    });
-
-    new CfnOutput(this, 'AlbSecurityGroupId', {
-      value: this.securityGroups.alb.securityGroupId,
-      description: 'Security group for the Application Load Balancer tier',
-      exportName: `${exportPrefix}-alb-security-group-id`,
-    });
-
-    new CfnOutput(this, 'ApplicationSecurityGroupId', {
-      value: this.securityGroups.application.securityGroupId,
-      description: 'Security group for the application tier (ECS tasks)',
-      exportName: `${exportPrefix}-application-security-group-id`,
-    });
-
-    new CfnOutput(this, 'DatabaseSecurityGroupId', {
-      value: this.securityGroups.database.securityGroupId,
-      description: 'Security group for the database tier (RDS, ElastiCache)',
-      exportName: `${exportPrefix}-database-security-group-id`,
+      exportName: exportName(NETWORK_EXPORTS.databaseSubnetIds),
     });
   }
 }

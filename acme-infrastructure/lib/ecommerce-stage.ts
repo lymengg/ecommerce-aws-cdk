@@ -1,7 +1,4 @@
-import { App, Fn, Stage, StageProps } from 'aws-cdk-lib';
-import { Certificate, ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
-import { ISecurityGroup, IVpc, SecurityGroup, Vpc } from 'aws-cdk-lib/aws-ec2';
-import { HostedZone, IHostedZone } from 'aws-cdk-lib/aws-route53';
+import { App, Stage, StageProps } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig, resolveImageTag } from './config';
@@ -13,7 +10,7 @@ import { CostStack } from './stacks/cost-stack';
 import { DatabaseStack } from './stacks/database-stack';
 import { EcrStack, RegistryLocation } from './stacks/ecr-stack';
 import { FrontendStack } from './stacks/frontend-stack';
-import { availabilityZoneTokens } from './stacks/network-stack';
+import { EcommerceSecurityStack } from './stacks/security-stack';
 
 /**
  * The one region Cognito custom domains can read a certificate from. A custom domain is fronted by
@@ -82,66 +79,6 @@ export class SharedRegistryStage extends Stage {
   }
 }
 
-/**
- * The platform exports a service stage imports, resolved through `Fn.importValue` at deploy time.
- * They are construct imports rather than construct references for the same boundary reason as the
- * registry: the platform foundation lives in {@link PlatformStage} (`acme-network-*`,
- * `acme-dns-*`), deployed by `bin/platform.ts`, and stack references cannot cross a stage
- * boundary. The exports are the contract - if the platform stage has not been deployed, the
- * service deploy fails on the missing export instead of drifting silently.
- */
-interface ImportedFoundation {
-  readonly vpc: IVpc;
-  readonly albSecurityGroup: ISecurityGroup;
-  readonly applicationSecurityGroup: ISecurityGroup;
-  readonly databaseSecurityGroup: ISecurityGroup;
-  readonly zone: IHostedZone;
-  readonly certificate: ICertificate;
-  readonly apiDomainName: string;
-}
-
-function importFoundation(scope: Construct, config: EnvironmentConfig): ImportedFoundation {
-  const { environment, dns } = config;
-  const exportPrefix = `acme-${environment}`;
-  const importValue = (name: string) => Fn.importValue(`${exportPrefix}-${name}`);
-
-  // The zone names are resolved exactly as the platform stack creates them: the first `maxAzs`
-  // zones of the region. The subnet lists are exported comma-joined, so each id is selected by
-  // index - the list must be `maxAzs` long at synth time or `fromVpcAttributes` cannot pair each
-  // subnet with its zone. The count must match the platform's subnet count or the imported VPC's
-  // subnet-to-AZ mapping is wrong.
-  const subnetIds = (exportName: string) => {
-    const joined = Fn.split(',', importValue(exportName));
-    return Array.from({ length: config.maxAzs }, (_, index) => Fn.select(index, joined));
-  };
-
-  const vpc = Vpc.fromVpcAttributes(scope, 'SharedVpc', {
-    vpcId: importValue('vpc-id'),
-    availabilityZones: availabilityZoneTokens(config.maxAzs),
-    publicSubnetIds: subnetIds('public-subnet-ids'),
-    privateSubnetIds: subnetIds('private-subnet-ids'),
-    isolatedSubnetIds: subnetIds('database-subnet-ids'),
-  });
-
-  const securityGroup = (id: string, exportName: string) =>
-    SecurityGroup.fromSecurityGroupId(scope, id, importValue(exportName));
-
-  return {
-    vpc,
-    albSecurityGroup: securityGroup('SharedAlbSg', 'alb-security-group-id'),
-    applicationSecurityGroup: securityGroup('SharedApplicationSg', 'application-security-group-id'),
-    databaseSecurityGroup: securityGroup('SharedDatabaseSg', 'database-security-group-id'),
-    // zoneName comes from configuration, not an export: it is a known value (`ouklymeng.qzz.io`),
-    // only the zone id is a deploy-time fact.
-    zone: HostedZone.fromHostedZoneAttributes(scope, 'SharedZone', {
-      hostedZoneId: importValue('hosted-zone-id'),
-      zoneName: dns!.zoneName,
-    }),
-    certificate: Certificate.fromCertificateArn(scope, 'SharedCertificate', importValue('certificate-arn')),
-    apiDomainName: `${dns!.apiSubdomain}.${dns!.zoneName}`,
-  };
-}
-
 export interface EcommerceStageProps extends StageProps {
   /** Environment specific configuration. No environment value is hardcoded in this stage. */
   readonly config: EnvironmentConfig;
@@ -158,14 +95,15 @@ export interface EcommerceStageProps extends StageProps {
  * These are the stacks the service team owns - `ecommerce-*` resources inside the shared
  * environment account.
  *
- * The service attaches to platform-owned foundations rather than building its own: the VPC and
- * tier security groups come from `acme-network-<env>`, the hosted zone and certificate from
- * `acme-dns-<env>` - both imported by `Fn.importValue` (see {@link importFoundation}). The service
- * still OWNS its own records and its own security posture: it writes `api.<zone>` and the apex
- * alias into the shared zone, and the tier security groups are the shared contract every service
- * in the environment attaches to.
+ * The service attaches to platform-owned foundations rather than building its own: the shared
+ * VPC and the hosted zone and certificate are imported by `Fn.importValue` in
+ * {@link EcommerceSecurityStack}, the one stack that touches the `acme-<env>-*` exports. The
+ * service still OWNS its own security posture: its security groups are created in that stack, not
+ * shared - sharing the tier groups would let any service in the environment reach this one's
+ * database.
  */
 export class EcommerceStage extends Stage {
+  public readonly security: EcommerceSecurityStack;
   public readonly database: DatabaseStack;
   public readonly authCertificate: AuthCertificateStack;
   public readonly cognito: CognitoStack;
@@ -187,21 +125,30 @@ export class EcommerceStage extends Stage {
       throw new Error(`Phase 4 authentication requires a delegated domain for environment "${environment}".`);
     }
 
-    // Phase 4 authentication is created FIRST: the user pool and the confidential app client the
-    // BFF authenticates as need nothing from the platform foundation, and every later stack
-    // consumes the pool.
+    // The attachment point is created FIRST: it is the only stack that imports the platform's
+    // `acme-<env>-*` exports, and it creates the service's own security groups in the shared VPC.
+    // Every later stack consumes the imported vpc/zone/certificate and the service-owned security
+    // groups as ordinary cross-stack references within the stage.
+    this.security = new EcommerceSecurityStack(this, `ecommerce-security-${environment}`, {
+      env,
+      stackName: `ecommerce-security-${environment}`,
+      config,
+      description: `E-commerce service security groups and shared-foundation imports (${environment})`,
+    });
+
+    // Phase 4 authentication. The user pool and the confidential app client the BFF authenticates
+    // as live ahead of the compute that consumes them, so the pool can be retained and its users
+    // survive a redeployment of the application.
+    //
+    // The app client needs the API's fully qualified domain name for its exact callback URIs, so it
+    // is derived from `config.dns` (never imported as a string). Deploy order is therefore
+    // dns -> cognito -> application.
     this.cognito = new CognitoStack(this, `ecommerce-cognito-${environment}`, {
       env,
       stackName: `ecommerce-cognito-${environment}`,
       config,
       description: `E-commerce platform authentication (${environment})`,
     });
-
-    // Imported constructs must live in a stack scope (a Stage is not one). Cognito is the anchor
-    // because it is the only service stack with no foundation inputs of its own: the imported VPC,
-    // security groups, zone and certificate are created inside it and handed to the other stacks
-    // as ordinary cross-stack references within the stage.
-    const foundation = importFoundation(this.cognito, config);
 
     // The database stack owns the RDS instance and the secret holding its credentials. It needs the
     // network (VPC and database security group) and nothing else, so it can be deployed
@@ -210,8 +157,8 @@ export class EcommerceStage extends Stage {
       env,
       stackName: `ecommerce-database-${environment}`,
       config,
-      vpc: foundation.vpc,
-      databaseSecurityGroup: foundation.databaseSecurityGroup,
+      vpc: this.security.vpc,
+      databaseSecurityGroup: this.security.securityGroups.database,
       description: `E-commerce platform PostgreSQL database (${environment})`,
     });
 
@@ -223,7 +170,7 @@ export class EcommerceStage extends Stage {
       crossRegionReferences: true,
       stackName: `ecommerce-auth-cert-${environment}`,
       config,
-      zone: foundation.zone,
+      zone: this.security.zone,
       description: `E-commerce platform Cognito custom domain certificate (${environment})`,
     });
 
@@ -241,10 +188,10 @@ export class EcommerceStage extends Stage {
       env,
       stackName: `ecommerce-application-${environment}`,
       config,
-      vpc: foundation.vpc,
+      vpc: this.security.vpc,
       registry: props.registry,
-      albSecurityGroup: foundation.albSecurityGroup,
-      applicationSecurityGroup: foundation.applicationSecurityGroup,
+      albSecurityGroup: this.security.securityGroups.alb,
+      applicationSecurityGroup: this.security.securityGroups.application,
       database: {
         host: this.database.instance.dbInstanceEndpointAddress,
         port: this.database.instance.dbInstanceEndpointPort,
@@ -252,9 +199,9 @@ export class EcommerceStage extends Stage {
         secret: this.database.credentialsSecret,
       },
       dns: {
-        zone: foundation.zone,
-        certificate: foundation.certificate,
-        domainName: foundation.apiDomainName,
+        zone: this.security.zone,
+        certificate: this.security.certificate,
+        domainName: this.security.apiDomainName,
       },
       auth: {
         issuerUrl: this.cognito.issuerUrl,
@@ -280,11 +227,11 @@ export class EcommerceStage extends Stage {
       config,
       registry: props.registry,
       cluster: this.application.cluster,
-      applicationSecurityGroup: foundation.applicationSecurityGroup,
+      applicationSecurityGroup: this.security.securityGroups.application,
       loadBalancer: this.application.api.loadBalancer,
-      albSecurityGroup: foundation.albSecurityGroup,
+      albSecurityGroup: this.security.securityGroups.alb,
       httpsListener,
-      zone: foundation.zone,
+      zone: this.security.zone,
       description: `E-commerce platform frontend hosting (${environment})`,
     });
 
@@ -301,7 +248,7 @@ export class EcommerceStage extends Stage {
       config,
       userPool: this.cognito.userPool,
       certificate: this.authCertificate.certificate,
-      zone: foundation.zone,
+      zone: this.security.zone,
       description: `E-commerce platform Cognito custom domain (${environment})`,
     });
     this.authDomain.addStackDependency(this.frontend);

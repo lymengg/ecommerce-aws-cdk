@@ -8,6 +8,7 @@ import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { RegistryLocation } from '../lib/stacks/ecr-stack';
 import { FrontendStack } from '../lib/stacks/frontend-stack';
+import { TierSecurityGroups } from '../lib/constructs/tier-security-groups';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
 /**
@@ -44,11 +45,12 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
+  const securityGroups = new TierSecurityGroups(network, 'SecurityGroups', { vpc: network.vpc });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,
     vpc: network.vpc,
-    databaseSecurityGroup: network.securityGroups.database,
+    databaseSecurityGroup: securityGroups.database,
   });
   const dns = new DnsStack(app, `test-dns-${environment}`, { env, config });
   const application = new ApplicationStack(app, `test-application-${environment}`, {
@@ -56,8 +58,8 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
     config,
     vpc: network.vpc,
     registry: TEST_REGISTRY,
-    albSecurityGroup: network.securityGroups.alb,
-    applicationSecurityGroup: network.securityGroups.application,
+    albSecurityGroup: securityGroups.alb,
+    applicationSecurityGroup: securityGroups.application,
     database: {
       host: database.instance.dbInstanceEndpointAddress,
       port: database.instance.dbInstanceEndpointPort,
@@ -78,9 +80,9 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
     config,
     registry: TEST_REGISTRY,
     cluster: application.cluster,
-    applicationSecurityGroup: network.securityGroups.application,
+    applicationSecurityGroup: securityGroups.application,
     loadBalancer: application.api.loadBalancer,
-    albSecurityGroup: network.securityGroups.alb,
+    albSecurityGroup: securityGroups.alb,
     httpsListener: application.api.httpsListener!,
     zone: dns.zone,
   });

@@ -97,6 +97,7 @@ describe('PipelineStack', () => {
     expect(devActions[devActions.length - 1]).toBe('SmokeTests-dev');
     // The service stage keeps every stack the manual workflow deploys, under its live stack name.
     for (const stack of [
+      'ecommerce-security-dev',
       'ecommerce-cognito-dev',
       'ecommerce-auth-cert-dev',
       'ecommerce-database-dev',
@@ -164,6 +165,7 @@ describe('Environment stages', () => {
 
     expect(platform.network.stackName).toBe('acme-network-dev');
     expect(platform.dns.stackName).toBe('acme-dns-dev');
+    expect(service.security.stackName).toBe('ecommerce-security-dev');
     expect(service.database.stackName).toBe('ecommerce-database-dev');
     expect(service.authCertificate.stackName).toBe('ecommerce-auth-cert-dev');
     expect(service.cognito.stackName).toBe('ecommerce-cognito-dev');
