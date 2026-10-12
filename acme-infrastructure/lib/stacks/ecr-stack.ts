@@ -99,25 +99,25 @@ export class EcrStack extends Stack {
     this.repositoryUriOutput = new CfnOutput(this, 'RepositoryUri', {
       value: this.repository.repositoryUri,
       description: 'ECR repository to push the application image to',
-      exportName: 'ecommerce-ecr-repository-uri',
+      exportName: 'acme-ecr-repository-uri',
     });
 
     new CfnOutput(this, 'RepositoryName', {
       value: this.repository.repositoryName,
       description: 'Name of the application image repository',
-      exportName: 'ecommerce-ecr-repository-name',
+      exportName: 'acme-ecr-repository-name',
     });
 
     this.frontendRepositoryUriOutput = new CfnOutput(this, 'FrontendRepositoryUri', {
       value: this.frontendRepository.repositoryUri,
       description: 'ECR repository to push the frontend image to',
-      exportName: 'ecommerce-ecr-frontend-repository-uri',
+      exportName: 'acme-ecr-frontend-repository-uri',
     });
 
     new CfnOutput(this, 'FrontendRepositoryName', {
       value: this.frontendRepository.repositoryName,
       description: 'Name of the frontend image repository',
-      exportName: 'ecommerce-ecr-frontend-repository-name',
+      exportName: 'acme-ecr-frontend-repository-name',
     });
   }
 

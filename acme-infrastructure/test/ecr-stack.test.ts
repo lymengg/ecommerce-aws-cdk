@@ -112,9 +112,9 @@ describe('EcrStack outputs', () => {
   test('exports where to push each image', () => {
     const template = buildTemplate();
 
-    template.hasOutput('RepositoryUri', { Export: { Name: 'ecommerce-ecr-repository-uri' } });
-    template.hasOutput('RepositoryName', { Export: { Name: 'ecommerce-ecr-repository-name' } });
-    template.hasOutput('FrontendRepositoryUri', { Export: { Name: 'ecommerce-ecr-frontend-repository-uri' } });
-    template.hasOutput('FrontendRepositoryName', { Export: { Name: 'ecommerce-ecr-frontend-repository-name' } });
+    template.hasOutput('RepositoryUri', { Export: { Name: 'acme-ecr-repository-uri' } });
+    template.hasOutput('RepositoryName', { Export: { Name: 'acme-ecr-repository-name' } });
+    template.hasOutput('FrontendRepositoryUri', { Export: { Name: 'acme-ecr-frontend-repository-uri' } });
+    template.hasOutput('FrontendRepositoryName', { Export: { Name: 'acme-ecr-frontend-repository-name' } });
   });
 });

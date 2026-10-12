@@ -99,7 +99,7 @@ back; the cert re-validates within minutes. The `us-east-1` Cognito cert follows
 3. **Deploy action failed** — the failed action's link opens the CloudFormation stack events in
    the *target account/region* (for uat/prod you must be signed into that account — or the pipeline
    account can't show you the failure).
-4. **`ecommerce-ecr` (registry) deploy failed** → the build step's `envFromCfnOutputs` vars are
+4. **`acme-ecr` (registry) deploy failed** → the build step's `envFromCfnOutputs` vars are
    unresolved and `BuildImages` fails on a literal `#{...}` token — re-run after the registry is
    healthy.
 
@@ -140,14 +140,14 @@ shared registry.
 **Diagnosis — both sides of the authorization must exist:**
 
 1. **Registry side** — the repository policy on `ecommerce-api`/`ecommerce-frontend` must list the
-   environment's account (`pullAccountIds` → `configuredAccountIds()` → `ECOMMERCE_<ENV>_ACCOUNT`
+   environment's account (`pullAccountIds` → `configuredAccountIds()` → `ACME_<ENV>_ACCOUNT`
    set at synth). `aws ecr get-repository-policy --repository-name ecommerce-api`.
 2. **Environment side** — the task execution role must allow `ecr:BatchGetImage` etc. on the
    repository ARN in the *registry* account; the platform stacks grant it automatically, so a
    failure here means the role was edited outside CDK.
 
-**Fix:** redeploy `ecommerce-ecr` with the missing account in `pullAccountIds` (set the env var
-before synth — the pull policy is generated from whichever `ECOMMERCE_*_ACCOUNT` variables exist
+**Fix:** redeploy `acme-ecr` with the missing account in `pullAccountIds` (set the env var
+before synth — the pull policy is generated from whichever `ACME_*_ACCOUNT` variables exist
 at synth time); then redeploy the platform stage.
 
 ## 8. "The site is down but nothing above explains it"

@@ -83,7 +83,7 @@ describe('PipelineStack', () => {
 
     const registryActions = stageActions(template, 'registry').map((a) => a.Name);
     expect(registryActions.slice(0, 3)).toEqual(['ApiTests', 'FrontendTests', 'InfrastructureTests']);
-    expect(registryActions.slice(3)).toEqual(['ecommerce-ecr.Prepare', 'ecommerce-ecr.Deploy']);
+    expect(registryActions.slice(3)).toEqual(['acme-ecr.Prepare', 'acme-ecr.Deploy']);
 
     const devActions = stageActions(template, 'dev').map((a) => a.Name);
     expect(devActions[0]).toBe('BuildImages');
@@ -167,7 +167,7 @@ describe('Environment stages', () => {
       pullAccountIds: [PIPELINE_ACCOUNT],
     });
 
-    expect(stage.registry.stackName).toBe('ecommerce-ecr');
+    expect(stage.registry.stackName).toBe('acme-ecr');
     expect(stage.registry.account).toBe(PIPELINE_ACCOUNT);
     expect(stage.registry.region).toBe('ap-southeast-1');
   });

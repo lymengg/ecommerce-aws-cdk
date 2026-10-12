@@ -52,13 +52,13 @@ export function getEnvironmentConfig(environment: EnvironmentName = resolveEnvir
 
 /**
  * The account ids of every configured environment: the set the shared registry allows to pull
- * images. An environment is "configured" the moment its `ECOMMERCE_<ENV>_ACCOUNT` variable exists -
+ * images. An environment is "configured" the moment its `ACME_<ENV>_ACCOUNT` variable exists -
  * the same rule {@link ../../bin/pipeline.ts} uses to decide which environments the pipeline
  * deploys, so the registry's pull policy always matches the pipeline's stage list.
  */
 export function configuredAccountIds(): string[] {
   return ENVIRONMENT_NAMES.map(
-    (name) => process.env[`ECOMMERCE_${name.toUpperCase()}_ACCOUNT`],
+    (name) => process.env[`ACME_${name.toUpperCase()}_ACCOUNT`],
   ).filter((account): account is string => account !== undefined && account !== '');
 }
 

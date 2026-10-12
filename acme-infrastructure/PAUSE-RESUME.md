@@ -36,7 +36,7 @@ stay up) but returns 503/empty responses — that is expected, not a bug.
 ## Pause
 
 ```bash
-cd ecommerce-infrastructure
+cd acme-infrastructure
 
 # 1. Stop the database (async — takes a few minutes, no action needed)
 aws rds stop-db-instance --db-instance-identifier ecommerce-dev-db
@@ -50,7 +50,7 @@ aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-f
 #    (stacks live under the `dev/` stage path from Phase 8 on; the bare stack name still works)
 ECOMMERCE_DEV_NAT_GATEWAYS=0 \
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io \
-ECOMMERCE_DEV_ACCOUNT=572396340039 \
+ACME_DEV_ACCOUNT=572396340039 \
 npx cdk deploy ecommerce-network-dev -c environment=dev
 ```
 
@@ -59,14 +59,14 @@ On PowerShell set the variables differently:
 ```powershell
 $env:ECOMMERCE_DEV_NAT_GATEWAYS = "0"
 $env:ECOMMERCE_DEV_DOMAIN       = "ouklymeng.qzz.io"
-$env:ECOMMERCE_DEV_ACCOUNT      = "572396340039"
+$env:ACME_DEV_ACCOUNT      = "572396340039"
 npx cdk deploy ecommerce-network-dev -c environment=dev
 ```
 
 ## Resume
 
 ```bash
-cd ecommerce-infrastructure
+cd acme-infrastructure
 
 # 1. Start the database (~2-3 min, runs while the next step deploys)
 aws rds start-db-instance --db-instance-identifier ecommerce-dev-db
@@ -74,7 +74,7 @@ aws rds start-db-instance --db-instance-identifier ecommerce-dev-db
 # 2. Restore the NAT gateway — the ECS tasks need it to pull images and reach
 #    Cognito/Secrets Manager. Simply omit the zero-override (~2 min).
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io \
-ECOMMERCE_DEV_ACCOUNT=572396340039 \
+ACME_DEV_ACCOUNT=572396340039 \
 npx cdk deploy ecommerce-network-dev -c environment=dev
 
 # 3. Scale the services back up (~1-2 min to healthy)
@@ -124,10 +124,10 @@ ECOMMERCE_DEV_NAT_GATEWAYS=0 npx cdk deploy ecommerce-network-dev -c environment
 aws rds stop-db-instance --db-instance-identifier ecommerce-dev-db
 
 # Resume: NAT first, database in parallel, then compute
-ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ECOMMERCE_DEV_ACCOUNT=572396340039 \
+ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ACME_DEV_ACCOUNT=572396340039 \
   npx cdk deploy ecommerce-network-dev -c environment=dev
 aws rds start-db-instance --db-instance-identifier ecommerce-dev-db
-ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ECOMMERCE_DEV_ACCOUNT=572396340039 \
+ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ACME_DEV_ACCOUNT=572396340039 \
   npx cdk deploy ecommerce-application-dev ecommerce-frontend-dev -c environment=dev
 ```
 

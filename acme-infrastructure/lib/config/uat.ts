@@ -30,7 +30,7 @@ const frontendOrigin = process.env.ECOMMERCE_UAT_FRONTEND_ORIGIN;
  */
 export const uatConfig: EnvironmentConfig = {
   environment: 'uat',
-  account: process.env.ECOMMERCE_UAT_ACCOUNT,
+  account: process.env.ACME_UAT_ACCOUNT,
   region: 'ap-southeast-1',
   vpcCidr: '10.1.0.0/16',
   maxAzs: 2,

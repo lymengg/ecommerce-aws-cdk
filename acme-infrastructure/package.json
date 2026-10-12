@@ -1,5 +1,5 @@
 {
-  "name": "ecommerce-infrastructure",
+  "name": "acme-infrastructure",
   "version": "0.1.0",
   "private": true,
   "description": "AWS CDK infrastructure for the e-commerce platform - Phases 1-4: network foundation, ECS/Fargate application, RDS PostgreSQL data layer, DNS/TLS and Cognito authentication",

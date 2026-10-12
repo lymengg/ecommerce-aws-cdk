@@ -23,64 +23,35 @@ describe('OrganizationStack', () => {
     });
   });
 
-  test('lays out the OU tree - workloads per service and environment plus security and tooling', () => {
+  test('lays out the OU tree - shared environment OUs plus security and tooling', () => {
     const template = buildTemplate();
 
     const ous = Object.values(template.findResources('AWS::Organizations::OrganizationalUnit')) as any[];
     const names = ous.map((ou) => ou.Properties.Name).sort();
-    expect(names).toEqual(['dev', 'ecommerce', 'prod', 'security', 'tooling', 'uat', 'workloads']);
+    expect(names).toEqual(['dev', 'prod', 'security', 'tooling', 'uat', 'workloads']);
   });
 
-  test('nests the environment OUs under each service OU', () => {
-    const template = buildTemplate([], { services: ['ecommerce', 'payments'] });
-
-    const ous = Object.values(template.findResources('AWS::Organizations::OrganizationalUnit')) as any[];
-    const names = ous.map((ou) => ou.Properties.Name);
-    // Two service OUs x three environment OUs, plus the root-level functional OUs.
-    expect(names.filter((name) => name === 'dev')).toHaveLength(2);
-    expect(names.filter((name) => name === 'prod')).toHaveLength(2);
-    expect(names).toEqual(expect.arrayContaining(['ecommerce', 'payments', 'workloads']));
-    template.resourceCountIs('AWS::Organizations::OrganizationalUnit', 3 + 2 * (1 + 3));
-  });
-
-  test('names member accounts <company>-<workload> like a real organization', () => {
+  test('names member accounts <company>-<name> like a real organization', () => {
     const template = buildTemplate([
-      { name: 'uat', service: 'ecommerce', email: 'uat@example.com' },
-      { name: 'prod', service: 'ecommerce', email: 'prod@example.com' },
-      { name: 'prod', service: 'payments', email: 'payments-prod@example.com' },
+      { name: 'uat', email: 'uat@example.com' },
+      { name: 'prod', email: 'prod@example.com' },
       { name: 'tooling', email: 'tooling@example.com' },
-    ], { services: ['ecommerce', 'payments'] });
+    ]);
 
-    // Workload accounts carry the service name: <company>-<service>-<env>. Shared-function
-    // accounts are not service-scoped: <company>-<name>.
     template.hasResourceProperties('AWS::Organizations::Account', {
-      AccountName: 'acme-ecommerce-uat',
+      AccountName: 'acme-uat',
       Email: 'uat@example.com',
       RoleName: 'OrganizationAccountAccessRole',
     });
     template.hasResourceProperties('AWS::Organizations::Account', {
-      AccountName: 'acme-ecommerce-prod',
+      AccountName: 'acme-prod',
       Email: 'prod@example.com',
-    });
-    template.hasResourceProperties('AWS::Organizations::Account', {
-      AccountName: 'acme-payments-prod',
-      Email: 'payments-prod@example.com',
     });
     template.hasResourceProperties('AWS::Organizations::Account', {
       AccountName: 'acme-tooling',
       Email: 'tooling@example.com',
     });
-    template.resourceCountIs('AWS::Organizations::Account', 4);
-  });
-
-  test('rejects an account whose service has no OU', () => {
-    const app = new App();
-    expect(
-      () =>
-        new OrganizationStack(app, 'test-organization', {
-          accounts: [{ name: 'dev', service: 'unknown', email: 'dev@example.com' }],
-        }),
-    ).toThrow('No OU for account "dev" of service "unknown"');
+    template.resourceCountIs('AWS::Organizations::Account', 3);
   });
 
   test('places security and tooling accounts under their parent OUs', () => {
@@ -137,20 +108,16 @@ describe('OrganizationStack', () => {
   });
 
   test('retains member accounts - stack deletion must not detach them', () => {
-    const template = buildTemplate([
-      { name: 'prod', service: 'ecommerce', email: 'prod@example.com' },
-    ]);
+    const template = buildTemplate([{ name: 'prod', email: 'prod@example.com' }]);
 
     template.hasResource('AWS::Organizations::Account', { DeletionPolicy: 'Retain' });
   });
 
-  test('exports the member account ids as the ECOMMERCE_<NAME>_ACCOUNT values', () => {
-    const template = buildTemplate([
-      { name: 'prod', service: 'ecommerce', email: 'prod@example.com' },
-    ]);
+  test('exports the member account ids as the ACME_<NAME>_ACCOUNT values', () => {
+    const template = buildTemplate([{ name: 'prod', email: 'prod@example.com' }]);
 
-    template.hasOutput('EcommerceProdAccountId', {
-      Export: { Name: 'acme-ecommerce-prod-account-id' },
+    template.hasOutput('ProdAccountId', {
+      Export: { Name: 'acme-prod-account-id' },
     });
   });
 });

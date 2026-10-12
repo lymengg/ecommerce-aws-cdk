@@ -15,12 +15,12 @@ const environment = resolveEnvironmentName(app);
 const config = getEnvironmentConfig(environment);
 
 // One registry serves every environment (Phase 8): images are built once and promoted, not
-// rebuilt per environment. The registry lives in `ECOMMERCE_REGISTRY_ACCOUNT` /
-// `ECOMMERCE_REGISTRY_REGION`, defaulting to the selected environment's own account and region -
+// rebuilt per environment. The registry lives in `ACME_REGISTRY_ACCOUNT` /
+// `ACME_REGISTRY_REGION`, defaulting to the selected environment's own account and region -
 // which keeps a same-account manual deploy working with no extra configuration.
 const registry: RegistryLocation = {
-  account: process.env.ECOMMERCE_REGISTRY_ACCOUNT ?? config.account,
-  region: process.env.ECOMMERCE_REGISTRY_REGION ?? config.region,
+  account: process.env.ACME_REGISTRY_ACCOUNT ?? config.account,
+  region: process.env.ACME_REGISTRY_REGION ?? config.region,
 };
 
 // The platform is two stages rather than a flat list of stacks so the same code drives both a

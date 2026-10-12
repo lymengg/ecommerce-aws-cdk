@@ -40,7 +40,7 @@ const natGateways =
  */
 export const devConfig: EnvironmentConfig = {
   environment: 'dev',
-  account: process.env.ECOMMERCE_DEV_ACCOUNT,
+  account: process.env.ACME_DEV_ACCOUNT,
   region: 'ap-southeast-1',
   vpcCidr: '10.0.0.0/16',
   maxAzs: 2,

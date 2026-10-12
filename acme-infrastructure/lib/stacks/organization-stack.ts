@@ -11,25 +11,18 @@ import { MANAGED_BY_TAG, PROJECT_TAG } from '../tags';
 
 export interface OrganizationAccountSpec {
   /**
-   * Account name suffix: `dev`/`uat`/`prod` for workload accounts, `tooling` for the account that
-   * hosts the CI/CD pipeline and the shared container registry, `log-archive` and `audit` for the
-   * security accounts. Rendered as the member account's name (see {@link OrganizationStackProps.company})
-   * and placed in the OU the name belongs to (see the tree in {@link OrganizationStack}).
+   * Account name suffix: `dev`/`uat`/`prod` for the shared workload accounts, `tooling` for the
+   * account that hosts the CI/CD pipeline and the shared container registry, `log-archive` and
+   * `audit` for the security accounts. Rendered as the member account's name
+   * (`<company>-<name>` - see {@link OrganizationStackProps.company}) and placed in the OU the
+   * name belongs to (see the tree in {@link OrganizationStack}).
    */
   readonly name: string;
 
   /**
-   * The service a workload account belongs to (`ecommerce`, `payments`, ...). Workload accounts
-   * must set it - it selects the `workloads/<service>/<env>` OU and the middle segment of the
-   * account name `<company>-<service>-<env>`. Shared-function accounts (tooling, log-archive,
-   * audit) leave it undefined: they are not service-scoped and land in their functional OU.
-   */
-  readonly service?: string;
-
-  /**
    * Email address the account's root user is registered under. AWS requires a unique email per
-   * account; it is read from `ECOMMERCE_<NAME>_ACCOUNT_EMAIL` (dashes become underscores, so the
-   * log archive's variable is `ECOMMERCE_LOG_ARCHIVE_ACCOUNT_EMAIL`) and accounts are created only
+   * account; it is read from `ACME_<NAME>_ACCOUNT_EMAIL` (dashes become underscores, so the
+   * log archive's variable is `ACME_LOG_ARCHIVE_ACCOUNT_EMAIL`) and accounts are created only
    * for names that have one - the stack is intentionally safe to deploy incrementally.
    */
   readonly email: string;
@@ -43,19 +36,11 @@ export interface OrganizationStackProps extends StackProps {
   readonly accounts: OrganizationAccountSpec[];
 
   /**
-   * Company prefix used in account naming, following the `<company>-<workload>` convention real
-   * organizations use: workload accounts render as `<company>-<service>-<env>` (company →
-   * service → environment), shared-function accounts as `<company>-<name>` (`acme-tooling`,
-   * `acme-log-archive`). Defaults to `acme` - replace it with the real name.
+   * Company prefix used in account naming, following the `<company>-<account>` convention real
+   * organizations use: `acme-dev`, `acme-tooling`, `acme-log-archive`. Defaults to `acme` -
+   * replace it with the real name.
    */
   readonly company?: string;
-
-  /**
-   * Services that get a workload account set. Each becomes a `workloads/<service>` OU with the
-   * environment OUs inside it - the shape a multi-team organization grows into, where team A's
-   * accounts are a distinct blast-radius boundary from team B's. Defaults to `['ecommerce']`.
-   */
-  readonly services?: string[];
 
   /**
    * Regions member accounts are allowed to operate in; every other region is denied org-wide by
@@ -67,18 +52,21 @@ export interface OrganizationStackProps extends StackProps {
 }
 
 /**
- * The organizational units that hang directly off the root, other than `workloads` - which is
- * built dynamically: one OU per service, the environment OUs inside it. `log-archive`, `audit`
- * and `tooling` live directly inside their parent OU because one OU per account would be
- * structure for structure's sake.
+ * The organizational-unit layout: parent OUs at the root, the environment OUs under `workloads`.
+ * `log-archive`, `audit` and `tooling` live directly inside their parent because one OU per
+ * account would be structure for structure's sake.
  */
-const ROOT_FUNCTIONAL_OUS = ['workloads', 'security', 'tooling'] as const;
+const OU_TREE: Record<string, readonly string[]> = {
+  workloads: ['dev', 'uat', 'prod'],
+  security: [],
+  tooling: [],
+};
 
-/** The environments every service gets an OU (and optionally an account) for. */
-const ENVIRONMENTS = ['dev', 'uat', 'prod'] as const;
-
-/** Which functional OU a shared-function account belongs to. */
-const FUNCTIONAL_ACCOUNT_OU: Record<string, string> = {
+/** Which OU each creatable account belongs to. */
+const ACCOUNT_OU: Record<string, string> = {
+  dev: 'dev',
+  uat: 'uat',
+  prod: 'prod',
   'log-archive': 'security',
   audit: 'security',
   tooling: 'tooling',
@@ -118,23 +106,26 @@ const pascal = (name: string): string =>
  *   Root                    (management account - pure payer/admin; best practice is that it
  *   │                        hosts NO workloads. Today it happens to host dev + the pipeline +
  *   │                        the shared registry, and those migrate to member accounts below)
- *   ├── workloads          (OU - one child OU per service; accounts are per service x env:
- *   │   │                    `acme-ecommerce-dev`, `acme-payments-prod`, ...)
- *   │   └── ecommerce      (service OU - the team blast-radius boundary an SCP can scope to)
- *   │       ├── dev        (OU + member account, when ECOMMERCE_DEV_ACCOUNT_EMAIL is set)
- *   │       ├── uat        (OU + member account, when ECOMMERCE_UAT_ACCOUNT_EMAIL is set)
- *   │       └── prod       (OU + member account, when ECOMMERCE_PROD_ACCOUNT_EMAIL is set)
+ *   ├── workloads          (OU - shared environment accounts that hold every service's
+ *   │   │                    workloads; per-service accounts are the upgrade path if a second
+ *   │   │                    service ever needs its own blast-radius boundary)
+ *   │   ├── dev            (OU + member account `acme-dev`, when ACME_DEV_ACCOUNT_EMAIL is set)
+ *   │   ├── uat            (OU + member account `acme-uat`, when ACME_UAT_ACCOUNT_EMAIL is set)
+ *   │   └── prod           (OU + member account `acme-prod`, when ACME_PROD_ACCOUNT_EMAIL is set)
  *   ├── security           (OU + member accounts - log-archive and audit, when their
- *   │                        ECOMMERCE_*_ACCOUNT_EMAIL variables are set)
- *   └── tooling            (OU + member account, when ECOMMERCE_TOOLING_ACCOUNT_EMAIL is set -
+ *   │                        ACME_*_ACCOUNT_EMAIL variables are set)
+ *   └── tooling            (OU + member account, when ACME_TOOLING_ACCOUNT_EMAIL is set -
  *                            the long-term home of the pipeline and the shared ECR registry)
  * ```
  *
  * Three structural decisions, all deliberate:
  *
- * - OUs nest service → environment (rather than one flat workloads OU): a service OU is the team
- *   blast-radius boundary ("deny networking writes in all of ecommerce's accounts" is one SCP
- *   attachment), and the env OUs inside it keep "prod is stricter than dev" expressible.
+ * - Environment accounts are shared across services: all of a company's services deploy into
+ *   the same `dev`/`uat`/`prod` accounts, isolated by resource naming, tags, and scoped IAM
+ *   roles rather than an account boundary. The env OUs are still the SCP attachment point
+ *   ("prod is stricter than dev"). If a service later needs its own accounts, the flat
+ *   workloads OU can grow `workloads/<service>/<env>` children without restructuring the
+ *   rest of the tree.
  * - `security` exists from day one because it is the hardest piece to retrofit: log-archive holds
  *   the org-wide CloudTrail/Config aggregation and audit holds read-only security tooling access -
  *   Control Tower provisions both automatically, and a hand-rolled organization needs them just
@@ -146,12 +137,12 @@ const pascal = (name: string): string =>
  * management account - SCPs do not apply to it): deny `LeaveOrganization`, deny tampering with
  * the audit trail (CloudTrail/Config/GuardDuty), and deny unapproved regions. They are safe to
  * attach unconditionally - they carve away edges nobody legitimate uses. Environment/team-scoped
- * SCPs (deny networking writes on `workloads`, deny destructive ops on the per-service `prod`
- * OUs) need principal exemptions for the deploy roles and are intentionally left for a later pass.
+ * SCPs (deny networking writes on `workloads`, deny destructive ops on `workloads/prod`) need
+ * principal exemptions for the deploy roles and are intentionally left for a later pass.
  *
  * Member accounts are created by CloudFormation (`AWS::Organizations::Account`), which also
  * creates the `OrganizationAccountAccessRole` the pipeline's bootstrap trusts. Once an account
- * exists, its id is exported as an output - that is the value `ECOMMERCE_<ENV>_ACCOUNT` wants,
+ * exists, its id is exported as an output - that is the value `ACME_<ENV>_ACCOUNT` wants,
  * which is what activates the environment in the pipeline and in the registry's pull policy.
  * Deploying this stack with no account emails creates just the organization skeleton, which is a
  * valid and useful intermediate state.
@@ -220,52 +211,27 @@ export class OrganizationStack extends Stack {
       },
     );
 
-    // OUs are keyed by path (`workloads/ecommerce/dev`) because the same leaf name appears under
-    // every service. The whole tree is created up front so it is stable even while accounts are
-    // still being added incrementally.
+    // The tree first, then the accounts hang off it: every leaf OU exists whether or not its
+    // account does yet, so the structure is stable even while accounts are added incrementally.
     const ous = new Map<string, CfnOrganizationalUnit>();
-    const ou = (path: string, name: string, parentId: string): CfnOrganizationalUnit => {
-      const unit = new CfnOrganizationalUnit(this, `${pascal(path.replaceAll('/', '-'))}Ou`, {
-        name,
-        parentId,
+    for (const [parent, children] of Object.entries(OU_TREE)) {
+      const parentOu = new CfnOrganizationalUnit(this, `${pascal(parent)}Ou`, {
+        name: parent,
+        parentId: organization.attrRootId,
       });
-      ous.set(path, unit);
-      return unit;
-    };
-
-    for (const functional of ROOT_FUNCTIONAL_OUS) {
-      const parent = ou(functional, functional, organization.attrRootId);
-      if (functional === 'workloads') {
-        for (const service of props?.services ?? ['ecommerce']) {
-          const serviceOu = ou(`workloads/${service}`, service, parent.attrId);
-          for (const env of ENVIRONMENTS) {
-            ou(`workloads/${service}/${env}`, env, serviceOu.attrId);
-          }
-        }
+      ous.set(parent, parentOu);
+      for (const child of children) {
+        ous.set(child, new CfnOrganizationalUnit(this, `${pascal(child)}Ou`, { name: child, parentId: parentOu.attrId }));
       }
     }
 
-    // Workload accounts name the service they host (`acme-ecommerce-dev`); shared-function
-    // accounts are not service-scoped (`acme-tooling`).
-    const accountName = ({ name, service }: OrganizationAccountSpec) =>
-      service === undefined ? `${company}-${name}` : `${company}-${service}-${name}`;
-
-    for (const spec of props?.accounts ?? []) {
-      const { name, service, email } = spec;
-      const ouPath =
-        service === undefined ? FUNCTIONAL_ACCOUNT_OU[name] : `workloads/${service}/${name}`;
-      const parentOu = ouPath === undefined ? undefined : ous.get(ouPath);
+    for (const { name, email } of props?.accounts ?? []) {
+      const parentOu = ous.get(ACCOUNT_OU[name] ?? name);
       if (parentOu === undefined) {
-        throw new Error(
-          `No OU for account "${name}"${service === undefined ? '' : ` of service "${service}"`} - ` +
-            `add it to ${service === undefined ? 'FUNCTIONAL_ACCOUNT_OU' : 'props.services'} in organization-stack.ts`,
-        );
+        throw new Error(`No OU for account "${name}" - add it to ACCOUNT_OU in organization-stack.ts`);
       }
-      // The construct id includes the service: `dev` exists once per service, but each is a
-      // distinct account (ecommerce-dev vs payments-dev).
-      const specId = pascal(service === undefined ? name : `${service}-${name}`);
-      const account = new CfnAccount(this, `${specId}Account`, {
-        accountName: accountName(spec),
+      const account = new CfnAccount(this, `${pascal(name)}Account`, {
+        accountName: `${company}-${name}`,
         email,
         parentIds: [parentOu.attrId],
         roleName: 'OrganizationAccountAccessRole',
@@ -274,10 +240,10 @@ export class OrganizationStack extends Stack {
       // whatever this stack was deployed to do.
       account.applyRemovalPolicy(RemovalPolicy.RETAIN);
 
-      new CfnOutput(this, `${specId}AccountId`, {
+      new CfnOutput(this, `${pascal(name)}AccountId`, {
         value: account.attrAccountId,
-        description: `Account id of the ${name} member account - the ECOMMERCE_${name.toUpperCase().replaceAll('-', '_')}_ACCOUNT value`,
-        exportName: `${accountName(spec)}-account-id`,
+        description: `Account id of the ${name} member account - the ACME_${name.toUpperCase().replaceAll('-', '_')}_ACCOUNT value`,
+        exportName: `${company}-${name}-account-id`,
       });
     }
 

@@ -79,11 +79,11 @@ export class SharedRegistryStage extends Stage {
 
     const env = { account: props.registry.account, region: props.registry.region };
 
-    this.registry = new EcrStack(this, 'ecommerce-ecr', {
+    this.registry = new EcrStack(this, 'acme-ecr', {
       env,
-      stackName: 'ecommerce-ecr',
+      stackName: 'acme-ecr',
       pullAccountIds: props.pullAccountIds,
-      description: 'E-commerce platform shared container registry',
+      description: 'Shared container registry for all services',
     });
   }
 }

@@ -21,7 +21,7 @@ import { PipelineStack } from '../lib/stacks/pipeline-stack';
  *                          OAuth handshake cannot be automated). May also be passed as the
  *                          `connectionArn` context value.
  *
- * Which environments the pipeline deploys is decided by which `ECOMMERCE_<ENV>_ACCOUNT` /
+ * Which environments the pipeline deploys is decided by which `ACME_<ENV>_ACCOUNT` /
  * `ECOMMERCE_<ENV>_DOMAIN` pairs are set: dev is required; uat and prod join the pipeline - behind
  * a manual approval each - as soon as their pair exists. The same check runs inside the synth
  * build, so a pipeline execution always synthesises the same set of environments its configured
@@ -40,19 +40,20 @@ if (connectionArn === undefined || connectionArn === '') {
 
 // The pipeline account is the account dev lives in today: the stack deploys there once, and the
 // env vars it forwards are exactly what the synth build will see.
-const pipelineAccountId = process.env.ECOMMERCE_DEV_ACCOUNT;
+const pipelineAccountId = process.env.ACME_DEV_ACCOUNT;
 const devDomain = process.env.ECOMMERCE_DEV_DOMAIN;
 if (pipelineAccountId === undefined || pipelineAccountId === '' || devDomain === undefined || devDomain === '') {
   throw new Error(
-    'ECOMMERCE_DEV_ACCOUNT and ECOMMERCE_DEV_DOMAIN are required - the pipeline deploys dev on every run.',
+    'ACME_DEV_ACCOUNT and ECOMMERCE_DEV_DOMAIN are required - the pipeline deploys dev on every run.',
   );
 }
 
-// Every ECOMMERCE_* variable travels into the synth build so the pipeline synthesises the same
-// configuration the deployer configured locally - including the dev NAT-gateway pause switch.
+// Every ECOMMERCE_* (service config) and ACME_* (platform/account config) variable travels into
+// the synth build so the pipeline synthesises the same configuration the deployer configured
+// locally - including the dev NAT-gateway pause switch.
 const synthEnvironment: Record<string, string> = {};
 for (const [name, value] of Object.entries(process.env)) {
-  if (name.startsWith('ECOMMERCE_') && value !== undefined) {
+  if ((name.startsWith('ECOMMERCE_') || name.startsWith('ACME_')) && value !== undefined) {
     synthEnvironment[name] = value;
   }
 }
@@ -60,7 +61,7 @@ for (const [name, value] of Object.entries(process.env)) {
 const environments = ENVIRONMENT_NAMES
   .filter((name) => {
     const configured =
-      process.env[`ECOMMERCE_${name.toUpperCase()}_ACCOUNT`] !== undefined &&
+      process.env[`ACME_${name.toUpperCase()}_ACCOUNT`] !== undefined &&
       process.env[`ECOMMERCE_${name.toUpperCase()}_DOMAIN`] !== undefined;
     return name === 'dev' || configured;
   })

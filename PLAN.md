@@ -252,7 +252,7 @@ self-mutates on push.
   registry is its own stage because the image build must sit between "repository exists" and
   "compute deploys" — and construct references cannot cross stage boundaries, so the platform
   imports the repositories by location (`{account, region}` + fixed names).
-- One **shared registry** (`ecommerce-ecr`: `ecommerce-api` + `ecommerce-frontend`) serves every
+- One **shared registry** (`acme-ecr`: `ecommerce-api` + `ecommerce-frontend`) serves every
   environment — an image is a build artifact, not an environment resource. Images build **once**
   (`BuildImages`, pushed as the commit SHA — the same `CODEBUILD_RESOLVED_SOURCE_VERSION` the synth
   baked into the task definitions) and each environment stage deploys the identical artifact:
@@ -264,7 +264,7 @@ self-mutates on push.
   account pull (`pullAccountIds`), the build step pushes with its own role scoped to the two
   repositories, and `crossAccountKeys` keeps the artifact bucket decryptable by other accounts'
   deploy roles.
-- `uat`/`prod` join the pipeline automatically once `ECOMMERCE_<ENV>_ACCOUNT` + `_DOMAIN` exist.
+- `uat`/`prod` join the pipeline automatically once `ACME_<ENV>_ACCOUNT` + `_DOMAIN` exist.
   The registry lives in the pipeline account today; Phase 9's tooling account is a `registry`
   location change plus re-pointed pull policies.
 
@@ -279,8 +279,8 @@ image tags in the pipeline context, cross-account artifact keys, assume-role ima
 
 - Multi-account structure: `OrganizationStack` + `bin/organization.ts` synthesizes the AWS
   Organization (ALL features), a `workloads` OU with one child OU per environment plus a `tooling`
-  OU, and a member account for every `ECOMMERCE_<NAME>_ACCOUNT_EMAIL` set — the emitted account
-  ids are exactly the `ECOMMERCE_<ENV>_ACCOUNT` values the pipeline and the shared registry's pull
+  OU, and a member account for every `ACME_<NAME>_ACCOUNT_EMAIL` set — the emitted account
+  ids are exactly the `ACME_<ENV>_ACCOUNT` values the pipeline and the shared registry's pull
   policy already key on, and `tooling` is the pipeline/registry's eventual home (the management
   account itself stays workload-free). Accounts are `RETAIN`ed; per-OU SCPs stay possible later.
 - Cost guardrails: `ecommerce-cost-<env>` in every platform stage — a monthly account budget

@@ -52,7 +52,8 @@ export interface PipelineStackProps extends StackProps {
   readonly pullAccountIds: string[];
 
   /**
-   * `ECOMMERCE_*` variables forwarded into the synth build. `bin/pipeline.ts` collects whatever is
+   * `ECOMMERCE_*`/`ACME_*` variables forwarded into the synth build. `bin/pipeline.ts` collects
+   * whatever is
    * set locally so the pipeline synthesises exactly the configuration the deployer had - including
    * the dev NAT-gateway pause switch.
    */
@@ -60,7 +61,7 @@ export interface PipelineStackProps extends StackProps {
 
   /**
    * Environments to deploy, in promotion order: `dev` first (always present); `uat` and `prod` once
-   * their `ECOMMERCE_<ENV>_ACCOUNT` and `ECOMMERCE_<ENV>_DOMAIN` variables are configured, each
+   * their `ACME_<ENV>_ACCOUNT` and `ECOMMERCE_<ENV>_DOMAIN` variables are configured, each
    * gated by a manual approval. Resolved configurations rather than names, so the caller - not this
    * stack - decides which environments exist.
    */
@@ -111,14 +112,14 @@ export class PipelineStack extends Stack {
         input: source,
         env: props.synthEnvironment,
         commands: [
-          'cd ecommerce-infrastructure',
+          'cd acme-infrastructure',
           'npm ci',
           // The image tag is the commit SHA: immutable, and identical to the tag the build step
           // pushes below.
           'export IMAGE_TAG="$CODEBUILD_RESOLVED_SOURCE_VERSION"',
           'npx cdk --app "npx ts-node --prefer-ts-exts bin/pipeline.ts" synth --strict',
         ],
-        primaryOutputDirectory: 'ecommerce-infrastructure/cdk.out',
+        primaryOutputDirectory: 'acme-infrastructure/cdk.out',
       }),
       synthCodeBuildDefaults: { partialBuildSpec: RUNTIME_BUILD_SPEC(NODE_RUNTIME) },
       codeBuildDefaults: { partialBuildSpec: RUNTIME_BUILD_SPEC(NODE_RUNTIME) },
@@ -129,7 +130,7 @@ export class PipelineStack extends Stack {
     const tests: Step[] = [
       new CodeBuildStep('InfrastructureTests', {
         input: source,
-        commands: ['cd ecommerce-infrastructure', 'npm ci', 'npm run typecheck', 'npm test'],
+        commands: ['cd acme-infrastructure', 'npm ci', 'npm run typecheck', 'npm test'],
       }),
       new CodeBuildStep('FrontendTests', {
         input: source,

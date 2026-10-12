@@ -26,7 +26,7 @@ const frontendOrigin = process.env.ECOMMERCE_PROD_FRONTEND_ORIGIN;
  */
 export const prodConfig: EnvironmentConfig = {
   environment: 'prod',
-  account: process.env.ECOMMERCE_PROD_ACCOUNT,
+  account: process.env.ACME_PROD_ACCOUNT,
   region: 'ap-southeast-1',
   vpcCidr: '10.2.0.0/16',
   maxAzs: 3,
