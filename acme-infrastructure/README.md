@@ -1545,7 +1545,7 @@ editing source, via `-c imageTag=<tag>` or the `IMAGE_TAG` environment variable.
 
 ```bash
 # 1. Deploy the shared registry first, so the repository exists.
-npx cdk deploy acme-ecr -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy acme-ecr
 
 # 2. Build the image and tag it with the registry URI and the immutable tag.
 docker build -t ecommerce-api:v0.1.0 application
@@ -2006,7 +2006,7 @@ Then deploy one environment at a time, in dependency order:
 npx cdk deploy ecommerce-network-dev -c environment=dev
 
 # 2. Shared registry (must exist before an image can be pushed)
-npx cdk deploy acme-ecr -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy acme-ecr
 
 # 3. Database (instance + generated credentials secret)
 npx cdk deploy ecommerce-database-dev -c environment=dev
@@ -2075,7 +2075,7 @@ Everything below is a manual operator action; nothing in this repository deploys
 export ACME_DEV_ACCOUNT=<account>       # PowerShell: $env:ACME_DEV_ACCOUNT = "<account>"
 
 npx cdk deploy ecommerce-network-dev    -c environment=dev
-npx cdk deploy acme-ecr             -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy acme-ecr
 npx cdk deploy ecommerce-database-dev   -c environment=dev
 ```
 
@@ -2189,7 +2189,7 @@ npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev   # the us-east-1 certificate
 npx cdk destroy ecommerce-dns-dev         -c environment=dev   # only when a domain was configured
 npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
-npx cdk destroy acme-ecr             -c environment=dev   # shared registry: RETAINed, delete repos by hand
+npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" destroy acme-ecr   # shared registry: RETAINed, delete repos by hand
 npx cdk destroy ecommerce-network-dev     -c environment=dev
 ```
 
