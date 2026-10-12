@@ -1,0 +1,162 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 800" font-family="Segoe UI, system-ui, -apple-system, sans-serif">
+  <defs>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="2" stdDeviation="3" flood-color="#1a2b3c" flood-opacity="0.15"/>
+    </filter>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3a4b5c"/>
+    </marker>
+    <marker id="arrOrange" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d86413"/>
+    </marker>
+    <marker id="arrGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#2e8b57"/>
+    </marker>
+    <marker id="arrPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8b5cf6"/>
+    </marker>
+    <style>
+      .node   { fill:#ffffff; stroke:#c9d4dd; stroke-width:1.4; }
+      .title  { font-size:13px; font-weight:600; fill:#1a2b3c; }
+      .sub    { font-size:10.5px; fill:#5a6b7a; }
+      .subI   { font-size:10.5px; fill:#5a6b7a; font-style:italic; }
+      .bandLbl{ font-size:11px; font-weight:700; }
+      .edgeLbl{ font-size:10px; fill:#43566a; }
+      .mono   { font-family:Consolas, monospace; }
+    </style>
+  </defs>
+
+  <rect width="1280" height="800" fill="#f7f9fb"/>
+
+  <text x="48" y="40" font-size="20" font-weight="700" fill="#1a2b3c">Ecommerce platform &#8212; architecture (dev)</text>
+  <text x="48" y="62" font-size="12" fill="#5a6b7a">shared ingress ALB &#183; three-tier subnet topology &#183; uat/prod are the same shape</text>
+
+  <!-- ===== client edge ===== -->
+  <rect x="60" y="96" width="100" height="52" rx="26" class="node" filter="url(#shadow)"/>
+  <text x="110" y="127" class="title" text-anchor="middle">Browser</text>
+
+  <rect x="220" y="96" width="150" height="64" rx="12" class="node" filter="url(#shadow)"/>
+  <text x="295" y="122" class="title" text-anchor="middle">Route 53</text>
+  <text x="295" y="138" class="sub mono" text-anchor="middle">ouklymeng.qzz.io</text>
+  <text x="295" y="153" class="subI" text-anchor="middle">acme-dns-&#8249;env&#8250;</text>
+
+  <!-- ===== VPC ===== -->
+  <rect x="60" y="200" width="890" height="560" rx="16" fill="#eef3f8" stroke="#8ea4b8" stroke-width="1.8" stroke-dasharray="8 5"/>
+  <text x="84" y="230" font-size="13" font-weight="700" fill="#43566a">acme-network-&#8249;env&#8250; &#8212; VPC 10.0.0.0/16</text>
+
+  <!-- Internet gateway straddles the VPC edge -->
+  <rect x="430" y="182" width="150" height="40" rx="10" class="node" filter="url(#shadow)"/>
+  <text x="505" y="206" class="title" text-anchor="middle" font-size="12">Internet Gateway</text>
+
+  <!-- ===== public subnets ===== -->
+  <rect x="90" y="248" width="830" height="100" rx="12" fill="#e7f4e4" stroke="#6cae3e" stroke-width="1.6"/>
+  <text x="106" y="272" class="bandLbl" fill="#3d7a1e">public subnets &#183; multi-AZ &#183; route &#8594; IGW</text>
+
+  <rect x="300" y="284" width="210" height="52" rx="10" fill="#ffffff" stroke="#147ebb" stroke-width="1.6" filter="url(#shadow)"/>
+  <text x="405" y="307" class="title" text-anchor="middle">Shared ALB</text>
+  <text x="405" y="324" class="subI" text-anchor="middle">acme-ingress-&#8249;env&#8250; &#183; one per env</text>
+
+  <rect x="640" y="284" width="170" height="52" rx="10" class="node" filter="url(#shadow)"/>
+  <text x="725" y="307" class="title" text-anchor="middle">NAT Gateway</text>
+  <text x="725" y="324" class="sub" text-anchor="middle">private egress only</text>
+
+  <!-- ===== private subnets ===== -->
+  <rect x="90" y="378" width="830" height="150" rx="12" fill="#e4eefc" stroke="#4f8fdd" stroke-width="1.6"/>
+  <text x="106" y="402" class="bandLbl" fill="#2c5d99">private subnets &#183; multi-AZ &#183; egress via NAT only</text>
+
+  <rect x="230" y="416" width="240" height="86" rx="10" fill="#ffffff" stroke="#d86413" stroke-width="1.6" filter="url(#shadow)"/>
+  <text x="350" y="442" class="title" text-anchor="middle">frontend service</text>
+  <text x="350" y="460" class="sub" text-anchor="middle">ECS Fargate &#183; nginx + Nuxt</text>
+  <text x="350" y="478" class="sub" text-anchor="middle">target group &#183; /healthz</text>
+  <text x="350" y="495" class="subI" text-anchor="middle">ecommerce-frontend-&#8249;env&#8250;</text>
+
+  <rect x="540" y="416" width="240" height="86" rx="10" fill="#ffffff" stroke="#d86413" stroke-width="1.6" filter="url(#shadow)"/>
+  <text x="660" y="442" class="title" text-anchor="middle">api service</text>
+  <text x="660" y="460" class="sub" text-anchor="middle">ECS Fargate &#183; Spring Boot</text>
+  <text x="660" y="478" class="sub" text-anchor="middle">target group &#183; /actuator/health</text>
+  <text x="660" y="495" class="subI" text-anchor="middle">ecommerce-application-&#8249;env&#8250;</text>
+
+  <!-- ===== isolated subnets ===== -->
+  <rect x="90" y="558" width="830" height="130" rx="12" fill="#fbeaea" stroke="#d13212" stroke-width="1.6"/>
+  <text x="106" y="582" class="bandLbl" fill="#a02810">isolated subnets &#183; multi-AZ &#183; no internet route</text>
+
+  <rect x="440" y="594" width="240" height="72" rx="10" fill="#ffffff" stroke="#d86413" stroke-width="1.6" filter="url(#shadow)"/>
+  <text x="560" y="622" class="title" text-anchor="middle">RDS PostgreSQL</text>
+  <text x="560" y="640" class="sub" text-anchor="middle">SG: &#8592; api tasks only</text>
+  <text x="560" y="657" class="subI" text-anchor="middle">ecommerce-database-&#8249;env&#8250;</text>
+
+  <!-- ===== managed services (outside VPC) ===== -->
+  <rect x="1000" y="250" width="220" height="90" rx="10" class="node" filter="url(#shadow)"/>
+  <text x="1110" y="278" class="title" text-anchor="middle">Cognito</text>
+  <text x="1110" y="296" class="sub" text-anchor="middle">user pool + managed login</text>
+  <text x="1110" y="312" class="sub mono" text-anchor="middle">auth.ouklymeng.qzz.io</text>
+  <text x="1110" y="328" class="subI" text-anchor="middle">ecommerce-cognito/auth-domain</text>
+
+  <rect x="1000" y="380" width="220" height="80" rx="10" class="node" filter="url(#shadow)"/>
+  <text x="1110" y="408" class="title" text-anchor="middle">Secrets Manager</text>
+  <text x="1110" y="426" class="sub" text-anchor="middle">db credentials +</text>
+  <text x="1110" y="442" class="sub" text-anchor="middle">cognito client secret</text>
+
+  <rect x="1000" y="500" width="220" height="80" rx="10" fill="#fff9e6" stroke="#d79b00" stroke-width="1.4" filter="url(#shadow)"/>
+  <text x="1110" y="528" class="title" text-anchor="middle">acme-ecr</text>
+  <text x="1110" y="546" class="sub" text-anchor="middle">shared image registry</text>
+  <text x="1110" y="562" class="subI" text-anchor="middle">tooling account</text>
+
+  <!-- ================= edges ================= -->
+
+  <!-- browser -> R53 -->
+  <path d="M160,122 L220,122" stroke="#3a4b5c" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="190" y="114" class="edgeLbl" text-anchor="middle">DNS</text>
+
+  <!-- browser -> IGW -->
+  <path d="M140,148 L140,178 L370,178 L370,202 L430,202" stroke="#3a4b5c" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+  <text x="252" y="170" class="edgeLbl" text-anchor="middle">https</text>
+
+  <!-- R53 -> ALB (alias) -->
+  <path d="M295,160 L295,176 Q295,188 307,188 L360,188 Q372,188 372,200 L372,272 Q372,284 384,284 L398,284" stroke="#3a4b5c" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+  <text x="300" y="240" class="edgeLbl">alias</text>
+
+  <!-- IGW -> ALB -->
+  <path d="M505,222 L505,252 Q505,264 493,264 L430,264 Q418,264 418,276 L418,284" stroke="#3a4b5c" stroke-width="2" fill="none" marker-end="url(#arr)"/>
+
+  <!-- ALB -> frontend -->
+  <path d="M405,336 L405,352 Q405,364 393,364 L360,364 Q350,364 350,374 L350,416" stroke="#d86413" stroke-width="2" fill="none" marker-end="url(#arrOrange)"/>
+  <text x="322" y="382" class="edgeLbl">apex</text>
+
+  <!-- ALB -> api -->
+  <path d="M455,336 L455,352 Q455,364 467,364 L645,364 Q660,364 660,378 L660,416" stroke="#d86413" stroke-width="2" fill="none" marker-end="url(#arrOrange)"/>
+  <text x="555" y="356" class="edgeLbl" text-anchor="middle">host api.</text>
+
+  <!-- api -> RDS -->
+  <path d="M660,502 L660,540 Q660,552 648,552 L575,552 Q560,552 560,566 L560,594" stroke="#2e8b57" stroke-width="2" fill="none" marker-end="url(#arrGreen)"/>
+  <text x="672" y="545" class="edgeLbl">:5432</text>
+
+  <!-- api -> NAT (egress) -->
+  <path d="M700,416 L700,368 Q700,356 712,356 L725,356 L725,336" stroke="#8b5cf6" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arrPurple)"/>
+  <text x="713" y="378" class="edgeLbl">egress</text>
+
+  <!-- NAT -> out: cognito + secrets -->
+  <path d="M810,300 L945,300 Q960,300 960,285 L1000,285" stroke="#8b5cf6" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arrPurple)"/>
+  <text x="948" y="280" class="edgeLbl">OIDC</text>
+  <path d="M810,322 L970,322 Q985,322 985,337 L985,405 Q985,418 997,418 L1000,418" stroke="#8b5cf6" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arrPurple)"/>
+
+  <!-- ECR -> tasks (image pull) -->
+  <path d="M1000,540 L960,540 Q945,540 945,525 L945,470 Q945,455 930,455 L780,455" stroke="#3a4b5c" stroke-width="1.6" fill="none" stroke-dasharray="5 4" marker-end="url(#arr)"/>
+  <text x="930" y="505" class="edgeLbl" text-anchor="middle">pull :&#8249;commit-sha&#8250;</text>
+
+  <!-- ===== legend ===== -->
+  <g>
+    <rect x="990" y="620" width="230" height="110" rx="10" fill="#ffffff" stroke="#c9d4dd" stroke-width="1.2"/>
+    <text x="1006" y="642" class="title" font-size="12">Legend</text>
+    <rect x="1006" y="652" width="11" height="11" rx="3" fill="#e7f4e4" stroke="#6cae3e"/>
+    <text x="1024" y="662" class="sub">public &#183; ALB, NAT</text>
+    <rect x="1006" y="672" width="11" height="11" rx="3" fill="#e4eefc" stroke="#4f8fdd"/>
+    <text x="1024" y="682" class="sub">private &#183; app tasks</text>
+    <rect x="1006" y="692" width="11" height="11" rx="3" fill="#fbeaea" stroke="#d13212"/>
+    <text x="1024" y="702" class="sub">isolated &#183; data tier</text>
+    <line x1="1006" y1="716" x2="1026" y2="716" stroke="#3a4b5c" stroke-width="2"/>
+    <text x="1032" y="720" class="sub">inbound request</text>
+    <line x1="1120" y1="716" x2="1140" y2="716" stroke="#8b5cf6" stroke-width="1.6" stroke-dasharray="5 4"/>
+    <text x="1146" y="720" class="sub">outbound / pull</text>
+  </g>
+</svg>
