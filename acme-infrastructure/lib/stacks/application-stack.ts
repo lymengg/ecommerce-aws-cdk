@@ -1,8 +1,11 @@
 import { CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
-import { ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
-import { ISecurityGroup, IVpc, SecurityGroup } from 'aws-cdk-lib/aws-ec2';
+import { ISecurityGroup, IVpc } from 'aws-cdk-lib/aws-ec2';
 import { Repository } from 'aws-cdk-lib/aws-ecr';
 import { Cluster } from 'aws-cdk-lib/aws-ecs';
+import {
+  IApplicationListener,
+  IApplicationLoadBalancer,
+} from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { ARecord, IHostedZone, RecordTarget } from 'aws-cdk-lib/aws-route53';
 import { LoadBalancerTarget } from 'aws-cdk-lib/aws-route53-targets';
 import { ISecret } from 'aws-cdk-lib/aws-secretsmanager';
@@ -10,6 +13,7 @@ import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
 import { DatabaseConnection, LoadBalancedApi } from '../constructs/load-balanced-api';
+import { INGRESS_PRIORITIES } from '../foundation-exports';
 import { API_REPOSITORY_NAME, RegistryLocation } from './ecr-stack';
 import { applyPlatformTags } from '../tags';
 
@@ -21,10 +25,10 @@ export interface ApplicationDnsProps {
   /** The hosted zone the API record is created in. */
   readonly zone: IHostedZone;
 
-  /** ACM certificate covering {@link domainName}, terminating TLS on the load balancer. */
-  readonly certificate: ICertificate;
-
-  /** Fully qualified domain name the API answers on, for example `api.dev.example.com`. */
+  /**
+   * Fully qualified domain name the API answers on, for example `api.dev.example.com`: the host
+   * header the shared listener routes on and the name the alias record publishes.
+   */
   readonly domainName: string;
 }
 
@@ -61,10 +65,21 @@ export interface ApplicationStackProps extends StackProps {
    */
   readonly registry: RegistryLocation;
 
-  /** The Phase 1 load balancer security group, whose HTTP rule is added by this stack. */
-  readonly albSecurityGroup: ISecurityGroup;
+  /**
+   * The platform's shared ingress load balancer, imported by reference. Used for the API's alias
+   * record: an alias target needs the ALB's DNS name and canonical zone id, not a construct of
+   * this stack.
+   */
+  readonly sharedLoadBalancer: IApplicationLoadBalancer;
 
-  /** The Phase 1 application security group, carried by the ECS tasks. */
+  /**
+   * The shared ingress HTTPS listener, imported by reference. The service's host rule is attached
+   * to it; the rule lands in this stack's template because a listener rule's template follows the
+   * scope it is declared in.
+   */
+  readonly httpsListener: IApplicationListener;
+
+  /** The application security group, carried by the ECS tasks. */
   readonly applicationSecurityGroup: ISecurityGroup;
 
   /**
@@ -116,7 +131,7 @@ export class ApplicationStack extends Stack {
   /** The ECS cluster the service runs in. */
   public readonly cluster: Cluster;
 
-  /** The load balanced API: task definition, service, target group, listener and load balancer. */
+  /** The load balanced API: task definition, service, target group and shared-listener rule. */
   public readonly api: LoadBalancedApi;
 
   constructor(scope: Construct, id: string, props: ApplicationStackProps) {
@@ -145,23 +160,15 @@ export class ApplicationStack extends Stack {
       vpc,
     });
 
-    // The Phase 1 load balancer security group is re-imported by id rather than used directly. CDK
-    // creates an added ingress rule as a child of the security group construct, so using the Phase 1
-    // construct would place the Phase 2 HTTP rule in the network stack's template. Re-importing
-    // creates a security group construct owned by this stack, which is where the rule belongs.
-    const albSecurityGroup = SecurityGroup.fromSecurityGroupId(
-      this,
-      'AlbSecurityGroup',
-      props.albSecurityGroup.securityGroupId,
-    );
-
     this.api = new LoadBalancedApi(this, 'Api', {
       vpc,
+      listener: props.httpsListener,
+      hostName: props.dns?.domainName,
+      priority: INGRESS_PRIORITIES.ecommerceApi,
       cluster: this.cluster,
       repository,
       config: config.application,
       serviceName,
-      albSecurityGroup,
       applicationSecurityGroup: props.applicationSecurityGroup,
       database,
       auth: {
@@ -172,8 +179,6 @@ export class ApplicationStack extends Stack {
         allowedOrigins: config.auth.allowedOrigins,
         sessionTimeout: config.auth.sessionTimeout,
       },
-      certificate: props.dns?.certificate,
-      domainName: props.dns?.domainName,
       removalPolicy: config.removalPolicy,
     });
 
@@ -183,20 +188,25 @@ export class ApplicationStack extends Stack {
       new ARecord(this, 'ApiRecord', {
         zone: props.dns.zone,
         recordName: props.dns.domainName,
-        target: RecordTarget.fromAlias(new LoadBalancerTarget(this.api.loadBalancer)),
-        comment: `Alias to the ${namePrefix} application load balancer`,
+        target: RecordTarget.fromAlias(new LoadBalancerTarget(props.sharedLoadBalancer)),
+        comment: `Alias to the shared ${namePrefix} ingress load balancer`,
       });
     }
 
     applyPlatformTags(this, config);
-    this.createOutputs(config, serviceName, props.dns);
+    this.createOutputs(config, serviceName, props.dns, props.sharedLoadBalancer);
   }
 
   /**
    * Publishes where the API answers and how to find the ECS resources. Export names are environment
    * specific so dev, uat and prod coexist in one account.
    */
-  private createOutputs(config: EnvironmentConfig, serviceName: string, dns: ApplicationDnsProps | undefined): void {
+  private createOutputs(
+    config: EnvironmentConfig,
+    serviceName: string,
+    dns: ApplicationDnsProps | undefined,
+    loadBalancer: IApplicationLoadBalancer,
+  ): void {
     const exportPrefix = `ecommerce-${config.environment}`;
 
     new CfnOutput(this, 'ClusterName', {
@@ -212,16 +222,17 @@ export class ApplicationStack extends Stack {
     });
 
     new CfnOutput(this, 'LoadBalancerDnsName', {
-      value: this.api.loadBalancer.loadBalancerDnsName,
-      description: 'DNS name of the application load balancer',
+      value: loadBalancer.loadBalancerDnsName,
+      description: 'DNS name of the shared application load balancer',
       exportName: `${exportPrefix}-alb-dns-name`,
     });
 
     new CfnOutput(this, 'ApiUrl', {
-      // With a certificate the API is reached by name over TLS; without one it is still the load
-      // balancer's own DNS name over plain HTTP, exactly as in Phase 2.
-      value: dns === undefined ? `http://${this.api.loadBalancer.loadBalancerDnsName}` : `https://${dns.domainName}`,
-      description: dns === undefined ? 'Public HTTP endpoint of the API' : 'Public HTTPS endpoint of the API',
+      // With DNS the API is reached by name over TLS; without a delegated domain it is still the
+      // load balancer's own DNS name over plain HTTP - unreachable through the shared listener,
+      // whose 404 default drops it, but kept for smoke visibility.
+      value: dns === undefined ? `http://${loadBalancer.loadBalancerDnsName}` : `https://${dns.domainName}`,
+      description: dns === undefined ? 'Load balancer DNS endpoint of the API' : 'Public HTTPS endpoint of the API',
       exportName: `${exportPrefix}-api-url`,
     });
 
@@ -229,7 +240,7 @@ export class ApplicationStack extends Stack {
       // Kept alongside the HTTPS URL because it is what the redirect is verified against: a request
       // to this plain HTTP endpoint must answer 301 with a Location of the HTTPS URL above.
       new CfnOutput(this, 'HttpApiUrl', {
-        value: `http://${this.api.loadBalancer.loadBalancerDnsName}`,
+        value: `http://${loadBalancer.loadBalancerDnsName}`,
         description: 'Plain HTTP endpoint of the load balancer, which redirects to HTTPS',
         exportName: `${exportPrefix}-api-http-url`,
       });

@@ -1,4 +1,4 @@
-import { App } from 'aws-cdk-lib';
+import { App, Stack } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 
 import { getEnvironmentConfig } from '../lib/config';
@@ -8,6 +8,7 @@ import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { RegistryLocation } from '../lib/stacks/ecr-stack';
 import { FrontendStack } from '../lib/stacks/frontend-stack';
+import { IngressStack } from '../lib/stacks/ingress-stack';
 import { TierSecurityGroups } from '../lib/constructs/tier-security-groups';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
@@ -45,20 +46,35 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
-  const securityGroups = new TierSecurityGroups(network, 'SecurityGroups', { vpc: network.vpc });
+  const dns = new DnsStack(app, `test-dns-${environment}`, { env, config });
+  // The platform's shared ingress, built as a real stack exactly as PlatformStage does.
+  const ingress = new IngressStack(app, `test-ingress-${environment}`, {
+    env,
+    config,
+    vpc: network.vpc,
+    certificate: dns.certificate,
+  });
+  // The service's security groups live in a stack of their own, like EcommerceSecurityStack:
+  // attaching them to the network stack would make network -> ingress and ingress -> network a
+  // cycle.
+  const security = new Stack(app, `test-security-${environment}`, { env });
+  const securityGroups = new TierSecurityGroups(security, 'SecurityGroups', {
+    vpc: network.vpc,
+    albSecurityGroup: ingress.securityGroup,
+  });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,
     vpc: network.vpc,
     databaseSecurityGroup: securityGroups.database,
   });
-  const dns = new DnsStack(app, `test-dns-${environment}`, { env, config });
   const application = new ApplicationStack(app, `test-application-${environment}`, {
     env,
     config,
     vpc: network.vpc,
     registry: TEST_REGISTRY,
-    albSecurityGroup: securityGroups.alb,
+    sharedLoadBalancer: ingress.loadBalancer,
+    httpsListener: ingress.httpsListener,
     applicationSecurityGroup: securityGroups.application,
     database: {
       host: database.instance.dbInstanceEndpointAddress,
@@ -66,7 +82,7 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
       databaseName: config.database.databaseName,
       secret: database.credentialsSecret,
     },
-    dns: { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
+    dns: { zone: dns.zone, domainName: dns.apiDomainName },
     auth: {
       issuerUrl: 'https://cognito-idp.example.com/pool',
       userPoolClientId: 'test-client-id',
@@ -81,9 +97,8 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
     registry: TEST_REGISTRY,
     cluster: application.cluster,
     applicationSecurityGroup: securityGroups.application,
-    loadBalancer: application.api.loadBalancer,
-    albSecurityGroup: securityGroups.alb,
-    httpsListener: application.api.httpsListener!,
+    loadBalancer: ingress.loadBalancer,
+    httpsListener: ingress.httpsListener,
     zone: dns.zone,
   });
 
@@ -278,14 +293,15 @@ describe('FrontendStack routing', () => {
   test('adds a host rule that sends the SPA host to the frontend target group', () => {
     const rule = single(buildStacks('dev').template, 'AWS::ElasticLoadBalancingV2::ListenerRule');
 
-    expect(rule.properties.Priority).toBe(10);
+    expect(rule.properties.Priority).toBe(110);
     expect(rule.properties.Conditions).toEqual([
       { Field: 'host-header', HostHeaderConfig: { Values: [TEST_SITE] } },
     ]);
     expect(rule.properties.Actions[0].Type).toBe('forward');
     expect(json(rule.properties.Actions[0].TargetGroupArn)).toContain('TargetGroup');
-    // The rule belongs to this stack, not the application stack: the listener is re-imported.
-    expect(json(rule.properties.ListenerArn)).toContain('HttpsListener');
+    // The rule belongs to this stack but the listener belongs to the ingress stack: it is
+    // referenced by ARN, never redefined.
+    expect(json(rule.properties.ListenerArn)).toContain('test-ingress');
   });
 
   test('creates no listener of its own, and adds no security group rule', () => {
@@ -305,7 +321,7 @@ describe('FrontendStack routing', () => {
     expect(Object.keys(byType).sort()).toEqual(['A', 'AAAA']);
     for (const properties of Object.values(byType)) {
       expect(properties.Name).toBe(`${TEST_SITE}.`);
-      expect(json(properties.AliasTarget)).toContain('ApiLoadBalancer');
+      expect(json(properties.AliasTarget)).toContain('test-ingress');
       expect(properties.ResourceRecords).toBeUndefined();
       expect(properties.TTL).toBeUndefined();
     }

@@ -1,5 +1,6 @@
 import { App, RemovalPolicy } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
+import { SecurityGroup } from 'aws-cdk-lib/aws-ec2';
 
 import { getEnvironmentConfig } from '../lib/config';
 import { EnvironmentName } from '../lib/config/types';
@@ -35,7 +36,12 @@ function buildStacks(environment: EnvironmentName): BuiltStacks {
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
-  const securityGroups = new TierSecurityGroups(network, 'SecurityGroups', { vpc: network.vpc });
+  // The shared ingress ALB's security group stands in for the platform's: only its id matters here.
+  const albSecurityGroup = new SecurityGroup(network, 'SharedAlbSecurityGroup', { vpc: network.vpc });
+  const securityGroups = new TierSecurityGroups(network, 'SecurityGroups', {
+    vpc: network.vpc,
+    albSecurityGroup,
+  });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,

@@ -162,9 +162,10 @@ Traffic paths created by the stacks:
 Security group chain:
 
 ```
-Internet ──443─▶ ALB SG ──8080──▶ Application SG ──5432──▶ Database SG
-Internet ──80──▶ ALB SG              │
- (301 redirect)                      └──443──▶ Internet (via NAT, e.g. image pulls)
+Internet ──443─▶ shared ALB SG ──8080──▶ Application SG ──5432──▶ Database SG
+Internet ──80──▶ shared ALB SG          │        (service-owned, in ecommerce-security-<env>)
+ (301 redirect)    (platform-owned,     └──443──▶ Internet (via NAT, e.g. image pulls)
+                  in acme-ingress-<env>)
 ```
 
 ### The Phase 4 request path
@@ -223,7 +224,7 @@ aws-cdk/
 │   ├── bin/
 │   │   ├── organization.ts           # deploys acme-organization (platform team)
 │   │   ├── registry.ts               # deploys acme-ecr, the shared registry (platform team)
-│   │   ├── platform.ts               # deploys acme-network/acme-dns per env (platform team)
+│   │   ├── platform.ts               # deploys acme-network/acme-dns/acme-ingress per env (platform team)
 │   │   ├── ecommerce.ts              # deploys the ecommerce service into an env (service team)
 │   │   └── pipeline.ts               # deploys the ecommerce-platform CI pipeline
 │   ├── lib/
@@ -235,12 +236,12 @@ aws-cdk/
 │   │   │   ├── prod.ts               # prod values
 │   │   │   └── index.ts              # environment + image tag resolution, config lookup
 │   │   ├── constructs/
-│   │   │   ├── tier-security-groups.ts   # ALB / application / database security groups
+│   │   │   ├── tier-security-groups.ts   # application / database security groups + shared-ALB rule
 │   │   │   ├── vpc-flow-logs.ts          # optional flow logging + its least-privilege role
-│   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB + auth wiring, IAM
+│   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, target group, listener rule, DB + auth wiring, IAM
 │   │   ├── ecommerce-stage.ts        # SharedRegistryStage + EcommerceStage (the service, per env)
-│   │   ├── platform-stage.ts         # PlatformStage: the shared network + DNS foundation per env
-│   │   ├── foundation-exports.ts     # the acme-<env>-* export names both sides of the boundary use
+│   │   ├── platform-stage.ts         # PlatformStage: the shared network + DNS + ingress foundation per env
+│   │   ├── foundation-exports.ts     # the acme-<env>-* export names + ingress priority allocations
 │   │   ├── stacks/
 │   │   │   ├── network-stack.ts      # shared VPC, subnets, routing, flow logs (platform-owned)
 │   │   │   ├── security-stack.ts     # service-owned tier SGs + the shared-foundation imports
@@ -251,7 +252,8 @@ aws-cdk/
 │   │   │   ├── auth-certificate-stack.ts # us-east-1 ACM certificate for the Cognito custom domain
 │   │   │   ├── cognito-stack.ts      # user pool, confidential app client, client secret (Phase 4)
 │   │   │   ├── auth-domain-stack.ts  # Cognito custom domain + alias records (Phase 4)
-│   │   │   ├── application-stack.ts  # ECS cluster, service, ALB, IAM, logs, DNS record
+│   │   │   ├── ingress-stack.ts      # the shared per-environment ALB, listeners and security group (platform-owned)
+│   │   │   ├── application-stack.ts  # ECS cluster, service, target group, listener rule, IAM, logs, DNS record
 │   │   │   └── frontend-stack.ts     # nginx ECS service, host rule, apex records (Phase 4.5)
 │   │   └── tags.ts                   # the shared tag contract
 │   ├── test/
@@ -327,18 +329,19 @@ by every service in the environment):
 | ----- | ---- | ------- |
 | Network | `acme-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, flow logs — no security groups: those are a service's own rulebook |
 | DNS | `acme-dns-<env>` | Route 53 hosted zone, ACM certificate |
+| Ingress | `acme-ingress-<env>` | The **shared** internet-facing ALB for the whole environment, its 80→443 redirect and 443 listener (fixed-404 default), the shared ALB security group |
 | Registry | `acme-ecr` | **Shared** ECR repositories (`ecommerce-api`, `ecommerce-frontend`), one pair for every environment |
 
 Service stacks (`bin/ecommerce.ts` — the ecommerce service's own resources):
 
 | Stack | Name | Creates |
 | ----- | ---- | ------- |
-| Security | `ecommerce-security-<env>` | The attachment point: imports the shared VPC/zone/certificate and creates the service's own ALB / application / database security groups inside it |
+| Security | `ecommerce-security-<env>` | The attachment point: imports the shared VPC/zone/ingress and creates the service's own application / database security groups inside it |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
 | Auth certificate | `ecommerce-auth-cert-<env>` | ACM certificate for `auth.<env-domain>` in `us-east-1`, the only region a Cognito custom domain reads certificates from |
 | Cognito | `ecommerce-cognito-<env>` | Cognito user pool, confidential app client, client-secret secret, baseline alarm |
-| Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listeners, alias record, log group, IAM roles |
-| Frontend | `ecommerce-frontend-<env>` | nginx ECS service + target group, host rule on the application stack's HTTPS listener, apex alias records, IAM roles, log group |
+| Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, target group, host rule on the **shared** HTTPS listener, `api.` alias record, log group, IAM roles |
+| Frontend | `ecommerce-frontend-<env>` | nginx ECS service + target group, apex host rule on the **shared** HTTPS listener, apex alias records, IAM roles, log group |
 | Auth domain | `ecommerce-auth-domain-<env>` | Cognito custom domain (`auth.<env-domain>`, managed login v2), `auth` A/AAAA alias records |
 | Cost | `ecommerce-cost-<env>` | Monthly budget, cost-anomaly monitor + subscription, `Environment` cost category, the shared `ecommerce-<env>-alerts` SNS topic |
 
@@ -385,17 +388,17 @@ dependency — a leaf stack keeps the graph acyclic.
 
 The frontend stack is **separate from the compute** even though it shares the load balancer: the SPA
 is deployed on its own cadence (a content change is not an API change) and the two services scale
-independently. It consumes the ECS cluster, the HTTPS listener, the load balancer, the application
-security group, the frontend repository and the hosted zone **by reference**, so it is deployed after
-the application and can be redeployed alone. See
+independently. It consumes the ECS cluster, the shared HTTPS listener, the shared load balancer, the
+application security group, the frontend repository and the hosted zone **by reference**, so it is
+deployed after the application and can be redeployed alone. See
 [Core concepts: frontend hosting](#core-concepts-frontend-hosting).
 
-Deployment order is therefore: **network → registry → database → dns → auth-certificate → cognito →
-application → frontend → auth-domain**. The DNS stack sits between the database and the application
-because the application consumes its zone and certificate; the Cognito stack sits between DNS and the
-application because the application consumes the pool and the client secret; the frontend sits after
-the application because it consumes the load balancer the application creates; and the auth domain
-closes the graph because Cognito requires the apex A record the frontend publishes. Nothing consumes
+Deployment order is therefore: **network → dns → ingress → registry → database → auth-certificate →
+cognito → application → frontend → auth-domain**. The ingress stack sits between the DNS stack and
+every service because each service attaches its listener rules to the shared listener; the Cognito
+stack sits between DNS and the application because the application consumes the pool and the client
+secret; the frontend sits after the application because it joins the application's cluster; and the
+auth domain closes the graph because Cognito requires the apex A record the frontend publishes. Nothing consumes
 the auth domain, so there is no path back and the graph stays acyclic. One manual step sits inside
 that order: the zone must be delegated at the registrar (see
 [Core concepts: DNS and TLS](#core-concepts-dns-and-tls)) before the certificates finish issuing.
@@ -423,7 +426,7 @@ deploys its own stacks on top.
 | Stage | Contains | Why it is separate |
 | ----- | -------- | ------------------ |
 | `registry` | `acme-ecr` | The shared registry: deployed once, not per environment. In the pipeline the image-build step sits between this stage and the first environment, which is only possible if the registry is its own stage. |
-| `<env>-foundation` (`dev-foundation`) | `acme-network-<env>`, `acme-dns-<env>` | The platform team's per-environment foundation: every service attaches to this VPC and writes records into this zone. Separate so a service team never deploys networking. |
+| `<env>-foundation` (`dev-foundation`) | `acme-network-<env>`, `acme-dns-<env>`, `acme-ingress-<env>` | The platform team's per-environment foundation: every service attaches to this VPC, writes records into this zone and hangs host rules on the shared listener. Separate so a service team never deploys networking or the shared load balancer. |
 | `<env>` (`dev`) | the eight `ecommerce-*` stacks | The service stage: everything the ecommerce service owns. `ecommerce-security-<env>` is the single attachment point - it imports the foundation's `acme-<env>-*` exports with `Fn.importValue` and creates the service's own security groups, so deploy fails fast if the foundation is missing. |
 
 The service stage consumes the repositories **by location** — `{account, region}` + the fixed
@@ -452,7 +455,8 @@ Source (CodeConnections -> GitHub)
   -> registry         pre: InfrastructureTests | FrontendTests | ApiTests (parallel)
                       deploy acme-ecr (the shared repositories)
   -> dev-foundation   pre: BuildImages (docker build x2 -> push :<commit SHA>, once)
-                      deploy acme-network-dev + acme-dns-dev (shared VPC and zone)
+                      deploy acme-network-dev + acme-dns-dev + acme-ingress-dev
+                      (shared VPC, zone and the one load balancer for the environment)
   -> dev              deploy the eight ecommerce-* stacks (import the foundation's exports)
                       post: SmokeTests-dev (curl the health, auth and 401 checks)
   -> uat-foundation   pre: manual approval - promotes the identical images
@@ -791,9 +795,13 @@ instead of leaving a half-deployed service behind.
 
 ### Application Load Balancer (ALB)
 
-A layer-7 load balancer. It is internet-facing, lives in the public subnets, carries the ALB security
-group, and forwards HTTP traffic to the ECS service's target group. It is the only internet-facing
-resource in the platform; the task itself has no public address.
+A layer-7 load balancer. It is internet-facing, lives in the public subnets, carries the shared ALB
+security group, and routes by **host header** to each service's target group. There is exactly one
+per environment — `acme-ingress-<env>` — because an ALB bills by the hour whether it fronts one
+service or twenty, and it is the only internet-facing resource; the tasks themselves have no public
+address. The platform owns the chassis (the listeners, the shared security group, the default
+actions); every service owns its rules and target groups, and takes its listener-rule priorities
+from the allocation registry in `lib/foundation-exports.ts` so two services can never collide.
 
 ### Target group
 
@@ -812,13 +820,16 @@ address is ever managed by hand. The health check is what decides whether a task
 
 ### Listener
 
-Accepts connections on a port and acts on them. There are two listeners once a certificate is
-configured:
+Accepts connections on a port and acts on them. The shared ALB carries two listeners:
 
 | Listener | Port | Protocol | Default action |
 | -------- | ---- | -------- | -------------- |
-| `HttpsListener` | 443 | HTTPS | **forward** to the target group |
-| `HttpListener` | 80 | HTTP | **redirect** (HTTP 301) to `https://<fqdn>` |
+| `HttpsListener` | 443 | HTTPS | **fixed 404** — no service is the implicit catch all |
+| `HttpListener` | 80 | HTTP | **redirect** (HTTP 301) to `https://<host>` |
+
+Each service adds its own *listener rules* (host header → its target group) on the 443 listener. A
+request whose host matches no rule is turned away at the edge rather than landing on whichever
+service happened to be "the default".
 
 The redirect is a listener *action*, not a target group: a plaintext request is answered by the load
 balancer itself and never reaches the application. TLS terminates at the load balancer with the ACM
@@ -830,12 +841,8 @@ policy still negotiates TLS 1.0/1.1 and is deliberately not used.
 
 The 443 listener also carries the **HSTS** response header
 (`routing.http.response.strict_transport_security.header_value = max-age=31536000; includeSubDomains`),
-so a browser that has seen the API once will not retry it over plaintext. Setting it at the load
-balancer rather than only in the application means the redirect from port 80 carries it too.
-
-`LoadBalancedApi` still supports being built without a certificate — the single port 80 listener
-forwards to the target group exactly as it did in Phase 2 — but no environment takes that path any
-more: from Phase 4 authentication needs an HTTPS origin, so `dns` is required everywhere.
+so a browser that has seen the site once will not retry it over plaintext. Setting it on the shared
+listener means every service's responses — and the port 80 redirect — carry it.
 
 ### CloudWatch Logs
 
@@ -1006,7 +1013,7 @@ link to click, no record to add by hand and no renewal to remember: ACM creates 
 it to resolve, issues the certificate, and renews it automatically.
 
 Managed renewal has one condition worth knowing: ACM only renews a certificate that is **in use by an
-integrated service** (or exported). Until the application stack attaches it to the load balancer
+integrated service** (or exported). Until the shared ingress stack attaches it to the load balancer
 listener, the certificate reports `RenewalEligibility: INELIGIBLE` — that is expected, not a fault,
 and it flips to `ELIGIBLE` once the listener references it. The scope is deliberately minimal — the
 API name plus the apex the SPA is served from, no wildcard, and no CAA records (a deferred hardening
@@ -1281,7 +1288,7 @@ Fargate service behind the load balancer that already exists**.
 | `ecr.Repository` | Holds the frontend image. Separate from the API's, because the two images have different lifecycles. |
 | ECS service + task | nginx serving the built SPA, in the private subnets on the application security group. |
 | Target group | Forwards to container port 8080 and health checks `/healthz`, which nginx answers itself - so a broken bundle cannot make the task look unhealthy. |
-| **Listener rule** (host header) | Sends `<env-domain>` to the frontend target group. Every other host, including `api.<env-domain>` and the load balancer's own name, falls through to the listener's default action, which is the API. |
+| **Listener rule** (host header) | Sends `<env-domain>` to the frontend target group. Every other host falls through to another service's rule — `api.<env-domain>` is the API's — or to the shared listener's fixed 404 default. |
 | Route 53 alias (A + AAAA) | Points the apex at the load balancer. An alias, not a CNAME, because a CNAME is not valid at the apex. |
 | The DNS stack's certificate | Gains the apex as a subject alternative name, so **one** certificate covers both public names - no wildcard. |
 
@@ -1716,26 +1723,18 @@ Rules and rationale:
   an RDS instance has no reason to start a connection, so it cannot.
 - **The application tier has no inbound rule from the internet**, and its outbound internet access is
   limited to TLS (443).
-- **Only the load balancer accepts traffic from `0.0.0.0/0`.** Phase 1 opened 443; Phase 2 adds 80 for
-  the HTTP listener. Port 80 is added by the *application* stack, not the network stack: the load
-  balancer security group is re-imported there so the Phase 2 rule is owned by the Phase 2 stack.
-  Phase 3.5 needs no new rule at all — 443 was already open, and 80 is still where the redirect to
-  HTTPS answers, so the application stack adds no duplicate ingress rule.
+- **Only the shared load balancer accepts traffic from `0.0.0.0/0`.** Its security group lives in the
+  platform's `acme-ingress-<env>` stack and opens exactly 80 (redirect) and 443 to the internet; its
+  only egress is the VPC CIDR on the shared backend port, so the ALB can reach service tasks and
+  nothing else.
+- **The service's application group admits the shared ALB group on the backend port only** — and
+  every service in the environment gets the same shape: shared subnets, service-owned groups, no
+  cross-service reachability. Another service's tasks cannot reach this one's tasks or database
+  because neither destination group has a rule allowing it.
 - **The application and database stacks create no security group of their own** — they reference the
-  Phase 1 groups, so there is exactly one definition of each.
+  security stack's groups, so there is exactly one definition of each.
 - **`allowAllOutbound: false` everywhere**, with egress granted explicitly.
 - The VPC's **default security group is stripped of its rules** (`restrictDefaultSecurityGroup: true`).
-
-### The no-traffic egress rule
-
-The `Alb` and `Database` groups contain an egress rule that matches nothing:
-`ICMP 252-86 → 255.255.255.255/32`, described as "Disallow all traffic".
-
-This is not a mistake. CloudFormation adds an **allow-all-outbound** rule to any security group whose
-inline `SecurityGroupEgress` list is empty, and a rule pointing at another security group is rendered
-as a separate resource rather than inline. Without the marker, the load balancer group would silently
-regain `allowAllOutbound`. The marker keeps the inline list non-empty so the rule set in the template
-is exactly the rule set intended.
 
 ---
 
@@ -1898,8 +1897,13 @@ account without clashing.
 | Database | `CredentialsSecretArn` | `ecommerce-dev-db-secret-arn` | ECS secret injection, operators |
 | DNS | `HostedZoneId` | `acme-dev-hosted-zone-id` | service stacks write their records into the zone |
 | DNS | `HostedZoneNameServers` | `acme-dev-hosted-zone-name-servers` | registrar delegation (by hand, once) |
-| DNS | `CertificateArn` | `acme-dev-certificate-arn` | the application stack's HTTPS listener |
-| DNS | `ApiDomainName` | `acme-dev-api-domain-name` | the application stack's alias record and `ApiUrl` |
+| DNS | `CertificateArn` | `acme-dev-certificate-arn` | the shared ingress stack's HTTPS listener |
+| DNS | `ApiDomainName` | `acme-dev-api-domain-name` | the application stack's listener rule, alias record and `ApiUrl` |
+| Ingress | `LoadBalancerArn` | `acme-dev-alb-arn` | services importing the shared ALB |
+| Ingress | `LoadBalancerDnsName` | `acme-dev-alb-dns-name` | service alias records |
+| Ingress | `LoadBalancerCanonicalHostedZoneId` | `acme-dev-alb-canonical-hosted-zone-id` | service alias records |
+| Ingress | `AlbSecurityGroupId` | `acme-dev-alb-security-group-id` | each service's application SG accepts it on 8080 |
+| Ingress | `HttpsListenerArn` | `acme-dev-https-listener-arn` | service listener rules attach to it |
 | Cognito | `UserPoolId` | `ecommerce-dev-user-pool-id` | operators, Cognito CLI |
 | Cognito | `UserPoolClientId` | `ecommerce-dev-user-pool-client-id` | the application stack's `COGNITO_CLIENT_ID` |
 | Cognito | `IssuerUrl` | `ecommerce-dev-cognito-issuer-url` | the application stack's `COGNITO_ISSUER_URI` |
@@ -2225,6 +2229,7 @@ npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the ins
 npx cdk destroy ecommerce-cognito-dev     -c environment=dev   # only if the user pool should go too
 npx cdk destroy ecommerce-security-dev    -c environment=dev   # last: its SGs are what the others referenced
 npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" destroy acme-ecr   # shared registry: RETAINed, delete repos by hand
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-ingress-dev -c environment=dev
 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-dns-dev -c environment=dev   # only when a domain was configured
 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-network-dev -c environment=dev
 ```
@@ -2341,6 +2346,7 @@ npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-cognito-dev     -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev
 npx cdk destroy ecommerce-security-dev    -c environment=dev   # last: the other stacks referenced its SGs
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-ingress-dev -c environment=dev
 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-dns-dev -c environment=dev
 # then: delete the NS records for dev.example.com at the registrar by hand
 ```
@@ -2354,11 +2360,10 @@ registrar change.
 
 ## Testing
 
-`npm test` in `acme-infrastructure/` runs **214 Jest tests** over the synthesised CloudFormation
-templates and the configuration modules — 33 for the network stack, 18 for the database stack, 41 for
-the application stack, 12 for the DNS stack, 4 for the auth certificate stack, 25 for the Cognito
-stack, 5 for the auth domain stack, 17 for the frontend stack, 7 for the registry stack and 52 for
-the configuration. `mvn test` in `application/` runs **28 Spring
+`npm test` in `acme-infrastructure/` runs **237 Jest tests** over the synthesised CloudFormation
+templates and the configuration modules — covering the network, ingress, database, DNS, security,
+application, frontend, Cognito, auth certificate and domain, registry, cost, organization and
+pipeline stacks plus the configuration. `mvn test` in `application/` runs **28 Spring
 Boot tests** — 9 product end-to-end HTTP tests against a real PostgreSQL, 13 access-control tests, 2
 logout-handler tests, and 4 service unit tests — and needs a Docker daemon. `npm test` in `frontend/`
 runs **13 Vitest tests** over the cart store, the formatting/error helpers and the post-login
@@ -2380,8 +2385,8 @@ Network (Phase 1, Phase 3):
 - both private route tables send `0.0.0.0/0` to a NAT Gateway and never to the Internet Gateway
 - the isolated database subnets have route tables with **no routes at all**, so there is no path to
   the internet gateway or to a NAT gateway
-- the three tier security groups exist; only the ALB accepts `0.0.0.0/0` inbound
-- the application and database tiers are reachable only by security group reference
+- the stack creates **no** security group at all: a security group is the service's own rulebook, so
+  the tier groups live in `ecommerce-security-<env>`
 - the project, environment and management tags are present on every resource
 - the VPC, public, private and database subnet outputs exist, with one subnet id per Availability Zone
 - flow logs are off in dev and capture all traffic in prod, with a scoped delivery policy
@@ -2423,6 +2428,26 @@ DNS and TLS (Phase 3.5):
 - the zone and the certificate carry the project, environment and management tags
 - the name servers, certificate ARN and API domain name are exported
 
+Shared ingress:
+
+- exactly one internet-facing ALB exists, in the public subnets, deletion-protected where the
+  removal policy is `RETAIN`
+- its security group opens only 80 and 443 to `0.0.0.0/0`, and its only egress is the VPC CIDR on
+  the shared backend port — the ALB can reach service tasks and nothing else
+- the port 80 listener permanently redirects to 443; the port 443 listener terminates TLS with the
+  shared certificate (`ELBSecurityPolicy-TLS13-1-2-2021-06`), carries HSTS, and answers unmatched
+  hosts with a fixed **404** — no service is the implicit default
+- the listener ARN, ALB attributes and shared security group id are exported under the
+  `acme-<env>-*` contract for service stacks to import
+
+Service security (`ecommerce-security-<env>`):
+
+- the application and database security groups exist in the shared VPC; no internet-facing group is
+  created — the shared ALB group is imported from the ingress stack
+- the application tier admits traffic on 8080 **only** from the imported shared-ALB group; the
+  database tier admits 5432 **only** from the application group, never a CIDR
+- the application tier's outbound is the database port plus HTTPS to the internet (NAT) only
+
 Cognito (Phase 4):
 
 - the user pool is named per environment, with the password policy, MFA mode and self sign-up from
@@ -2457,9 +2482,10 @@ Frontend hosting (Phase 4.5):
 - the execution role can pull the one frontend image and write to the one log group, and nothing
   else; the task role has no permissions at all
 - the host rule matches the apex only, forwards to the frontend target group, and is owned by this
-  stack (the listener is re-imported); every other host falls through to the API
+  stack on the shared listener (priority 110, from the platform's allocation registry); every other
+  host falls through to another service's rule or the 404 default
 - the stack creates no listener, no security group and no repository of its own
-- IPv4 and IPv6 alias records point the apex at the load balancer
+- IPv4 and IPv6 alias records point the apex at the shared load balancer
 - the service rolls back a failed deployment, and runs two tasks in prod but one in dev/uat
 - the resources are tagged, and the site URL, service name and target group ARN are exported
 
@@ -2480,14 +2506,12 @@ Application (Phase 2, Phase 3, Phase 3.5, Phase 4):
 - the task role has no permissions at all; no administrator or power-user policy appears anywhere
 - the service runs exactly one task, in the private subnets, without a public IP, in the application
   security group, with the circuit breaker enabled
-- the load balancer is internet-facing in the public subnets and opens only port 80 to the internet
-  (the application stack adds no duplicate rule for 443, which Phase 1 already opened)
-- a stack built without `dns` still supports the certificate-less forwarding listener — the construct
-  capability is kept even though every environment now configures a domain
-- the port 443 listener terminates TLS (`ELBSecurityPolicy-TLS13-1-2-2021-06`), carries the HSTS
-  response header, and forwards to the target group; the port 80 listener is a permanent redirect to
-  HTTPS; an alias `A` record points at the load balancer (never an IP); and `ApiUrl` is
-  `https://<fqdn>` with the plaintext URL kept as `HttpApiUrl` for the redirect check
+- the stack creates no load balancer, listener, security group or ingress rule of its own — those
+  belong to the platform's `acme-ingress-<env>` and the service's own security stack
+- a host rule on the shared listener sends `api.<env-domain>` to the API target group (priority 100,
+  from the platform's allocation registry); an alias `A` record points at the shared load balancer
+  (never an IP); and `ApiUrl` is `https://<fqdn>` with the plaintext URL kept as `HttpApiUrl` for the
+  redirect check
 - the application stack defines neither the hosted zone nor the certificate, only references them
 - the target group health checks `/actuator/health` on 8080
 - the project, environment and management tags are present on every resource

@@ -3,6 +3,7 @@ import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from './config';
 import { DnsStack } from './stacks/dns-stack';
+import { IngressStack } from './stacks/ingress-stack';
 import { NetworkStack } from './stacks/network-stack';
 
 export interface PlatformStageProps extends StageProps {
@@ -28,6 +29,7 @@ export interface PlatformStageProps extends StageProps {
 export class PlatformStage extends Stage {
   public readonly network: NetworkStack;
   public readonly dns: DnsStack;
+  public readonly ingress: IngressStack;
 
   constructor(scope: Construct, id: string, props: PlatformStageProps) {
     super(scope, id, props);
@@ -56,6 +58,20 @@ export class PlatformStage extends Stage {
       stackName: `acme-dns-${environment}`,
       config,
       description: `Shared environment public DNS and TLS certificate (${environment})`,
+    });
+
+    // One load balancer for the whole environment: an ALB bills by the hour whether it fronts one
+    // service or twenty, so services share this chassis and each attaches its own host rules to
+    // the listener. The platform owns the chassis, the listeners and the shared security group;
+    // every service owns its rules and target groups. Deploy order within the stage is implicit:
+    // the ingress consumes the VPC and the certificate by reference.
+    this.ingress = new IngressStack(this, `acme-ingress-${environment}`, {
+      env,
+      stackName: `acme-ingress-${environment}`,
+      config,
+      vpc: this.network.vpc,
+      certificate: this.dns.certificate,
+      description: `Shared environment ingress load balancer (${environment})`,
     });
   }
 }

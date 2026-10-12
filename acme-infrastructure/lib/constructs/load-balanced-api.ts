@@ -1,6 +1,5 @@
 import { Duration, RemovalPolicy } from 'aws-cdk-lib';
-import { ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
-import { ISecurityGroup, IVpc, Peer, Port, SubnetType } from 'aws-cdk-lib/aws-ec2';
+import { ISecurityGroup, IVpc, SubnetType } from 'aws-cdk-lib/aws-ec2';
 import { IRepository } from 'aws-cdk-lib/aws-ecr';
 import {
   Cluster,
@@ -13,13 +12,13 @@ import {
   Secret as EcsSecret,
 } from 'aws-cdk-lib/aws-ecs';
 import {
-  ApplicationListener,
-  ApplicationLoadBalancer,
+  ApplicationListenerRule,
   ApplicationProtocol,
   ApplicationTargetGroup,
+  IApplicationListener,
   ListenerAction,
+  ListenerCondition,
   Protocol as ElbProtocol,
-  SslPolicy,
   TargetType,
 } from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import { Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
@@ -28,12 +27,6 @@ import { ISecret } from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 
 import { ApplicationConfig } from '../config/types';
-
-/** Port the load balancer accepts public HTTP traffic on. With a certificate it redirects to 443. */
-const LISTENER_PORT = 80;
-
-/** Port the load balancer accepts public HTTPS traffic on once a certificate is supplied. */
-const HTTPS_LISTENER_PORT = 443;
 
 /**
  * Everything the container needs to reach the database (Phase 3).
@@ -90,8 +83,26 @@ export interface AuthConnection {
 }
 
 export interface LoadBalancedApiProps {
-  /** The Phase 1 VPC. The load balancer lands in its public subnets, the tasks in its private ones. */
+  /** The Phase 1 VPC. The target group lives in it, the tasks in its private subnets. */
   readonly vpc: IVpc;
+
+  /**
+   * The shared ingress HTTPS listener, imported by reference. The host rule routing
+   * {@link hostName} to this service's target group is attached to it; the rule is created as a
+   * resource of *this* stack, because a listener rule construct's template follows the scope it is
+   * declared in, not the listener's.
+   */
+  readonly listener: IApplicationListener;
+
+  /**
+   * Host header the listener rule matches, for example `api.dev.example.com`. Omitted only when the
+   * environment has no delegated domain; without one no rule is created, so unmatched traffic keeps
+   * answering the shared listener's 404 rather than this target group.
+   */
+  readonly hostName?: string;
+
+  /** Listener rule priority, allocated from this service's {@link INGRESS_PRIORITIES} block. */
+  readonly priority: number;
 
   /** ECS cluster the service is created in. */
   readonly cluster: Cluster;
@@ -105,16 +116,7 @@ export interface LoadBalancedApiProps {
   /** Name shared by the ECS service, task family, load balancer, target group and log group. */
   readonly serviceName: string;
 
-  /**
-   * The Phase 1 load balancer security group, re-imported so that it is *owned by the stack that
-   * builds this construct*. CDK creates an added rule as a child of the security group construct,
-   * so a rule added to the security group while it still lives in the network stack would end up in
-   * the network stack's template. Re-importing keeps the Phase 2 HTTP rule in the Phase 2 stack,
-   * where it belongs. See ApplicationStack.
-   */
-  readonly albSecurityGroup: ISecurityGroup;
-
-  /** The Phase 1 application security group. The ECS tasks carry it, so the ALB can reach them. */
+  /** The application security group. The ECS tasks carry it, so the shared ALB can reach them. */
   readonly applicationSecurityGroup: ISecurityGroup;
 
   /** Where the container finds the database and the secret holding its credentials (Phase 3). */
@@ -123,58 +125,33 @@ export interface LoadBalancedApiProps {
   /** How the container authenticates as the Cognito OAuth client (Phase 4). */
   readonly auth: AuthConnection;
 
-  /**
-   * ACM certificate covering {@link domainName}. When supplied, the load balancer terminates TLS on
-   * 443 and the port 80 listener becomes a permanent redirect. When omitted (dev before a domain
-   * has been delegated), the load balancer keeps today's plaintext HTTP path.
-   */
-  readonly certificate?: ICertificate;
-
-  /**
-   * Fully qualified domain name the certificate covers, for example `api.dev.example.com`. Only
-   * used to document the listener; the load balancer does not need it to serve the certificate.
-   */
-  readonly domainName?: string;
-
   /** Removal policy for resources that support one: the log group. */
   readonly removalPolicy: RemovalPolicy;
 }
 
 /**
- * The Phase 2 application tier: a Spring Boot API running as a single Fargate task behind an
- * internet-facing Application Load Balancer, now reading and writing PostgreSQL (Phase 3) and, when
- * a certificate is supplied, terminating TLS (Phase 3.5).
+ * The application tier: a Spring Boot API running as Fargate tasks behind the platform's shared
+ * Application Load Balancer, reading and writing PostgreSQL (Phase 3).
  *
- *   Internet -> ALB (public subnets) -> target group -> ECS service (private subnets) -> Fargate task
- *                                                                                          |
- *                                                                       TCP 5432 (application SG)
- *                                                                                          v
- *                                                                            RDS (isolated subnets)
+ *   Internet -> shared ALB :443 -host rule-> target group -> ECS service (private) -> Fargate task
+ *                                                                                   |
+ *                                                                TCP 5432 (application SG)
+ *                                                                                   v
+ *                                                                     RDS (isolated subnets)
  *
- * The load balancer is the only internet-facing resource; the task itself has no public address and
- * is reachable only from the load balancer's security group. Everything is wired with L2 constructs,
- * and the ECS service registers and deregisters its task with the target group automatically, so no
- * task IP address is ever managed by hand.
+ * The shared load balancer - owned by the platform's ingress stack - is the only internet-facing
+ * resource; the task itself has no public address and is reachable only from the load balancer's
+ * security group. What this construct owns is everything *behind* the shared listener: the target
+ * group, the host rule that routes this service's host name to it, and the compute. The ECS
+ * service registers and deregisters its tasks with the target group automatically, so no task IP
+ * address is ever managed by hand.
  */
 export class LoadBalancedApi extends Construct {
-  /** The load balancer serving public traffic. */
-  public readonly loadBalancer: ApplicationLoadBalancer;
-
   /** Target group the ECS service registers its tasks with. */
   public readonly targetGroup: ApplicationTargetGroup;
 
-  /**
-   * Port 80 listener. Forwards to {@link targetGroup} when no certificate is configured; with a
-   * certificate it answers a permanent redirect to HTTPS instead, so no plaintext request reaches
-   * the application.
-   */
-  public readonly listener: ApplicationListener;
-
-  /**
-   * Port 443 listener that terminates TLS with {@link LoadBalancedApiProps.certificate} and forwards
-   * to {@link targetGroup}. Absent when no certificate is configured.
-   */
-  public readonly httpsListener?: ApplicationListener;
+  /** The host rule on the shared listener routing {@link LoadBalancedApiProps.hostName} here. */
+  public readonly listenerRule?: ApplicationListenerRule;
 
   /** The ECS service running the API. */
   public readonly service: FargateService;
@@ -196,11 +173,13 @@ export class LoadBalancedApi extends Construct {
 
     const {
       vpc,
+      listener,
+      hostName,
+      priority,
       cluster,
       repository,
       config,
       serviceName,
-      albSecurityGroup,
       applicationSecurityGroup,
       database,
       auth,
@@ -215,19 +194,6 @@ export class LoadBalancedApi extends Construct {
     this.executionRole = this.createExecutionRole(repository, database, auth);
     this.taskRole = this.createTaskRole();
     this.taskDefinition = this.createTaskDefinition(serviceName, repository, config, database, auth);
-
-    this.loadBalancer = new ApplicationLoadBalancer(this, 'LoadBalancer', {
-      loadBalancerName: `${serviceName}-alb`,
-      vpc,
-      internetFacing: true,
-      securityGroup: albSecurityGroup,
-      // Only the public subnets have a route to the internet gateway, which an internet-facing ALB
-      // needs in both directions.
-      vpcSubnets: { subnetType: SubnetType.PUBLIC },
-      // Deletion protection follows the environment's removal policy: dev can be torn down, uat and
-      // prod cannot lose the endpoint to an accidental `cdk destroy`.
-      deletionProtection: props.removalPolicy === RemovalPolicy.RETAIN,
-    });
 
     this.targetGroup = new ApplicationTargetGroup(this, 'TargetGroup', {
       targetGroupName: `${serviceName}-tg`,
@@ -249,61 +215,18 @@ export class LoadBalancedApi extends Construct {
       },
     });
 
-    // `open: false` keeps the listeners from quietly adding a 0.0.0.0/0 rule; the ingress rules
-    // below are added explicitly instead, so the public entry points are visible in the template.
-    if (props.certificate === undefined) {
-      // No certificate yet (dev before a domain has been delegated): the plaintext Phase 2 path.
-      this.listener = this.loadBalancer.addListener('HttpListener', {
-        port: LISTENER_PORT,
-        protocol: ApplicationProtocol.HTTP,
-        defaultTargetGroups: [this.targetGroup],
-        open: false,
+    // The rule, not the listener, is the service's contribution to the shared load balancer. Only
+    // this service's host matches; every other host falls through to another service's rule or to
+    // the listener's fixed 404 default. With no host name no rule exists at all - a fabricated host
+    // would be a quiet hole in the shared listener's "unmatched means 404" contract.
+    if (hostName !== undefined) {
+      this.listenerRule = new ApplicationListenerRule(this, 'HostRule', {
+        listener,
+        priority,
+        conditions: [ListenerCondition.hostHeaders([hostName])],
+        action: ListenerAction.forward([this.targetGroup]),
       });
-    } else {
-      // With a certificate, port 80 only redirects. A redirect action keeps the plaintext listener
-      // out of the request path entirely - it never forwards to the target group, so no request
-      // reaches the application unencrypted.
-      this.listener = this.loadBalancer.addListener('HttpListener', {
-        port: LISTENER_PORT,
-        protocol: ApplicationProtocol.HTTP,
-        defaultAction: ListenerAction.redirect({
-          port: String(HTTPS_LISTENER_PORT),
-          protocol: ApplicationProtocol.HTTPS,
-          permanent: true,
-        }),
-        open: false,
-      });
-
-      // TLS terminates at the load balancer and the request continues to the task over plain HTTP
-      // inside the private subnets, which is standard: the hop that crosses the internet is the one
-      // that must be encrypted, and the target group is not reachable from outside the VPC.
-      this.httpsListener = this.loadBalancer.addListener('HttpsListener', {
-        port: HTTPS_LISTENER_PORT,
-        protocol: ApplicationProtocol.HTTPS,
-        certificates: [props.certificate],
-        // TLS 1.2 as the floor (the ELBSecurityPolicy-TLS13-1-2-2021-06 policy). The older
-        // `RECOMMENDED` policy still negotiates TLS 1.0/1.1, which is not acceptable for an endpoint
-        // that carries session cookies.
-        sslPolicy: SslPolicy.RECOMMENDED_TLS,
-        defaultTargetGroups: [this.targetGroup],
-        open: false,
-      });
-
-      // HSTS (OWASP A02). Setting it on the load balancer rather than only in the application means
-      // every response on 443 carries it - including the redirect from port 80 - so a browser that
-      // has seen the API once will never try it over plaintext again. The long max-age is safe
-      // because the certificate renews automatically for as long as the hosted zone exists.
-      this.httpsListener.setAttribute(
-        'routing.http.response.strict_transport_security.header_value',
-        'max-age=31536000; includeSubDomains',
-      );
     }
-
-    // The Phase 1 load balancer security group already accepts HTTPS on 443; port 80 is opened here
-    // because Phase 2 added the HTTP listener. With a certificate, port 80 is still needed: it is
-    // where the redirect to HTTPS answers. These are the only CIDR-based inbound rules in the
-    // application stack.
-    albSecurityGroup.addIngressRule(Peer.anyIpv4(), Port.tcp(LISTENER_PORT), 'HTTP from the internet');
 
     this.service = this.createService(cluster, applicationSecurityGroup, serviceName, config);
   }

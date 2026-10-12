@@ -29,3 +29,28 @@ export const DNS_EXPORTS = {
   certificateArn: 'certificate-arn',
   apiDomainName: 'api-domain-name',
 } as const;
+
+/**
+ * The export keys the shared ingress publishes: the one internet-facing load balancer every
+ * service attaches its listener rules to. The ALB *chassis* is platform-owned; each service owns
+ * its rules and target groups, exactly like the platform owns the subnets while each service owns
+ * its security groups.
+ */
+export const INGRESS_EXPORTS = {
+  loadBalancerArn: 'alb-arn',
+  loadBalancerDnsName: 'alb-dns-name',
+  loadBalancerCanonicalHostedZoneId: 'alb-canonical-hosted-zone-id',
+  securityGroupId: 'alb-security-group-id',
+  httpsListenerArn: 'https-listener-arn',
+} as const;
+
+/**
+ * Listener rule priority ranges, allocated per service so two services can never collide on the
+ * shared listener. Each service owns a contiguous block of priorities; this file is the single
+ * allocation registry - a new service takes the next free block here, never a number picked
+ * locally.
+ */
+export const INGRESS_PRIORITIES = {
+  ecommerceApi: 100,
+  ecommerceApex: 110,
+} as const;

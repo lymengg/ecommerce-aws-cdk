@@ -1,5 +1,6 @@
-import { App } from 'aws-cdk-lib';
+import { App, Stack } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
+import { Certificate } from 'aws-cdk-lib/aws-certificatemanager';
 import { Secret } from 'aws-cdk-lib/aws-secretsmanager';
 
 import { getEnvironmentConfig } from '../lib/config';
@@ -9,6 +10,7 @@ import { CognitoStack } from '../lib/stacks/cognito-stack';
 import { DatabaseStack } from '../lib/stacks/database-stack';
 import { DnsStack } from '../lib/stacks/dns-stack';
 import { RegistryLocation } from '../lib/stacks/ecr-stack';
+import { IngressStack } from '../lib/stacks/ingress-stack';
 import { TierSecurityGroups } from '../lib/constructs/tier-security-groups';
 import { NetworkStack } from '../lib/stacks/network-stack';
 
@@ -58,15 +60,37 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
   const env = { account: TEST_ACCOUNT, region: config.region };
 
   const network = new NetworkStack(app, `test-network-${environment}`, { env, config });
-  const securityGroups = new TierSecurityGroups(network, 'SecurityGroups', { vpc: network.vpc });
+  const dns =
+    config.dns === undefined ? undefined : new DnsStack(app, `test-dns-${environment}`, { env, config });
+  // The platform's shared ingress is built as a real stack: the application attaches to it exactly
+  // as it does in EcommerceStage. With no DNS stack a stand-in certificate keeps the listener
+  // buildable for the certificate-less template path.
+  const ingress = new IngressStack(app, `test-ingress-${environment}`, {
+    env,
+    config,
+    vpc: network.vpc,
+    certificate:
+      dns?.certificate ??
+      Certificate.fromCertificateArn(
+        network,
+        'StandInCertificate',
+        `arn:aws:acm:${config.region}:${TEST_ACCOUNT}:certificate/stand-in`,
+      ),
+  });
+  // The service's security groups live in a stack of their own, like EcommerceSecurityStack:
+  // attaching them to the network stack would make network -> ingress and ingress -> network a
+  // cycle.
+  const security = new Stack(app, `test-security-${environment}`, { env });
+  const securityGroups = new TierSecurityGroups(security, 'SecurityGroups', {
+    vpc: network.vpc,
+    albSecurityGroup: ingress.securityGroup,
+  });
   const database = new DatabaseStack(app, `test-database-${environment}`, {
     env,
     config,
     vpc: network.vpc,
     databaseSecurityGroup: securityGroups.database,
   });
-  const dns =
-    config.dns === undefined ? undefined : new DnsStack(app, `test-dns-${environment}`, { env, config });
   // The Cognito stack needs a domain for its callback URIs, so it is only built when one exists.
   const cognito =
     config.dns === undefined ? undefined : new CognitoStack(app, `test-cognito-${environment}`, { env, config });
@@ -75,7 +99,8 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
     config,
     vpc: network.vpc,
     registry: TEST_REGISTRY,
-    albSecurityGroup: securityGroups.alb,
+    sharedLoadBalancer: ingress.loadBalancer,
+    httpsListener: ingress.httpsListener,
     applicationSecurityGroup: securityGroups.application,
     database: {
       host: database.instance.dbInstanceEndpointAddress,
@@ -84,7 +109,7 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
       secret: database.credentialsSecret,
     },
     dns:
-      dns === undefined ? undefined : { zone: dns.zone, certificate: dns.certificate, domainName: dns.apiDomainName },
+      dns === undefined ? undefined : { zone: dns.zone, domainName: dns.apiDomainName },
     auth:
       cognito === undefined
         ? {
@@ -104,15 +129,6 @@ function buildStacks(environment: EnvironmentName, options: { dns?: DnsConfig | 
   });
 
   return { template: Template.fromStack(application), network, database, application, dns, cognito };
-}
-
-/** Finds the single listener on a given port, or fails the test if there is not exactly one. */
-function listenerOnPort(template: Template, port: number): ResourceEntry {
-  const listeners = resourcesOfType(template, 'AWS::ElasticLoadBalancingV2::Listener').filter(
-    ({ properties }) => properties.Port === port,
-  );
-  expect(listeners).toHaveLength(1);
-  return listeners[0];
 }
 
 function resourcesOfType(template: Template, type: string): ResourceEntry[] {
@@ -306,26 +322,11 @@ describe('ApplicationStack authentication wiring', () => {
     template.resourceCountIs('AWS::Cognito::UserPoolClient', 0);
   });
 
-  test('adds HSTS to the HTTPS listener so browsers never retry over plaintext', () => {
-    const { template } = buildStacks('dev', { dns: TEST_DNS });
-    const listener = listenerOnPort(template, 443);
-    const attributes = Object.fromEntries(
-      (listener.properties.ListenerAttributes ?? []).map((attribute: { Key: string; Value: string }) => [
-        attribute.Key,
-        attribute.Value,
-      ]),
-    );
-
-    expect(attributes['routing.http.response.strict_transport_security.header_value']).toBe(
-      'max-age=31536000; includeSubDomains',
-    );
-  });
-
   test('adds no new security group rule for the authentication wiring', () => {
     const template = buildStacks('dev').template;
 
     // Phase 4 changes IAM and the task definition only: the security group model is untouched.
-    expect(resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress')).toHaveLength(1);
+    expect(resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress')).toHaveLength(0);
   });
 });
 
@@ -480,68 +481,33 @@ describe('ApplicationStack ECS service', () => {
   });
 });
 
-describe('ApplicationStack load balancer', () => {
-  test('is internet-facing in the public subnets with the ALB security group', () => {
-    const loadBalancer = single(buildStacks('dev').template, 'AWS::ElasticLoadBalancingV2::LoadBalancer');
-
-    expect(loadBalancer.properties).toMatchObject({
-      Type: 'application',
-      Scheme: 'internet-facing',
-      Name: 'ecommerce-dev-api-alb',
-    });
-    expect(loadBalancer.properties.SecurityGroups).toHaveLength(1);
-    expect(json(loadBalancer.properties.SecurityGroups)).toContain('SecurityGroupsAlb');
-    expect(loadBalancer.properties.Subnets).toHaveLength(2);
-    for (const subnet of loadBalancer.properties.Subnets) {
-      expect(json(subnet)).toContain('publicSubnet');
-    }
-  });
-
-  test('is protected against deletion in production but not in dev', () => {
-    const attributesOf = (template: Template) =>
-      Object.fromEntries(
-        single(template, 'AWS::ElasticLoadBalancingV2::LoadBalancer').properties.LoadBalancerAttributes.map(
-          (attribute: { Key: string; Value: string }) => [attribute.Key, attribute.Value],
-        ),
-      );
-
-    expect(attributesOf(buildStacks('dev').template)['deletion_protection.enabled']).toBe('false');
-    expect(attributesOf(buildStacks('prod').template)['deletion_protection.enabled']).toBe('true');
-  });
-
-  test('opens only port 80 to the internet, and only on the load balancer', () => {
+describe('ApplicationStack shared ingress attachment', () => {
+  test('creates no load balancer, listener or security group of its own', () => {
+    // The ingress chassis belongs to the platform's acme-ingress-<env> stack; the service only
+    // attaches a rule and a target group to it.
     const template = buildStacks('dev').template;
 
-    // The Phase 1 security groups are referenced, never redefined, so the application stack must
-    // contain no security group of its own.
-    expect(resourcesOfType(template, 'AWS::EC2::SecurityGroup')).toHaveLength(0);
+    template.resourceCountIs('AWS::ElasticLoadBalancingV2::LoadBalancer', 0);
+    template.resourceCountIs('AWS::ElasticLoadBalancingV2::Listener', 0);
+    template.resourceCountIs('AWS::EC2::SecurityGroup', 0);
+    template.resourceCountIs('AWS::EC2::SecurityGroupIngress', 0);
+  });
 
-    const ingress = resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress');
-    expect(ingress).toHaveLength(1);
-    expect(ingress[0].properties).toMatchObject({
-      CidrIp: '0.0.0.0/0',
-      Description: 'HTTP from the internet',
-      FromPort: 80,
-      ToPort: 80,
-      IpProtocol: 'tcp',
-    });
-    expect(json(ingress[0].properties.GroupId)).toContain('SecurityGroupsAlb');
+  test('hangs a host rule for the API host on the shared HTTPS listener', () => {
+    const rule = single(buildStacks('dev', { dns: TEST_DNS }).template, 'AWS::ElasticLoadBalancingV2::ListenerRule');
+
+    expect(rule.properties.Priority).toBe(100);
+    expect(rule.properties.Conditions).toEqual([
+      { Field: 'host-header', HostHeaderConfig: { Values: [TEST_FQDN] } },
+    ]);
+    expect(rule.properties.Actions[0].Type).toBe('forward');
+    expect(json(rule.properties.Actions[0].TargetGroupArn)).toContain('ApiTargetGroup');
+    // The listener belongs to the ingress stack: the rule references it by ARN, it is not redefined.
+    expect(json(rule.properties.ListenerArn)).toContain('test-ingress-dev');
   });
 });
 
-describe('ApplicationStack listener and target group', () => {
-  test('listens on HTTP port 80 and forwards to the target group when no certificate is configured', () => {
-    // Every environment has a certificate from Phase 4 on, so the forwarding port 80 listener only
-    // exists on a stack built without dns; the configured path redirects 80 to 443 instead.
-    const template = buildStacks('dev', { dns: null }).template;
-    const listener = single(template, 'AWS::ElasticLoadBalancingV2::Listener');
-
-    expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
-    expect(listener.properties.DefaultActions).toHaveLength(1);
-    expect(listener.properties.DefaultActions[0].Type).toBe('forward');
-    expect(json(listener.properties.DefaultActions[0].TargetGroupArn)).toContain('ApiTargetGroup');
-  });
-
+describe('ApplicationStack target group', () => {
   test('health checks the Actuator health endpoint on the container port', () => {
     const targetGroup = single(buildStacks('dev').template, 'AWS::ElasticLoadBalancingV2::TargetGroup');
 
@@ -569,9 +535,7 @@ describe('ApplicationStack tags', () => {
       'AWS::ECS::Cluster',
       'AWS::ECS::TaskDefinition',
       'AWS::ECS::Service',
-      'AWS::ElasticLoadBalancingV2::LoadBalancer',
       'AWS::ElasticLoadBalancingV2::TargetGroup',
-      'AWS::ElasticLoadBalancingV2::Listener',
       'AWS::Logs::LogGroup',
       'AWS::IAM::Role',
     ]) {
@@ -609,15 +573,12 @@ describe('ApplicationStack outputs', () => {
   });
 });
 
-describe('ApplicationStack DNS and TLS', () => {
-  test('still supports a certificate-less listener when a stack is built without dns', () => {
+describe('ApplicationStack DNS', () => {
+  test('still builds without dns, but publishes no record and no HTTPS URL', () => {
     // Every environment configures a domain from Phase 4 on (auth needs HTTPS), so this exercises
-    // the construct's optional-certificate branch directly rather than through a real environment.
+    // the construct's optional-DNS branch directly rather than through a real environment.
     const template = buildStacks('dev', { dns: null }).template;
-    const listener = single(template, 'AWS::ElasticLoadBalancingV2::Listener');
 
-    expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
-    expect(listener.properties.DefaultActions[0].Type).toBe('forward');
     template.resourceCountIs('AWS::Route53::RecordSet', 0);
 
     // ApiUrl is still the load balancer's own plaintext name, and there is no secondary HTTP output.
@@ -626,43 +587,14 @@ describe('ApplicationStack DNS and TLS', () => {
     expect(outputs.HttpApiUrl).toBeUndefined();
   });
 
-  test('terminates TLS on 443 and forwards to the existing target group', () => {
-    const { template, dns } = buildStacks('dev', { dns: TEST_DNS });
-    const listener = listenerOnPort(template, 443);
-
-    expect(listener.properties).toMatchObject({
-      Port: 443,
-      Protocol: 'HTTPS',
-      // TLS 1.2 floor: the older RECOMMENDED policy still negotiates TLS 1.0/1.1.
-      SslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
-    });
-    expect(listener.properties.DefaultActions).toHaveLength(1);
-    expect(listener.properties.DefaultActions[0].Type).toBe('forward');
-    expect(json(listener.properties.DefaultActions[0].TargetGroupArn)).toContain('ApiTargetGroup');
-
-    // The certificate is consumed from the DNS stack by reference, never as a literal ARN string.
-    expect(listener.properties.Certificates).toHaveLength(1);
-    expect(json(listener.properties.Certificates[0].CertificateArn)).toContain(dns!.stackName);
-  });
-
-  test('redirects plaintext HTTP to HTTPS with a permanent redirect', () => {
-    const template = buildStacks('dev', { dns: TEST_DNS }).template;
-    const listener = listenerOnPort(template, 80);
-
-    // A redirect action, not a forward: no plaintext request ever reaches the application.
-    expect(listener.properties).toMatchObject({ Port: 80, Protocol: 'HTTP' });
-    expect(listener.properties.DefaultActions).toEqual([
-      { Type: 'redirect', RedirectConfig: { Protocol: 'HTTPS', Port: '443', StatusCode: 'HTTP_301' } },
-    ]);
-  });
-
-  test('creates an alias A record to the load balancer, never an IP address', () => {
+  test('creates an alias A record to the shared load balancer, never an IP address', () => {
     const { template, dns } = buildStacks('dev', { dns: TEST_DNS });
     const record = single(template, 'AWS::Route53::RecordSet');
 
     expect(record.properties).toMatchObject({ Name: `${TEST_FQDN}.`, Type: 'A' });
-    // Alias to the load balancer: its DNS name and canonical hosted zone id, resolved by Route 53.
-    expect(json(record.properties.AliasTarget)).toContain('ApiLoadBalancer');
+    // Alias to the shared load balancer: its DNS name and canonical hosted zone id, resolved by
+    // Route 53. The ALB belongs to the ingress stack, so the name arrives as an import.
+    expect(json(record.properties.AliasTarget)).toContain('test-ingress');
     expect(json(record.properties.AliasTarget)).toContain('DNSName');
     expect(record.properties.ResourceRecords).toBeUndefined();
     expect(record.properties.TTL).toBeUndefined();
@@ -685,14 +617,5 @@ describe('ApplicationStack DNS and TLS', () => {
     expect(outputs.ApiUrl.Export.Name).toBe('ecommerce-dev-api-url');
     expect(json(outputs.HttpApiUrl.Value)).toContain('http://');
     expect(outputs.HttpApiUrl.Export.Name).toBe('ecommerce-dev-api-http-url');
-  });
-
-  test('adds no duplicate rule for 443 - the Phase 1 security group already allows it', () => {
-    const template = buildStacks('dev', { dns: TEST_DNS }).template;
-
-    const ingress = resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress');
-    expect(ingress).toHaveLength(1);
-    expect(ingress[0].properties).toMatchObject({ FromPort: 80, ToPort: 80, CidrIp: '0.0.0.0/0' });
-    expect(ingress.some(({ properties }) => properties.FromPort === 443)).toBe(false);
   });
 });

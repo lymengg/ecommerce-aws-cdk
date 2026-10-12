@@ -48,12 +48,16 @@ describe('EcommerceSecurityStack security groups', () => {
   test('creates the service-owned tier security groups in the shared VPC', () => {
     const template = buildTemplate('dev');
 
-    expect(securityGroupByDescription(template, 'Internet facing load balancer tier')).toBeDefined();
+    // The service owns its application and database groups; the load balancer group is the
+    // platform's shared ingress group, imported - never created here.
     expect(securityGroupByDescription(template, 'Application tier, private subnets only')).toBeDefined();
     expect(securityGroupByDescription(template, 'Database tier, private subnets only')).toBeDefined();
+    expect(resourcesOfType(template, 'AWS::EC2::SecurityGroup')).toHaveLength(2);
   });
 
-  test('only accepts inbound traffic from the internet on the load balancer, over TLS', () => {
+  test('accepts no traffic directly from the internet on any of its own groups', () => {
+    // The internet-facing group lives in the platform's ingress stack; the service's groups admit
+    // traffic only from the shared ALB and from each other, both by security group reference.
     const template = buildTemplate('dev');
     const openIngress = resourcesOfType(template, 'AWS::EC2::SecurityGroup').flatMap(({ properties }) =>
       (properties.SecurityGroupIngress ?? []).filter(
@@ -61,13 +65,11 @@ describe('EcommerceSecurityStack security groups', () => {
       ),
     );
 
-    expect(openIngress).toHaveLength(1);
-    expect(openIngress[0]).toMatchObject({ FromPort: 443, ToPort: 443, Description: 'HTTPS from the internet' });
+    expect(openIngress).toHaveLength(0);
   });
 
-  test('gives the application tier access from the load balancer by security group reference', () => {
+  test('gives the application tier access from the shared load balancer group only', () => {
     const template = buildTemplate('dev');
-    const alb = securityGroupByDescription(template, 'Internet facing load balancer tier');
     const application = securityGroupByDescription(template, 'Application tier, private subnets only');
 
     const ingress = resourcesOfType(template, 'AWS::EC2::SecurityGroupIngress').filter(
@@ -79,7 +81,8 @@ describe('EcommerceSecurityStack security groups', () => {
       FromPort: 8080,
       ToPort: 8080,
       IpProtocol: 'tcp',
-      SourceSecurityGroupId: { 'Fn::GetAtt': [alb.logicalId, 'GroupId'] },
+      // The shared ingress group is imported from the platform contract, not a group in this stack.
+      SourceSecurityGroupId: { 'Fn::ImportValue': 'acme-dev-alb-security-group-id' },
     });
   });
 
@@ -100,32 +103,6 @@ describe('EcommerceSecurityStack security groups', () => {
       SourceSecurityGroupId: { 'Fn::GetAtt': [application.logicalId, 'GroupId'] },
     });
     expect(JSON.stringify(database.properties.SecurityGroupIngress ?? [])).not.toContain('0.0.0.0/0');
-  });
-
-  test('keeps the load balancer egress restricted to the application tier', () => {
-    const template = buildTemplate('dev');
-    const alb = securityGroupByDescription(template, 'Internet facing load balancer tier');
-    const application = securityGroupByDescription(template, 'Application tier, private subnets only');
-
-    // CloudFormation re-adds an allow-all egress rule when the inline egress list is empty, which is
-    // why the group carries a no-traffic marker rule instead of an empty list.
-    const inlineEgress = alb.properties.SecurityGroupEgress ?? [];
-    expect(inlineEgress).not.toHaveLength(0);
-    for (const rule of inlineEgress) {
-      expect(rule.CidrIp).not.toBe('0.0.0.0/0');
-      expect(rule.IpProtocol).not.toBe('-1');
-    }
-
-    const referencedEgress = resourcesOfType(template, 'AWS::EC2::SecurityGroupEgress').filter(
-      ({ properties }) => groupIdRef(properties.GroupId) === alb.logicalId,
-    );
-
-    expect(referencedEgress).toHaveLength(1);
-    expect(referencedEgress[0].properties).toMatchObject({
-      FromPort: 8080,
-      ToPort: 8080,
-      DestinationSecurityGroupId: { 'Fn::GetAtt': [application.logicalId, 'GroupId'] },
-    });
   });
 
   test('lets the application tier reach the database tier and the internet over TLS only', () => {
@@ -159,9 +136,9 @@ describe('EcommerceSecurityStack foundation imports', () => {
   test('anchors the security groups in the shared VPC via the acme-<env> export', () => {
     const template = buildTemplate('dev');
 
-    // The security groups are the only consumers inside this stack, so vpc-id is the one import
-    // that materialises here; the subnet, zone and certificate imports resolve in the stacks that
-    // consume them downstream.
+    // The security groups and the shared-ALB acceptance rule are the consumers inside this stack,
+    // so vpc-id and alb-security-group-id are the imports that materialise here; the subnet, zone,
+    // listener and ALB-attribute imports resolve in the stacks that consume them downstream.
     for (const { properties } of resourcesOfType(template, 'AWS::EC2::SecurityGroup')) {
       expect(properties.VpcId).toEqual({ 'Fn::ImportValue': 'acme-dev-vpc-id' });
     }

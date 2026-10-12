@@ -182,15 +182,16 @@ export class EcommerceStage extends Stage {
     const frontendUrl = config.auth.frontendUrl;
 
     // The application stack consumes the imported VPC and security groups, the registry, the
-    // database stack's endpoint and credentials secret, the imported hosted zone and certificate,
-    // and the Cognito stack's user pool, app client and client secret.
+    // database stack's endpoint and credentials secret, the imported hosted zone and shared
+    // ingress load balancer, and the Cognito stack's user pool, app client and client secret.
     this.application = new ApplicationStack(this, `ecommerce-application-${environment}`, {
       env,
       stackName: `ecommerce-application-${environment}`,
       config,
       vpc: this.security.vpc,
       registry: props.registry,
-      albSecurityGroup: this.security.securityGroups.alb,
+      sharedLoadBalancer: this.security.sharedLoadBalancer,
+      httpsListener: this.security.httpsListener,
       applicationSecurityGroup: this.security.securityGroups.application,
       database: {
         host: this.database.instance.dbInstanceEndpointAddress,
@@ -200,7 +201,6 @@ export class EcommerceStage extends Stage {
       },
       dns: {
         zone: this.security.zone,
-        certificate: this.security.certificate,
         domainName: this.security.apiDomainName,
       },
       auth: {
@@ -212,15 +212,9 @@ export class EcommerceStage extends Stage {
       description: `E-commerce platform application compute (${environment})`,
     });
 
-    // The frontend consumes the ECS cluster, the HTTPS listener, the load balancer, the application
-    // security group and the frontend repository, all by reference - so it is deployed after the
-    // application and can be redeployed on its own.
-    const httpsListener = this.application.api.httpsListener;
-    if (httpsListener === undefined) {
-      // config.dns is required, so the certificate and the HTTPS listener always exist.
-      throw new Error(`The frontend requires the HTTPS listener for environment "${environment}".`);
-    }
-
+    // The frontend consumes the ECS cluster, the shared HTTPS listener, the shared load balancer,
+    // the application security group and the frontend repository, all by reference - so it is
+    // deployed after the application and can be redeployed on its own.
     this.frontend = new FrontendStack(this, `ecommerce-frontend-${environment}`, {
       env,
       stackName: `ecommerce-frontend-${environment}`,
@@ -228,9 +222,8 @@ export class EcommerceStage extends Stage {
       registry: props.registry,
       cluster: this.application.cluster,
       applicationSecurityGroup: this.security.securityGroups.application,
-      loadBalancer: this.application.api.loadBalancer,
-      albSecurityGroup: this.security.securityGroups.alb,
-      httpsListener,
+      loadBalancer: this.security.sharedLoadBalancer,
+      httpsListener: this.security.httpsListener,
       zone: this.security.zone,
       description: `E-commerce platform frontend hosting (${environment})`,
     });

@@ -89,7 +89,7 @@ describe('PipelineStack', () => {
     const foundationActions = stageActions(template, 'dev-foundation').map((a) => a.Name);
     expect(foundationActions[0]).toBe('BuildImages');
     // The platform foundation keeps its shared stacks under their acme-* names.
-    for (const stack of ['acme-network-dev', 'acme-dns-dev']) {
+    for (const stack of ['acme-network-dev', 'acme-dns-dev', 'acme-ingress-dev']) {
       expect(foundationActions).toContain(`${stack}.Deploy`);
     }
 
@@ -165,6 +165,7 @@ describe('Environment stages', () => {
 
     expect(platform.network.stackName).toBe('acme-network-dev');
     expect(platform.dns.stackName).toBe('acme-dns-dev');
+    expect(platform.ingress.stackName).toBe('acme-ingress-dev');
     expect(service.security.stackName).toBe('ecommerce-security-dev');
     expect(service.database.stackName).toBe('ecommerce-database-dev');
     expect(service.authCertificate.stackName).toBe('ecommerce-auth-cert-dev');

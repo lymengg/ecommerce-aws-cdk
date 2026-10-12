@@ -20,7 +20,7 @@ are stopped: the database, the Fargate tasks, and the NAT gateway.
 | Route 53 zone, Secrets Manager, ACM certs, Cognito pool + custom domain, ECR | kept | ~$1.30/mo | ~$1.30/mo |
 | **Total** | | **~$22/mo** | **~$117/mo** |
 
-All nine stacks remain deployed while paused. The site answers (the ALB and the managed login page
+All stacks remain deployed while paused. The site answers (the shared ALB and the managed login page
 stay up) but returns 503/empty responses — that is expected, not a bug.
 
 > **RDS auto-restarts after 7 days** — an AWS limit on stopped instances, not a bug. If the
@@ -105,30 +105,33 @@ the service stabilises on its own, or check
 
 ## Why the ALB is kept
 
-The Application Load Balancer (~$18/mo) is the deliberate cost of a fast resume. Destroying the
-application/frontend stacks would save it, but then a resume means recreating the load balancer,
-listeners, target groups and DNS records — several minutes of CloudFormation each way — and the apex
-A record would disappear, which the Cognito custom domain relies on existing if the auth-domain
-stack is ever redeployed. For a long shutdown where $18/mo matters more than restart speed, use the
-full teardown in the next section instead.
+The shared Application Load Balancer (~$18/mo, in the platform's `acme-ingress-dev` stack) is the
+deliberate cost of a fast resume. Destroying the compute stacks no longer removes it — and cannot:
+`ecommerce-security-dev` imports its listener and security group exports, so CloudFormation blocks
+the ingress stack's deletion while any service is attached. For a long shutdown where $18/mo matters
+more than restart speed, use the full teardown in the next section instead.
 
 ## Full teardown (alternative, ~$4/mo, slow resume)
 
-If the environment will be down for weeks, destroy the compute instead of scaling it. Resume then
-takes ~10 minutes and recreates the ALB and its DNS records.
+If the environment will be down for weeks, destroy the compute **and** the shared ingress instead of
+scaling it. Resume then takes ~10 minutes and recreates the ALB, listener rules and DNS records.
+Note the order: `ecommerce-security-dev` must go before `acme-ingress-dev` — it imports the ingress
+exports, and CloudFormation refuses to delete an exporting stack while an importer exists.
 
 ```bash
-# Pause: destroy compute, remove NAT, stop the database
+# Pause: destroy compute, then the attachment point, then the shared ingress, remove NAT, stop the database
 npx cdk destroy ecommerce-frontend-dev ecommerce-application-dev -c environment=dev
+npx cdk destroy ecommerce-security-dev -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-ingress-dev -c environment=dev
 ECOMMERCE_DEV_NAT_GATEWAYS=0 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 aws rds stop-db-instance --db-instance-identifier ecommerce-dev-db
 
-# Resume: NAT first, database in parallel, then compute
+# Resume: NAT first, the shared ingress (the security stack imports it), then compute
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ACME_DEV_ACCOUNT=572396340039 \
-  npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
+  npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev acme-ingress-dev -c environment=dev
 aws rds start-db-instance --db-instance-identifier ecommerce-dev-db
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ACME_DEV_ACCOUNT=572396340039 \
-  npx cdk deploy ecommerce-application-dev ecommerce-frontend-dev -c environment=dev
+  npx cdk deploy ecommerce-security-dev ecommerce-application-dev ecommerce-frontend-dev -c environment=dev
 ```
 
 Never `cdk destroy` `acme-dns-dev`, `ecommerce-database-dev`, `ecommerce-auth-cert-dev`,

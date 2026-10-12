@@ -3,11 +3,11 @@ import { ISecurityGroup, SubnetType } from 'aws-cdk-lib/aws-ec2';
 import { Cluster, ContainerImage, FargateService, FargateTaskDefinition, LogDrivers, Protocol as EcsProtocol, PropagatedTagSource } from 'aws-cdk-lib/aws-ecs';
 import { IRepository, Repository } from 'aws-cdk-lib/aws-ecr';
 import {
-  ApplicationListener,
   ApplicationListenerRule,
-  ApplicationLoadBalancer,
   ApplicationProtocol,
   ApplicationTargetGroup,
+  IApplicationListener,
+  IApplicationLoadBalancer,
   ListenerAction,
   ListenerCondition,
   Protocol as ElbProtocol,
@@ -20,11 +20,9 @@ import { LoadBalancerTarget } from 'aws-cdk-lib/aws-route53-targets';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig, FrontendConfig } from '../config/types';
+import { INGRESS_PRIORITIES } from '../foundation-exports';
 import { FRONTEND_REPOSITORY_NAME, RegistryLocation } from './ecr-stack';
 import { applyPlatformTags } from '../tags';
-
-/** Priority of the host rule that sends the SPA's host to this service. */
-const HOST_RULE_PRIORITY = 10;
 
 /** nginx is serving files; it is listening within a second of the container starting. */
 const HEALTH_CHECK_GRACE_PERIOD = Duration.seconds(30);
@@ -50,17 +48,11 @@ export interface FrontendStackProps extends StackProps {
    */
   readonly applicationSecurityGroup: ISecurityGroup;
 
-  /** The Phase 2 load balancer, consumed by reference, for the apex alias records. */
-  readonly loadBalancer: ApplicationLoadBalancer;
+  /** The platform's shared ingress load balancer, consumed by reference, for the apex alias records. */
+  readonly loadBalancer: IApplicationLoadBalancer;
 
-  /**
-   * The load balancer's security group. Only needed so the re-imported listener below has a
-   * `connections` object; the group itself is unchanged.
-   */
-  readonly albSecurityGroup: ISecurityGroup;
-
-  /** The HTTPS listener, consumed by reference, for the host rule. */
-  readonly httpsListener: ApplicationListener;
+  /** The shared ingress HTTPS listener, consumed by reference, for the host rule. */
+  readonly httpsListener: IApplicationListener;
 
   /** The hosted zone the apex records are created in, consumed from the DNS stack by reference. */
   readonly zone: IHostedZone;
@@ -109,7 +101,7 @@ export class FrontendStack extends Stack {
   constructor(scope: Construct, id: string, props: FrontendStackProps) {
     super(scope, id, props);
 
-    const { config, cluster, applicationSecurityGroup, loadBalancer, albSecurityGroup, httpsListener, zone } = props;
+    const { config, cluster, applicationSecurityGroup, loadBalancer, httpsListener, zone } = props;
     // The repository is imported by ARN, like the API's: it lives in the shared registry stage
     // (possibly another account), which deploys - and the pipeline pushes into - before this stack.
     const repository = Repository.fromRepositoryAttributes(this, 'FrontendRepository', {
@@ -164,20 +156,15 @@ export class FrontendStack extends Stack {
       },
     });
 
-    // The listener is re-imported rather than used directly: CDK creates an added rule as a child of
-    // the listener construct, so using the application stack's listener would place this rule in the
-    // application stack's template. Re-importing creates a listener construct owned by *this* stack,
-    // which is where the rule belongs. Same reasoning as the security group in ApplicationStack.
-    const listener = ApplicationListener.fromApplicationListenerAttributes(this, 'HttpsListener', {
-      listenerArn: httpsListener.listenerArn,
-      securityGroup: albSecurityGroup,
-    });
-
+    // The rule lands in this stack's template even though the listener is imported: a listener
+    // rule's template follows the scope it is declared in, so the service keeps ownership of its
+    // own routing on the platform's shared listener.
     new ApplicationListenerRule(this, 'HostRule', {
-      listener,
-      priority: HOST_RULE_PRIORITY,
+      listener: httpsListener,
+      priority: INGRESS_PRIORITIES.ecommerceApex,
       // Only the SPA's own host is matched. Every other host - including api.<env-domain> and the
-      // load balancer's own name - falls through to the listener's default action, which is the API.
+      // load balancer's own name - falls through to another service's rule or to the listener's
+      // fixed 404 default.
       conditions: [ListenerCondition.hostHeaders([siteDomain])],
       action: ListenerAction.forward([this.targetGroup]),
     });
