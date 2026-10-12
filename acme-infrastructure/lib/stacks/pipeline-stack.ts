@@ -13,7 +13,8 @@ import {
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
-import { PlatformStage, SharedRegistryStage } from '../ecommerce-stage';
+import { EcommerceStage, SharedRegistryStage } from '../ecommerce-stage';
+import { PlatformStage } from '../platform-stage';
 import { applyPlatformTags } from '../tags';
 import {
   API_REPOSITORY_NAME,
@@ -206,11 +207,16 @@ export class PipelineStack extends Stack {
       const gate: Step[] =
         index === 0 ? [buildImages] : [new ManualApprovalStep(`Promote to ${environment}`)];
 
-      const platform = new PlatformStage(this, environment, { env, config, registry: props.registry });
-      pipeline.addStage(platform, {
-        // Images must exist before the compute stacks roll: the task definitions reference the
-        // tag built here, and a service that cannot pull never becomes healthy.
-        pre: gate,
+      // Two stages per environment, mirroring the manual entry points: the platform foundation
+      // (bin/platform.ts - shared VPC and DNS) deploys first, then the service stage
+      // (bin/ecommerce.ts) imports its exports. The gate sits on the platform stage so an approval
+      // stops an environment BEFORE anything in it is touched, and the image build still precedes
+      // the compute stacks that pull it.
+      const foundation = new PlatformStage(this, `${environment}-foundation`, { env, config });
+      pipeline.addStage(foundation, { pre: gate });
+
+      const service = new EcommerceStage(this, environment, { env, config, registry: props.registry });
+      pipeline.addStage(service, {
         post: [this.smokeTests(environment, domain)],
       });
     });

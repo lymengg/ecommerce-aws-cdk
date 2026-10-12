@@ -221,7 +221,11 @@ while a browser navigation still gets the login redirect that starts the hosted-
 aws-cdk/
 ├── acme-infrastructure/         # CDK app (TypeScript)
 │   ├── bin/
-│   │   └── ecommerce.ts              # CDK app entry point: resolve env, build the stacks
+│   │   ├── organization.ts           # deploys acme-organization (platform team)
+│   │   ├── registry.ts               # deploys acme-ecr, the shared registry (platform team)
+│   │   ├── platform.ts               # deploys acme-network/acme-dns per env (platform team)
+│   │   ├── ecommerce.ts              # deploys the ecommerce service into an env (service team)
+│   │   └── pipeline.ts               # deploys the ecommerce-platform CI pipeline
 │   ├── lib/
 │   │   ├── config/
 │   │   │   ├── types.ts              # EnvironmentConfig + Application/Database/Dns/AuthConfig
@@ -234,7 +238,8 @@ aws-cdk/
 │   │   │   ├── tier-security-groups.ts   # ALB / application / database security groups
 │   │   │   ├── vpc-flow-logs.ts          # optional flow logging + its least-privilege role
 │   │   │   └── load-balanced-api.ts      # Fargate task, ECS service, ALB, DB + auth wiring, IAM
-│   │   ├── ecommerce-stage.ts        # RegistryStage + PlatformStage (Phase 8 stage split)
+│   │   ├── ecommerce-stage.ts        # SharedRegistryStage + EcommerceStage (the service, per env)
+│   │   ├── platform-stage.ts         # PlatformStage: the shared network + DNS foundation per env
 │   │   ├── stacks/
 │   │   │   ├── network-stack.ts      # VPC, public/private/isolated subnets, routing, SGs
 │   │   │   ├── ecr-stack.ts          # container registry
@@ -313,12 +318,20 @@ arrives through `EnvironmentConfig`, which is why the same stack code produces d
 
 ## Stacks and deployment order
 
+Platform-owned stacks (`bin/platform.ts`, `bin/registry.ts` — deployed by the platform team, shared
+by every service in the environment):
+
 | Stack | Name | Creates |
 | ----- | ---- | ------- |
-| Network | `ecommerce-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
+| Network | `acme-network-<env>` | VPC, public/private/isolated subnets, gateways, route tables, tier security groups, flow logs |
+| DNS | `acme-dns-<env>` | Route 53 hosted zone, ACM certificate |
 | Registry | `acme-ecr` | **Shared** ECR repositories (`ecommerce-api`, `ecommerce-frontend`), one pair for every environment |
+
+Service stacks (`bin/ecommerce.ts` — the ecommerce service's own resources):
+
+| Stack | Name | Creates |
+| ----- | ---- | ------- |
 | Database | `ecommerce-database-<env>` | RDS PostgreSQL instance, subnet group, Secrets Manager credentials |
-| DNS | `ecommerce-dns-<env>` | Route 53 hosted zone, ACM certificate |
 | Auth certificate | `ecommerce-auth-cert-<env>` | ACM certificate for `auth.<env-domain>` in `us-east-1`, the only region a Cognito custom domain reads certificates from |
 | Cognito | `ecommerce-cognito-<env>` | Cognito user pool, confidential app client, client-secret secret, baseline alarm |
 | Application | `ecommerce-application-<env>` | ECS cluster, task definition, ECS service, ALB, target group, listeners, alias record, log group, IAM roles |
@@ -400,24 +413,27 @@ is ever plumbed between stacks as a string.
 ### Stages
 
 From Phase 8 the stacks above are instantiated inside CDK **stages**, so the pipeline can deploy
-them as units — and so a stage is the thing that repeats per account. There are two stages per
-environment, and the split is deliberate:
+them as units — and so a stage is the thing that repeats per account. The stage boundaries follow
+the team boundaries: the platform team deploys the foundation and the registry, the service team
+deploys its own stacks on top.
 
 | Stage | Contains | Why it is separate |
 | ----- | -------- | ------------------ |
 | `registry` | `acme-ecr` | The shared registry: deployed once, not per environment. In the pipeline the image-build step sits between this stage and the first environment, which is only possible if the registry is its own stage. |
-| `<env>` (`dev`) | the other nine stacks | Construct dependencies cannot cross a stage boundary: the load balancer depends on its subnets' route tables, so everything that wires constructs together stays in one stage. |
+| `<env>-foundation` (`dev-foundation`) | `acme-network-<env>`, `acme-dns-<env>` | The platform team's per-environment foundation: every service attaches to this VPC and writes records into this zone. Separate so a service team never deploys networking. |
+| `<env>` (`dev`) | the seven `ecommerce-*` stacks | The service stage: everything the ecommerce service owns. It imports the foundation's `acme-<env>-*` exports with `Fn.importValue`, so deploy fails fast if the foundation is missing. |
 
-The platform stage consumes the repositories **by location** — `{account, region}` + the fixed
+The service stage consumes the repositories **by location** — `{account, region}` + the fixed
 names `ecommerce-api` / `ecommerce-frontend`, imported with `Repository.fromRepositoryAttributes` —
-rather than by construct reference. A stack reference would create a dependency across the stage
-boundary, which the CDK forbids; the location is configuration, so nothing is lost. Ordering is the
-deploy-order contract the manual workflow already followed.
+and the network/DNS foundation by CloudFormation export. Neither is a construct reference, which is
+forbidden across a stage boundary; ordering is the deploy-order contract the manual workflow
+encodes as three entry points: `bin/registry.ts`, then `bin/platform.ts`, then `bin/ecommerce.ts`.
 
 Every stack carries an explicit `stackName`, so adopting stages did not rename the deployed
-CloudFormation stacks: `ecommerce-network-dev` is still `ecommerce-network-dev`. In CLI output they
-appear under their stage path (`dev/ecommerce-network-dev`); both `cdk deploy ecommerce-network-dev`
-(matching the stack name) and `cdk deploy dev/ecommerce-network-dev` (matching the path) select it.
+CloudFormation stacks: `ecommerce-application-dev` is still `ecommerce-application-dev`. In CLI
+output they appear under their stage path (`dev/ecommerce-application-dev`); both
+`cdk deploy ecommerce-application-dev` (matching the stack name) and
+`cdk deploy dev/ecommerce-application-dev` (matching the path) select it.
 
 ---
 
@@ -432,11 +448,14 @@ Source (CodeConnections -> GitHub)
   -> UpdatePipeline   the pipeline re-synthesises itself on every push
   -> registry         pre: InfrastructureTests | FrontendTests | ApiTests (parallel)
                       deploy acme-ecr (the shared repositories)
-  -> dev              pre: BuildImages (docker build x2 -> push :<commit SHA>, once)
-                      deploy the eight platform stacks in dependency order
+  -> dev-foundation   pre: BuildImages (docker build x2 -> push :<commit SHA>, once)
+                      deploy acme-network-dev + acme-dns-dev (shared VPC and zone)
+  -> dev              deploy the seven ecommerce-* stacks (import the foundation's exports)
                       post: SmokeTests-dev (curl the health, auth and 401 checks)
-  -> uat              pre: manual approval - promotes the identical images
-  -> prod             pre: manual approval
+  -> uat-foundation   pre: manual approval - promotes the identical images
+  -> uat
+  -> prod-foundation  pre: manual approval
+  -> prod
 ```
 
 **Which environments deploy is configuration, not code.** `bin/pipeline.ts` includes `uat` and
@@ -938,17 +957,17 @@ environment variables set from the database stack's outputs.
 
 ## Core concepts: DNS and TLS
 
-Phase 3.5 gives the API a name and a certificate. Both are created in `ecommerce-dns-<env>`, ahead of
-the compute that uses them.
+Phase 3.5 gives the API a name and a certificate. Both are created in `acme-dns-<env>` — the
+platform-owned DNS stack — ahead of the compute that uses them.
 
 ```
    registrar (example.com)
         │  NS records for the subdomain, added by hand once
         ▼
-   Route 53 hosted zone (dev.example.com)          ← ecommerce-dns-dev
+   Route 53 hosted zone (dev.example.com)          ← acme-dns-dev
         │  ACM writes and renews the validation CNAME itself
         ▼
-   ACM certificate (api.dev.example.com)           ← ecommerce-dns-dev
+   ACM certificate (api.dev.example.com)           ← acme-dns-dev
         │  attached to the HTTPS listener
         ▼
    ALB :443  ──8080──▶  ECS task                  ← ecommerce-application-dev
@@ -1808,13 +1827,13 @@ the single-account setup needs no extra configuration either way.
 PowerShell:
 
 ```powershell
-$env:ACME_DEV_ACCOUNT = "123456789012"; npx cdk deploy ecommerce-network-dev -c environment=dev
+$env:ACME_DEV_ACCOUNT = "123456789012"; npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 ```
 
 bash / Git Bash / CI:
 
 ```bash
-ACME_PROD_ACCOUNT=123456789012 npx cdk deploy ecommerce-network-prod -c environment=prod
+ACME_PROD_ACCOUNT=123456789012 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-prod -c environment=prod
 ```
 
 A `.env` file will not work: nothing in the CDK CLI or this app reads one. Pin the account before
@@ -1864,22 +1883,23 @@ account without clashing.
 
 | Stack | Output | Export name (dev) | Consumed by |
 | ----- | ------ | ----------------- | ----------- |
-| Network | `VpcId` | `ecommerce-dev-vpc-id` | every later stack |
-| Network | `PublicSubnetIds` | `ecommerce-dev-public-subnet-ids` | ALB, NAT placement |
-| Network | `PrivateSubnetIds` | `ecommerce-dev-private-subnet-ids` | ECS tasks |
-| Network | `DatabaseSubnetIds` | `ecommerce-dev-database-subnet-ids` | RDS DB subnet group |
-| Network | `AlbSecurityGroupId` | `ecommerce-dev-alb-security-group-id` | Phase 2 load balancer |
-| Network | `ApplicationSecurityGroupId` | `ecommerce-dev-application-security-group-id` | Phase 2 ECS service |
-| Network | `DatabaseSecurityGroupId` | `ecommerce-dev-database-security-group-id` | Phase 3 RDS |
+| Network | `VpcId` | `acme-dev-vpc-id` | every service stack in the environment |
+| Network | `PublicSubnetIds` | `acme-dev-public-subnet-ids` | ALB, NAT placement |
+| Network | `PrivateSubnetIds` | `acme-dev-private-subnet-ids` | ECS tasks |
+| Network | `DatabaseSubnetIds` | `acme-dev-database-subnet-ids` | RDS DB subnet group |
+| Network | `AlbSecurityGroupId` | `acme-dev-alb-security-group-id` | load balancers |
+| Network | `ApplicationSecurityGroupId` | `acme-dev-application-security-group-id` | ECS services |
+| Network | `DatabaseSecurityGroupId` | `acme-dev-database-security-group-id` | RDS |
 | Registry | `RepositoryUri` | `acme-ecr-repository-uri` | image push |
 | Registry | `RepositoryName` | `acme-ecr-repository-name` | image push |
 | Database | `DatabaseEndpoint` | `ecommerce-dev-db-endpoint` | ECS task env `DB_HOST` |
 | Database | `DatabasePort` | `ecommerce-dev-db-port` | ECS task env `DB_PORT` |
 | Database | `DatabaseName` | `ecommerce-dev-db-name` | ECS task env `DB_NAME` |
 | Database | `CredentialsSecretArn` | `ecommerce-dev-db-secret-arn` | ECS secret injection, operators |
-| DNS | `HostedZoneNameServers` | `ecommerce-dev-hosted-zone-name-servers` | registrar delegation (by hand, once) |
-| DNS | `CertificateArn` | `ecommerce-dev-certificate-arn` | the application stack's HTTPS listener |
-| DNS | `ApiDomainName` | `ecommerce-dev-api-domain-name` | the application stack's alias record and `ApiUrl` |
+| DNS | `HostedZoneId` | `acme-dev-hosted-zone-id` | service stacks write their records into the zone |
+| DNS | `HostedZoneNameServers` | `acme-dev-hosted-zone-name-servers` | registrar delegation (by hand, once) |
+| DNS | `CertificateArn` | `acme-dev-certificate-arn` | the application stack's HTTPS listener |
+| DNS | `ApiDomainName` | `acme-dev-api-domain-name` | the application stack's alias record and `ApiUrl` |
 | Cognito | `UserPoolId` | `ecommerce-dev-user-pool-id` | operators, Cognito CLI |
 | Cognito | `UserPoolClientId` | `ecommerce-dev-user-pool-client-id` | the application stack's `COGNITO_CLIENT_ID` |
 | Cognito | `IssuerUrl` | `ecommerce-dev-cognito-issuer-url` | the application stack's `COGNITO_ISSUER_URI` |
@@ -2007,44 +2027,49 @@ Bootstrap the account and region once before anything can be deployed:
 npx cdk bootstrap aws://<account>/ap-southeast-1
 ```
 
-Then deploy one environment at a time, in dependency order:
+Then deploy one environment at a time, in dependency order — platform resources first (the
+foundation and the registry), then the service stacks that attach to them:
 
 ```bash
-# 1. Network foundation (VPC, subnets, security groups)
-npx cdk deploy ecommerce-network-dev -c environment=dev
+export ECOMMERCE_DEV_DOMAIN=dev.example.com   # required from Phase 4 on
+
+# 1. Platform foundation (shared VPC + hosted zone + ACM certificate)
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy 'dev/**' -c environment=dev
+#    Then delegate the zone at the registrar (see "Delegating the subdomain") and wait for the
+#    certificate to finish issuing before deploying the service.
 
 # 2. Shared registry (must exist before an image can be pushed)
+export ACME_TOOLING_ACCOUNT=<account>
 npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy acme-ecr
 
 # 3. Database (instance + generated credentials secret)
 npx cdk deploy ecommerce-database-dev -c environment=dev
 
-# 4. DNS and TLS (hosted zone + ACM certificate). The domain is required from Phase 4 on.
-export ECOMMERCE_DEV_DOMAIN=dev.example.com
-npx cdk deploy ecommerce-dns-dev -c environment=dev
-#    Then delegate the zone at the registrar (see "Delegating the subdomain") and wait for the
-#    certificates to finish issuing before the next steps.
-
-# 5. Cognito (user pool + confidential app client + client-secret secret)
+# 4. Cognito (user pool + confidential app client + client-secret secret)
 npx cdk deploy ecommerce-cognito-dev -c environment=dev
 
-# 6. Build and push the image (see "ECR: how an image is tagged and pushed")
+# 5. Build and push the image (see "ECR: how an image is tagged and pushed")
 #    ...
 
-# 7. Compute (the service finds the image, the secrets, the database endpoint and the certificate)
+# 6. Compute (the service finds the image, the secrets, the database endpoint and the certificate)
 npx cdk deploy ecommerce-application-dev -c environment=dev
 
-# 8. Frontend hosting (nginx service + target group + host rule + apex records)
+# 7. Frontend hosting (nginx service + target group + host rule + apex records)
 npx cdk deploy ecommerce-frontend-dev -c environment=dev
 
-# 9. Build and push the storefront image (the service starts once one exists)
+# 8. Build and push the storefront image (the service starts once one exists)
 cd ../frontend && ECOMMERCE_DEV_DOMAIN=dev.example.com ./scripts/deploy.sh dev
 ```
 
-`npx cdk deploy --all -c environment=dev` deploys every stack in the correct order in one go, but
-only after an image has been pushed for the first time; otherwise the ECS service starts with no
-image to run. The stacks will wait on certificates that are still validating until the zone is
-delegated.
+Note the `--app` split: `bin/platform.ts` and `bin/registry.ts` are platform-team entry points;
+the default `cdk.json` app (`bin/ecommerce.ts`) synths only the service stacks, so `cdk deploy
+ecommerce-network-dev` no longer exists — networking is `acme-network-dev`, deployed by the
+platform app.
+
+`npx cdk deploy 'dev/**' -c environment=dev` deploys every service stack in the correct order in
+one go, but only after the platform foundation exists and an image has been pushed for the first
+time; otherwise the ECS service starts with no image to run, and the `acme-dev-*` imports fail.
+The stacks will wait on certificates that are still validating until the zone is delegated.
 
 Things that are easy to get wrong:
 
@@ -2067,8 +2092,8 @@ Things that are easy to get wrong:
 
 Deployment is not performed by the test path, but since Phase 8 the **pipeline** deploys on every
 push to `main` — see [CI/CD pipeline](#cicd-pipeline-phase-8). Manual deploys remain available for
-targeted work, with stacks now selected under their stage path (`dev/ecommerce-network-dev`) or by
-stack name as below.
+targeted work, with stacks now selected under their stage path (`dev/ecommerce-application-dev`)
+or by stack name as below.
 
 ---
 
@@ -2081,8 +2106,9 @@ Everything below is a manual operator action; nothing in this repository deploys
 
 ```bash
 export ACME_DEV_ACCOUNT=<account>       # PowerShell: $env:ACME_DEV_ACCOUNT = "<account>"
+export ACME_TOOLING_ACCOUNT=<account>
 
-npx cdk deploy ecommerce-network-dev    -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy 'dev/**' -c environment=dev
 npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy acme-ecr
 npx cdk deploy ecommerce-database-dev   -c environment=dev
 ```
@@ -2107,7 +2133,7 @@ There should be no route from the database subnets to the internet or to a NAT g
 ```bash
 aws ec2 describe-route-tables \
   --filters "Name=association.subnet-id,Values=$(aws cloudformation list-exports \
-      --query "Exports[?Name=='ecommerce-dev-database-subnet-ids'].Value" --output text)" \
+      --query "Exports[?Name=='acme-dev-database-subnet-ids'].Value" --output text)" \
   --query "RouteTables[].Routes"
 # each route table has only the implicit local route
 ```
@@ -2117,7 +2143,7 @@ aws ec2 describe-route-tables \
 ```bash
 aws ec2 describe-security-groups \
   --group-ids "$(aws cloudformation list-exports \
-      --query "Exports[?Name=='ecommerce-dev-database-security-group-id'].Value" --output text)" \
+      --query "Exports[?Name=='acme-dev-database-security-group-id'].Value" --output text)" \
   --query "SecurityGroups[0].IpPermissions"
 # exactly one rule: TCP 5432, SourceSecurityGroupId = the application security group, no CidrIp
 ```
@@ -2195,10 +2221,10 @@ npx cdk destroy ecommerce-auth-domain-dev -c environment=dev   # the custom doma
 npx cdk destroy ecommerce-frontend-dev    -c environment=dev
 npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev   # the us-east-1 certificate
-npx cdk destroy ecommerce-dns-dev         -c environment=dev   # only when a domain was configured
 npx cdk destroy ecommerce-database-dev    -c environment=dev   # deletes the instance and the secret
 npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" destroy acme-ecr   # shared registry: RETAINed, delete repos by hand
-npx cdk destroy ecommerce-network-dev     -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-dns-dev -c environment=dev   # only when a domain was configured
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-network-dev -c environment=dev
 ```
 
 Dev has `deletionProtection: false` and `RemovalPolicy.DESTROY` precisely so this works. In uat/prod
@@ -2214,12 +2240,12 @@ so the order is: deploy the DNS stack, delegate, wait, then deploy the compute.
 ```bash
 export ECOMMERCE_DEV_DOMAIN=dev.example.com   # PowerShell: $env:ECOMMERCE_DEV_DOMAIN = "dev.example.com"
 
-# 1. Create the hosted zone and start the certificate request.
-npx cdk deploy ecommerce-dns-dev -c environment=dev
+# 1. Create the hosted zone and start the certificate request (platform-owned stack).
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-dns-dev -c environment=dev
 
 # 2. Copy the four name servers the zone exported.
 aws cloudformation list-exports \
-  --query "Exports[?Name=='ecommerce-dev-hosted-zone-name-servers'].Value" --output text
+  --query "Exports[?Name=='acme-dev-hosted-zone-name-servers'].Value" --output text
 # ns-123.awsdns-45.com,ns-678.awsdns-90.net,ns-234.awsdns-12.co.uk,ns-567.awsdns-34.org
 
 # 3. Add them as the NS record for dev.example.com at the registrar (one record, four values).
@@ -2312,7 +2338,7 @@ npx cdk destroy ecommerce-frontend-dev    -c environment=dev
 npx cdk destroy ecommerce-application-dev -c environment=dev
 npx cdk destroy ecommerce-cognito-dev     -c environment=dev
 npx cdk destroy ecommerce-auth-cert-dev   -c environment=dev
-npx cdk destroy ecommerce-dns-dev         -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" destroy acme-dns-dev -c environment=dev
 # then: delete the NS records for dev.example.com at the registrar by hand
 ```
 

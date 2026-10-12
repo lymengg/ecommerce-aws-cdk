@@ -3,7 +3,7 @@ import 'source-map-support/register';
 
 import { App } from 'aws-cdk-lib';
 
-import { configuredAccountIds, ENVIRONMENT_NAMES, getEnvironmentConfig } from '../lib/config';
+import { configuredAccountIds, ENVIRONMENT_NAMES, getEnvironmentConfig, toolingAccountId } from '../lib/config';
 import { PipelineStack } from '../lib/stacks/pipeline-stack';
 
 /**
@@ -38,11 +38,11 @@ if (connectionArn === undefined || connectionArn === '') {
   );
 }
 
-// The pipeline account is the account dev lives in today: the stack deploys there once, and the
-// env vars it forwards are exactly what the synth build will see.
-const pipelineAccountId = process.env.ACME_DEV_ACCOUNT;
+// The pipeline is tooling-owned like the registry: it deploys into ACME_TOOLING_ACCOUNT (required),
+// which today is the one real account and later is `acme-tooling`.
+const pipelineAccountId = toolingAccountId();
 const devDomain = process.env.ECOMMERCE_DEV_DOMAIN;
-if (pipelineAccountId === undefined || pipelineAccountId === '' || devDomain === undefined || devDomain === '') {
+if (process.env.ACME_DEV_ACCOUNT === undefined || devDomain === undefined || devDomain === '') {
   throw new Error(
     'ACME_DEV_ACCOUNT and ECOMMERCE_DEV_DOMAIN are required - the pipeline deploys dev on every run.',
   );
@@ -70,8 +70,7 @@ const environments = ENVIRONMENT_NAMES
 new PipelineStack(app, 'ecommerce-pipeline', {
   env: { account: pipelineAccountId, region: getEnvironmentConfig('dev').region },
   connectionArn,
-  // The shared registry lives in the pipeline account today; Phase 9's dedicated tooling account
-  // is a one-line change here plus a re-pointed pull policy.
+  // The shared registry lives in the tooling account - same home as bin/registry.ts.
   registry: { account: pipelineAccountId, region: getEnvironmentConfig('dev').region },
   pullAccountIds: configuredAccountIds(),
   synthEnvironment,

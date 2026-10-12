@@ -1,4 +1,7 @@
-import { App, Stage, StageProps } from 'aws-cdk-lib';
+import { App, Fn, Stage, StageProps } from 'aws-cdk-lib';
+import { Certificate, ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
+import { ISecurityGroup, IVpc, SecurityGroup, Vpc } from 'aws-cdk-lib/aws-ec2';
+import { HostedZone, IHostedZone } from 'aws-cdk-lib/aws-route53';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig, resolveImageTag } from './config';
@@ -8,10 +11,9 @@ import { AuthDomainStack } from './stacks/auth-domain-stack';
 import { CognitoStack } from './stacks/cognito-stack';
 import { CostStack } from './stacks/cost-stack';
 import { DatabaseStack } from './stacks/database-stack';
-import { DnsStack } from './stacks/dns-stack';
 import { EcrStack, RegistryLocation } from './stacks/ecr-stack';
 import { FrontendStack } from './stacks/frontend-stack';
-import { NetworkStack } from './stacks/network-stack';
+import { availabilityZoneTokens } from './stacks/network-stack';
 
 /**
  * The one region Cognito custom domains can read a certificate from. A custom domain is fronted by
@@ -37,9 +39,8 @@ function withResolvedImageTag(config: EnvironmentConfig, scope: Construct): Envi
 
 export interface SharedRegistryStageProps extends StageProps {
   /**
-   * Where the shared registry lives: the pipeline account today, a dedicated tooling account after
-   * Phase 9. The stage's environment is derived from this - the registry does not belong to any one
-   * deployment environment.
+   * Where the shared registry lives: the tooling account. The stage's environment is derived from
+   * this - the registry does not belong to any one deployment environment.
    */
   readonly registry: RegistryLocation;
 
@@ -56,17 +57,10 @@ export interface SharedRegistryStageProps extends StageProps {
  * repository pair serves dev, uat and prod, and a pipeline promotion moves the identical image
  * forward rather than rebuilding it per stage.
  *
- * This is also the only stage boundary the pipeline needs: the registry deploys, the image-build
- * step pushes into it, and each {@link PlatformStage} deploys tasks referencing the pushed images.
- *
- * Two constraints decided this shape:
- *
- * - Construct dependencies cannot cross a stage boundary - a load balancer depends on its subnets'
- *   route tables, so the compute stacks must share a stage with the network stack.
- * - Even stack-level references cannot cross a stage boundary (`addStackDependency` throws), so the
- *   platform stage imports the repositories by ARN built from {@link RegistryLocation} - names and
- *   account ids are configuration, not deploy-time values. Ordering is the pipeline's job: this
- *   stage is added before the first environment, so the repositories exist before the build runs.
+ * Even stack-level references cannot cross a stage boundary (`addStackDependency` throws), so the
+ * service stage imports the repositories by ARN built from {@link RegistryLocation} - names and
+ * account ids are configuration, not deploy-time values. Ordering is the pipeline's job: this
+ * stage is added before the first environment, so the repositories exist before the build runs.
  */
 export class SharedRegistryStage extends Stage {
   public readonly registry: EcrStack;
@@ -88,7 +82,67 @@ export class SharedRegistryStage extends Stage {
   }
 }
 
-export interface PlatformStageProps extends StageProps {
+/**
+ * The platform exports a service stage imports, resolved through `Fn.importValue` at deploy time.
+ * They are construct imports rather than construct references for the same boundary reason as the
+ * registry: the platform foundation lives in {@link PlatformStage} (`acme-network-*`,
+ * `acme-dns-*`), deployed by `bin/platform.ts`, and stack references cannot cross a stage
+ * boundary. The exports are the contract - if the platform stage has not been deployed, the
+ * service deploy fails on the missing export instead of drifting silently.
+ */
+interface ImportedFoundation {
+  readonly vpc: IVpc;
+  readonly albSecurityGroup: ISecurityGroup;
+  readonly applicationSecurityGroup: ISecurityGroup;
+  readonly databaseSecurityGroup: ISecurityGroup;
+  readonly zone: IHostedZone;
+  readonly certificate: ICertificate;
+  readonly apiDomainName: string;
+}
+
+function importFoundation(scope: Construct, config: EnvironmentConfig): ImportedFoundation {
+  const { environment, dns } = config;
+  const exportPrefix = `acme-${environment}`;
+  const importValue = (name: string) => Fn.importValue(`${exportPrefix}-${name}`);
+
+  // The zone names are resolved exactly as the platform stack creates them: the first `maxAzs`
+  // zones of the region. The subnet lists are exported comma-joined, so each id is selected by
+  // index - the list must be `maxAzs` long at synth time or `fromVpcAttributes` cannot pair each
+  // subnet with its zone. The count must match the platform's subnet count or the imported VPC's
+  // subnet-to-AZ mapping is wrong.
+  const subnetIds = (exportName: string) => {
+    const joined = Fn.split(',', importValue(exportName));
+    return Array.from({ length: config.maxAzs }, (_, index) => Fn.select(index, joined));
+  };
+
+  const vpc = Vpc.fromVpcAttributes(scope, 'SharedVpc', {
+    vpcId: importValue('vpc-id'),
+    availabilityZones: availabilityZoneTokens(config.maxAzs),
+    publicSubnetIds: subnetIds('public-subnet-ids'),
+    privateSubnetIds: subnetIds('private-subnet-ids'),
+    isolatedSubnetIds: subnetIds('database-subnet-ids'),
+  });
+
+  const securityGroup = (id: string, exportName: string) =>
+    SecurityGroup.fromSecurityGroupId(scope, id, importValue(exportName));
+
+  return {
+    vpc,
+    albSecurityGroup: securityGroup('SharedAlbSg', 'alb-security-group-id'),
+    applicationSecurityGroup: securityGroup('SharedApplicationSg', 'application-security-group-id'),
+    databaseSecurityGroup: securityGroup('SharedDatabaseSg', 'database-security-group-id'),
+    // zoneName comes from configuration, not an export: it is a known value (`ouklymeng.qzz.io`),
+    // only the zone id is a deploy-time fact.
+    zone: HostedZone.fromHostedZoneAttributes(scope, 'SharedZone', {
+      hostedZoneId: importValue('hosted-zone-id'),
+      zoneName: dns!.zoneName,
+    }),
+    certificate: Certificate.fromCertificateArn(scope, 'SharedCertificate', importValue('certificate-arn')),
+    apiDomainName: `${dns!.apiSubdomain}.${dns!.zoneName}`,
+  };
+}
+
+export interface EcommerceStageProps extends StageProps {
   /** Environment specific configuration. No environment value is hardcoded in this stage. */
   readonly config: EnvironmentConfig;
 
@@ -100,22 +154,19 @@ export interface PlatformStageProps extends StageProps {
 }
 
 /**
- * The whole platform in one stage: network, database, DNS, authentication and both compute
- * services. They share a stage because they wire constructs together - the application stack places
- * a load balancer in the network stack's VPC, which is a construct dependency, and construct
- * dependencies cannot cross a stage boundary.
+ * The ecommerce service in one environment: database, authentication and both compute services.
+ * These are the stacks the service team owns - `ecommerce-*` resources inside the shared
+ * environment account.
  *
- * The registry is consumed by location rather than referenced as a construct for the same reason:
- * a construct reference would create a stack dependency on the registry stack in
- * {@link SharedRegistryStage}, which is forbidden across stages. The repository names are fixed
- * (`ecommerce-api` / `ecommerce-frontend`), the registry's account and region are configuration,
- * and the deploy-order contract is the same one manual deploys already follow - registry first,
- * push the image, then compute.
+ * The service attaches to platform-owned foundations rather than building its own: the VPC and
+ * tier security groups come from `acme-network-<env>`, the hosted zone and certificate from
+ * `acme-dns-<env>` - both imported by `Fn.importValue` (see {@link importFoundation}). The service
+ * still OWNS its own records and its own security posture: it writes `api.<zone>` and the apex
+ * alias into the shared zone, and the tier security groups are the shared contract every service
+ * in the environment attaches to.
  */
-export class PlatformStage extends Stage {
-  public readonly network: NetworkStack;
+export class EcommerceStage extends Stage {
   public readonly database: DatabaseStack;
-  public readonly dns: DnsStack;
   public readonly authCertificate: AuthCertificateStack;
   public readonly cognito: CognitoStack;
   public readonly application: ApplicationStack;
@@ -123,7 +174,7 @@ export class PlatformStage extends Stage {
   public readonly authDomain: AuthDomainStack;
   public readonly cost: CostStack;
 
-  constructor(scope: Construct, id: string, props: PlatformStageProps) {
+  constructor(scope: Construct, id: string, props: EcommerceStageProps) {
     super(scope, id, props);
 
     const config = withResolvedImageTag(props.config, this);
@@ -136,12 +187,21 @@ export class PlatformStage extends Stage {
       throw new Error(`Phase 4 authentication requires a delegated domain for environment "${environment}".`);
     }
 
-    this.network = new NetworkStack(this, `ecommerce-network-${environment}`, {
+    // Phase 4 authentication is created FIRST: the user pool and the confidential app client the
+    // BFF authenticates as need nothing from the platform foundation, and every later stack
+    // consumes the pool.
+    this.cognito = new CognitoStack(this, `ecommerce-cognito-${environment}`, {
       env,
-      stackName: `ecommerce-network-${environment}`,
+      stackName: `ecommerce-cognito-${environment}`,
       config,
-      description: `E-commerce platform network foundation (${environment})`,
+      description: `E-commerce platform authentication (${environment})`,
     });
+
+    // Imported constructs must live in a stack scope (a Stage is not one). Cognito is the anchor
+    // because it is the only service stack with no foundation inputs of its own: the imported VPC,
+    // security groups, zone and certificate are created inside it and handed to the other stacks
+    // as ordinary cross-stack references within the stage.
+    const foundation = importFoundation(this.cognito, config);
 
     // The database stack owns the RDS instance and the secret holding its credentials. It needs the
     // network (VPC and database security group) and nothing else, so it can be deployed
@@ -150,28 +210,9 @@ export class PlatformStage extends Stage {
       env,
       stackName: `ecommerce-database-${environment}`,
       config,
-      vpc: this.network.vpc,
-      databaseSecurityGroup: this.network.securityGroups.database,
+      vpc: foundation.vpc,
+      databaseSecurityGroup: foundation.databaseSecurityGroup,
       description: `E-commerce platform PostgreSQL database (${environment})`,
-    });
-
-    // Phase 3.5 DNS and TLS. It depends on no other stack - the hosted zone is created, never
-    // looked up - so it can be deployed in parallel with the network and database stacks.
-    //
-    // Deploy-order contract: the zone must be delegated before the certificate can finish issuing.
-    // After this stack is deployed, copy the HostedZoneNameServers output into NS records at the
-    // registrar; ACM then completes the DNS validation on its own and the certificate becomes
-    // usable. Deploying the application stack before that leaves the HTTPS listener waiting on a
-    // certificate that is still pending, which is why the order matters.
-    this.dns = new DnsStack(this, `ecommerce-dns-${environment}`, {
-      env,
-      // The auth-certificate stack reads the hosted zone id from `us-east-1`; cross-region
-      // references hand it over via SSM instead of a CloudFormation export, which cannot cross
-      // regions.
-      crossRegionReferences: true,
-      stackName: `ecommerce-dns-${environment}`,
-      config,
-      description: `E-commerce platform public DNS and TLS certificate (${environment})`,
     });
 
     // The certificate for the Cognito custom domain lives in `us-east-1`, the only region a
@@ -182,46 +223,39 @@ export class PlatformStage extends Stage {
       crossRegionReferences: true,
       stackName: `ecommerce-auth-cert-${environment}`,
       config,
-      zone: this.dns.zone,
+      zone: foundation.zone,
       description: `E-commerce platform Cognito custom domain certificate (${environment})`,
     });
 
-    // Phase 4 authentication. The user pool and the confidential app client the BFF authenticates
-    // as live ahead of the compute that consumes them, so the pool can be retained and its users
-    // survive a redeployment of the application.
-    //
     // The app client needs the API's fully qualified domain name for its exact callback URIs, so it
     // is derived from `config.dns` (never imported as a string). Deploy order is therefore
     // dns -> cognito -> application.
-    this.cognito = new CognitoStack(this, `ecommerce-cognito-${environment}`, {
-      env,
-      stackName: `ecommerce-cognito-${environment}`,
-      config,
-      description: `E-commerce platform authentication (${environment})`,
-    });
-
+    //
     // The SPA: where the browser lands after login and after logout, and a registered logout URI.
     const frontendUrl = config.auth.frontendUrl;
 
-    // The application stack consumes the network stack's VPC and security groups, the registry, the
-    // database stack's endpoint and credentials secret, the DNS stack's hosted zone and
-    // certificate, and the Cognito stack's user pool, app client and client secret. Within the
-    // stage these are construct references as before; only the registry crossed the boundary.
+    // The application stack consumes the imported VPC and security groups, the registry, the
+    // database stack's endpoint and credentials secret, the imported hosted zone and certificate,
+    // and the Cognito stack's user pool, app client and client secret.
     this.application = new ApplicationStack(this, `ecommerce-application-${environment}`, {
       env,
       stackName: `ecommerce-application-${environment}`,
       config,
-      vpc: this.network.vpc,
+      vpc: foundation.vpc,
       registry: props.registry,
-      albSecurityGroup: this.network.securityGroups.alb,
-      applicationSecurityGroup: this.network.securityGroups.application,
+      albSecurityGroup: foundation.albSecurityGroup,
+      applicationSecurityGroup: foundation.applicationSecurityGroup,
       database: {
         host: this.database.instance.dbInstanceEndpointAddress,
         port: this.database.instance.dbInstanceEndpointPort,
         databaseName: config.database.databaseName,
         secret: this.database.credentialsSecret,
       },
-      dns: { zone: this.dns.zone, certificate: this.dns.certificate, domainName: this.dns.apiDomainName },
+      dns: {
+        zone: foundation.zone,
+        certificate: foundation.certificate,
+        domainName: foundation.apiDomainName,
+      },
       auth: {
         issuerUrl: this.cognito.issuerUrl,
         userPoolClientId: this.cognito.userPoolClient.userPoolClientId,
@@ -246,20 +280,20 @@ export class PlatformStage extends Stage {
       config,
       registry: props.registry,
       cluster: this.application.cluster,
-      applicationSecurityGroup: this.network.securityGroups.application,
+      applicationSecurityGroup: foundation.applicationSecurityGroup,
       loadBalancer: this.application.api.loadBalancer,
-      albSecurityGroup: this.network.securityGroups.alb,
+      albSecurityGroup: foundation.albSecurityGroup,
       httpsListener,
-      zone: this.dns.zone,
+      zone: foundation.zone,
       description: `E-commerce platform frontend hosting (${environment})`,
     });
 
     // The Cognito custom domain (`auth.<zone>`) is a leaf stack deployed last on purpose. Cognito
     // verifies at domain creation that the parent domain resolves an A record, and the frontend
     // stack is what publishes the apex alias - so the domain cannot exist before the frontend.
-    // Object references already force this stack after cognito (the pool), dns (the zone) and
-    // auth-certificate (the cert, via a cross-region reference); only the apex-record ordering is
-    // not expressible as a value, hence the explicit dependency.
+    // Object references already force this stack after cognito (the pool) and auth-certificate
+    // (the cert, via a cross-region reference); only the apex-record ordering is not expressible
+    // as a value, hence the explicit dependency.
     this.authDomain = new AuthDomainStack(this, `ecommerce-auth-domain-${environment}`, {
       env,
       crossRegionReferences: true,
@@ -267,12 +301,12 @@ export class PlatformStage extends Stage {
       config,
       userPool: this.cognito.userPool,
       certificate: this.authCertificate.certificate,
-      zone: this.dns.zone,
+      zone: foundation.zone,
       description: `E-commerce platform Cognito custom domain (${environment})`,
     });
     this.authDomain.addStackDependency(this.frontend);
 
-    // Phase 9 guardrails. No dependencies on the rest of the platform - the budget, anomaly monitor
+    // Phase 9 guardrails. No dependencies on the rest of the service - the budget, anomaly monitor
     // and alert topic exist whether or not a workload is running, which is the point: cost
     // guardrails must outlive and predate the things they watch.
     this.cost = new CostStack(this, `ecommerce-cost-${environment}`, {

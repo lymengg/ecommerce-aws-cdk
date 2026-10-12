@@ -185,9 +185,9 @@ describe('DnsStack outputs', () => {
   test('exports the delegation name servers, the certificate arn and the API domain name', () => {
     const template = buildStacks('dev').template;
 
-    template.hasOutput('HostedZoneNameServers', { Export: { Name: 'ecommerce-dev-hosted-zone-name-servers' } });
-    template.hasOutput('CertificateArn', { Export: { Name: 'ecommerce-dev-certificate-arn' } });
-    template.hasOutput('ApiDomainName', { Export: { Name: 'ecommerce-dev-api-domain-name' } });
+    template.hasOutput('HostedZoneNameServers', { Export: { Name: 'acme-dev-hosted-zone-name-servers' } });
+    template.hasOutput('CertificateArn', { Export: { Name: 'acme-dev-certificate-arn' } });
+    template.hasOutput('ApiDomainName', { Export: { Name: 'acme-dev-api-domain-name' } });
   });
 
   test('exports the domain name the API answers on', () => {
@@ -199,7 +199,7 @@ describe('DnsStack outputs', () => {
   test('uses environment specific export names so environments do not clash', () => {
     const outputs = buildStacks('prod').template.toJSON().Outputs;
 
-    expect(outputs.CertificateArn.Export.Name).toBe('ecommerce-prod-certificate-arn');
-    expect(outputs.ApiDomainName.Export.Name).toBe('ecommerce-prod-api-domain-name');
+    expect(outputs.CertificateArn.Export.Name).toBe('acme-prod-certificate-arn');
+    expect(outputs.ApiDomainName.Export.Name).toBe('acme-prod-api-domain-name');
   });
 });

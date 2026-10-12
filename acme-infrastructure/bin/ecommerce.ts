@@ -4,7 +4,7 @@ import 'source-map-support/register';
 import { App } from 'aws-cdk-lib';
 
 import { getEnvironmentConfig, resolveEnvironmentName } from '../lib/config';
-import { PlatformStage } from '../lib/ecommerce-stage';
+import { EcommerceStage } from '../lib/ecommerce-stage';
 import { RegistryLocation } from '../lib/stacks/ecr-stack';
 
 const app = new App();
@@ -14,19 +14,22 @@ const app = new App();
 const environment = resolveEnvironmentName(app);
 const config = getEnvironmentConfig(environment);
 
-// The service team's entry point deploys ONLY the environment's stacks. The shared registry is a
-// platform-owned resource - deployed once via `bin/registry.ts` into ACME_TOOLING_ACCOUNT,
-// referenced here by location so the stacks can build image ARNs. The environment's own account
-// is the fallback so a single-account setup still deploys with zero extra configuration.
+// The service team's entry point deploys ONLY the ecommerce service's stacks. Two things it does
+// NOT own, both platform resources deployed by other entry points:
+// - the shared registry (`bin/registry.ts`, ACME_TOOLING_ACCOUNT), referenced here by location so
+//   stacks can build image ARNs - the environment's own account is the fallback for a
+//   single-account setup;
+// - the network and DNS foundation (`bin/platform.ts`, acme-network/acme-dns), imported by the
+//   stacks via the `acme-<env>-*` CloudFormation exports - deploy that entry point first.
 const registry: RegistryLocation = {
   account: process.env.ACME_TOOLING_ACCOUNT ?? config.account,
   region: process.env.ACME_REGISTRY_REGION ?? config.region,
 };
 
 // Stack names are explicit inside the stage, so the deployed stacks keep the names they were
-// created with (`ecommerce-network-dev`, ...) even though their construct paths are stage-scoped
-// (`dev/ecommerce-network-dev`).
-new PlatformStage(app, environment, {
+// created with (`ecommerce-database-dev`, ...) even though their construct paths are stage-scoped
+// (`dev/ecommerce-database-dev`).
+new EcommerceStage(app, environment, {
   env: { account: config.account, region: config.region },
   config,
   registry,

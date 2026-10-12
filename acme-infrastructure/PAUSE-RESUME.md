@@ -51,7 +51,7 @@ aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-f
 ECOMMERCE_DEV_NAT_GATEWAYS=0 \
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io \
 ACME_DEV_ACCOUNT=572396340039 \
-npx cdk deploy ecommerce-network-dev -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 ```
 
 On PowerShell set the variables differently:
@@ -60,7 +60,7 @@ On PowerShell set the variables differently:
 $env:ECOMMERCE_DEV_NAT_GATEWAYS = "0"
 $env:ECOMMERCE_DEV_DOMAIN       = "ouklymeng.qzz.io"
 $env:ACME_DEV_ACCOUNT      = "572396340039"
-npx cdk deploy ecommerce-network-dev -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 ```
 
 ## Resume
@@ -75,7 +75,7 @@ aws rds start-db-instance --db-instance-identifier ecommerce-dev-db
 #    Cognito/Secrets Manager. Simply omit the zero-override (~2 min).
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io \
 ACME_DEV_ACCOUNT=572396340039 \
-npx cdk deploy ecommerce-network-dev -c environment=dev
+npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 
 # 3. Scale the services back up (~1-2 min to healthy)
 aws ecs update-service --cluster ecommerce-dev-cluster --service ecommerce-dev-api      --desired-count 1
@@ -120,18 +120,18 @@ takes ~10 minutes and recreates the ALB and its DNS records.
 ```bash
 # Pause: destroy compute, remove NAT, stop the database
 npx cdk destroy ecommerce-frontend-dev ecommerce-application-dev -c environment=dev
-ECOMMERCE_DEV_NAT_GATEWAYS=0 npx cdk deploy ecommerce-network-dev -c environment=dev
+ECOMMERCE_DEV_NAT_GATEWAYS=0 npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 aws rds stop-db-instance --db-instance-identifier ecommerce-dev-db
 
 # Resume: NAT first, database in parallel, then compute
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ACME_DEV_ACCOUNT=572396340039 \
-  npx cdk deploy ecommerce-network-dev -c environment=dev
+  npx cdk --app "npx ts-node --prefer-ts-exts bin/platform.ts" deploy acme-network-dev -c environment=dev
 aws rds start-db-instance --db-instance-identifier ecommerce-dev-db
 ECOMMERCE_DEV_DOMAIN=ouklymeng.qzz.io ACME_DEV_ACCOUNT=572396340039 \
   npx cdk deploy ecommerce-application-dev ecommerce-frontend-dev -c environment=dev
 ```
 
-Never `cdk destroy` `ecommerce-dns-dev`, `ecommerce-database-dev`, `ecommerce-auth-cert-dev`,
+Never `cdk destroy` `acme-dns-dev`, `ecommerce-database-dev`, `ecommerce-auth-cert-dev`,
 `ecommerce-auth-domain-dev` or `ecommerce-cognito-dev` as a way to save money: they are nearly free
 to keep, and destroying them means re-delegating DNS at the registrar, recreating the user pool and
 waiting for the custom domain's CloudFront distribution again.

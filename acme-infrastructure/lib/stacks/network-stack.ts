@@ -24,7 +24,7 @@ const SUBNET_CIDR_MASK = 24;
  * and leaves CloudFormation to resolve the real zone names at deploy time. It also keeps the template
  * region independent, so a region change is a one line configuration change.
  */
-function availabilityZoneTokens(count: number): string[] {
+export function availabilityZoneTokens(count: number): string[] {
   return Array.from({ length: count }, (_, index) => Fn.select(index, Fn.getAzs()));
 }
 
@@ -35,13 +35,15 @@ export interface NetworkStackProps extends StackProps {
 }
 
 /**
- * Phase 1 network foundation for the e-commerce platform.
+ * The environment's shared network foundation - a platform-owned resource (`acme-*`), not part
+ * of any one service.
  *
  * Creates the VPC, public and private subnets spread over the configured Availability Zones, the
  * internet and NAT gateways with the route tables that connect them, and the three tier security
- * groups that later phases attach their resources to. It deliberately creates no compute, database
- * or load balancer resources: those are Phase 2 and Phase 3 and live in separate stacks that
- * consume this stack's outputs.
+ * groups services attach their resources to. Every service in the environment shares this VPC -
+ * one NAT gateway bill for the whole environment, and the platform team owns the only place
+ * networking is defined. It deliberately creates no compute, database or load balancer resources:
+ * services consume this stack's exports via `Fn.importValue` and attach.
  *
  * Phase 3 added the isolated `database` subnet group. It is the smallest change that gives the
  * database tier a network of its own - the public and private application subnets are untouched, so
@@ -72,7 +74,7 @@ export class NetworkStack extends Stack {
     const { config } = props;
 
     this.vpc = new Vpc(this, 'Vpc', {
-      vpcName: `ecommerce-${config.environment}`,
+      vpcName: `acme-${config.environment}`,
       ipAddresses: IpAddresses.cidr(config.vpcCidr),
       // `availabilityZones` instead of `maxAzs`: CDK accepts one or the other, never both, and only
       // the explicit list guarantees the configured zone count. See availabilityZoneTokens().
@@ -142,11 +144,12 @@ export class NetworkStack extends Stack {
   }
 
   /**
-   * Publishes the contract later stacks consume. Export names are environment specific so that a
-   * dev, uat and prod stack can coexist in one account without clashing.
+   * Publishes the contract services import across the ownership boundary. Export names are
+   * environment specific so that dev, uat and prod can coexist in one account without clashing,
+   * and `acme-` prefixed because the network is platform infrastructure, not a service resource.
    */
   private createOutputs(config: EnvironmentConfig): void {
-    const exportPrefix = `ecommerce-${config.environment}`;
+    const exportPrefix = `acme-${config.environment}`;
 
     new CfnOutput(this, 'VpcId', {
       value: this.vpc.vpcId,

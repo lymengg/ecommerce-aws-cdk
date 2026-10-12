@@ -97,7 +97,14 @@ export class DnsStack extends Stack {
    * one account.
    */
   private createOutputs(config: EnvironmentConfig): void {
-    const exportPrefix = `ecommerce-${config.environment}`;
+    const exportPrefix = `acme-${config.environment}`;
+
+    // The zone id is what service stacks import to write their own records into the shared zone.
+    new CfnOutput(this, 'HostedZoneId', {
+      value: this.zone.hostedZoneId,
+      description: 'Id of the public hosted zone services attach their records to',
+      exportName: `${exportPrefix}-hosted-zone-id`,
+    });
 
     new CfnOutput(this, 'HostedZoneNameServers', {
       // The name servers are a list attribute of the zone, so they are joined with Fn.join rather

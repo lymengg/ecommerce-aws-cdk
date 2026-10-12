@@ -3,7 +3,8 @@ import { Match, Template } from 'aws-cdk-lib/assertions';
 
 import { getEnvironmentConfig } from '../lib/config';
 import { EnvironmentConfig } from '../lib/config/types';
-import { PlatformStage, SharedRegistryStage } from '../lib/ecommerce-stage';
+import { EcommerceStage, SharedRegistryStage } from '../lib/ecommerce-stage';
+import { PlatformStage } from '../lib/platform-stage';
 import { RegistryLocation } from '../lib/stacks/ecr-stack';
 import { PipelineStack } from '../lib/stacks/pipeline-stack';
 
@@ -79,20 +80,24 @@ describe('PipelineStack', () => {
   it('runs tests before the shared registry and builds the images before dev', () => {
     const template = pipelineTemplate([dev]);
     const names = stageNames(template);
-    expect(names).toEqual(['Source', 'Build', 'UpdatePipeline', 'Assets', 'registry', 'dev']);
+    expect(names).toEqual(['Source', 'Build', 'UpdatePipeline', 'Assets', 'registry', 'dev-foundation', 'dev']);
 
     const registryActions = stageActions(template, 'registry').map((a) => a.Name);
     expect(registryActions.slice(0, 3)).toEqual(['ApiTests', 'FrontendTests', 'InfrastructureTests']);
     expect(registryActions.slice(3)).toEqual(['acme-ecr.Prepare', 'acme-ecr.Deploy']);
 
+    const foundationActions = stageActions(template, 'dev-foundation').map((a) => a.Name);
+    expect(foundationActions[0]).toBe('BuildImages');
+    // The platform foundation keeps its shared stacks under their acme-* names.
+    for (const stack of ['acme-network-dev', 'acme-dns-dev']) {
+      expect(foundationActions).toContain(`${stack}.Deploy`);
+    }
+
     const devActions = stageActions(template, 'dev').map((a) => a.Name);
-    expect(devActions[0]).toBe('BuildImages');
     expect(devActions[devActions.length - 1]).toBe('SmokeTests-dev');
-    // The platform keeps every stack the manual workflow deploys, under its live stack name.
+    // The service stage keeps every stack the manual workflow deploys, under its live stack name.
     for (const stack of [
       'ecommerce-cognito-dev',
-      'ecommerce-dns-dev',
-      'ecommerce-network-dev',
       'ecommerce-auth-cert-dev',
       'ecommerce-database-dev',
       'ecommerce-application-dev',
@@ -113,8 +118,11 @@ describe('PipelineStack', () => {
       'UpdatePipeline',
       'Assets',
       'registry',
+      'dev-foundation',
       'dev',
+      'uat-foundation',
       'uat',
+      'prod-foundation',
       'prod',
     ]);
 
@@ -124,9 +132,10 @@ describe('PipelineStack', () => {
 
     const approval = (stage: string) =>
       stageActions(template, stage).filter((a) => a.ActionTypeId?.Category === 'Approval').map((a) => a.Name);
+    expect(approval('dev-foundation')).toEqual([]);
     expect(approval('dev')).toEqual([]);
-    expect(approval('uat')).toEqual(['Promote_to_uat']);
-    expect(approval('prod')).toEqual(['Promote_to_prod']);
+    expect(approval('uat-foundation')).toEqual(['Promote_to_uat']);
+    expect(approval('prod-foundation')).toEqual(['Promote_to_prod']);
   });
 
   it('targets each environment stage at its own account', () => {
@@ -136,6 +145,9 @@ describe('PipelineStack', () => {
     const uat = stack.node.findChild('uat') as Stage;
     expect(uat.account).toBe(UAT_ACCOUNT);
     expect(uat.region).toBe('ap-southeast-1');
+
+    const uatFoundation = stack.node.findChild('uat-foundation') as Stage;
+    expect(uatFoundation.account).toBe(UAT_ACCOUNT);
   });
 });
 
@@ -145,19 +157,20 @@ describe('Environment stages', () => {
 
   // The stacks were deployed before stages existed; the explicit stackName is what makes CloudFormation
   // keep updating the same stacks instead of deploying stage-prefixed duplicates.
-  it('preserves the deployed stack names inside the platform stage', () => {
+  it('preserves the deployed stack names inside the platform and service stages', () => {
     const app = new App();
-    const platform = new PlatformStage(app, 'dev', { env, config: dev, registry: REGISTRY });
+    const platform = new PlatformStage(app, 'dev-foundation', { env, config: dev });
+    const service = new EcommerceStage(app, 'dev', { env, config: dev, registry: REGISTRY });
 
-    expect(platform.network.stackName).toBe('ecommerce-network-dev');
-    expect(platform.database.stackName).toBe('ecommerce-database-dev');
-    expect(platform.dns.stackName).toBe('ecommerce-dns-dev');
-    expect(platform.authCertificate.stackName).toBe('ecommerce-auth-cert-dev');
-    expect(platform.cognito.stackName).toBe('ecommerce-cognito-dev');
-    expect(platform.application.stackName).toBe('ecommerce-application-dev');
-    expect(platform.frontend.stackName).toBe('ecommerce-frontend-dev');
-    expect(platform.authDomain.stackName).toBe('ecommerce-auth-domain-dev');
-    expect(platform.cost.stackName).toBe('ecommerce-cost-dev');
+    expect(platform.network.stackName).toBe('acme-network-dev');
+    expect(platform.dns.stackName).toBe('acme-dns-dev');
+    expect(service.database.stackName).toBe('ecommerce-database-dev');
+    expect(service.authCertificate.stackName).toBe('ecommerce-auth-cert-dev');
+    expect(service.cognito.stackName).toBe('ecommerce-cognito-dev');
+    expect(service.application.stackName).toBe('ecommerce-application-dev');
+    expect(service.frontend.stackName).toBe('ecommerce-frontend-dev');
+    expect(service.authDomain.stackName).toBe('ecommerce-auth-domain-dev');
+    expect(service.cost.stackName).toBe('ecommerce-cost-dev');
   });
 
   it('deploys the shared registry once, at the registry location', () => {
@@ -174,9 +187,9 @@ describe('Environment stages', () => {
 
   it('deploys the auth certificate to us-east-1 regardless of the stage region', () => {
     const app = new App();
-    const platform = new PlatformStage(app, 'dev', { env, config: dev, registry: REGISTRY });
+    const service = new EcommerceStage(app, 'dev', { env, config: dev, registry: REGISTRY });
 
-    expect(platform.authCertificate.region).toBe('us-east-1');
-    expect(platform.network.region).toBe('ap-southeast-1');
+    expect(service.authCertificate.region).toBe('us-east-1');
+    expect(service.database.region).toBe('ap-southeast-1');
   });
 });

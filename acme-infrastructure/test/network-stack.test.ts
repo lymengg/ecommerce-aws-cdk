@@ -410,21 +410,21 @@ describe('NetworkStack outputs', () => {
   test('exports the VPC and subnet ids for later stacks', () => {
     const template = buildTemplate('dev');
 
-    template.hasOutput('VpcId', { Export: { Name: 'ecommerce-dev-vpc-id' } });
-    template.hasOutput('PublicSubnetIds', { Export: { Name: 'ecommerce-dev-public-subnet-ids' } });
-    template.hasOutput('PrivateSubnetIds', { Export: { Name: 'ecommerce-dev-private-subnet-ids' } });
-    template.hasOutput('DatabaseSubnetIds', { Export: { Name: 'ecommerce-dev-database-subnet-ids' } });
+    template.hasOutput('VpcId', { Export: { Name: 'acme-dev-vpc-id' } });
+    template.hasOutput('PublicSubnetIds', { Export: { Name: 'acme-dev-public-subnet-ids' } });
+    template.hasOutput('PrivateSubnetIds', { Export: { Name: 'acme-dev-private-subnet-ids' } });
+    template.hasOutput('DatabaseSubnetIds', { Export: { Name: 'acme-dev-database-subnet-ids' } });
   });
 
   test('exports the security group ids for later stacks', () => {
     const template = buildTemplate('dev');
 
-    template.hasOutput('AlbSecurityGroupId', { Export: { Name: 'ecommerce-dev-alb-security-group-id' } });
+    template.hasOutput('AlbSecurityGroupId', { Export: { Name: 'acme-dev-alb-security-group-id' } });
     template.hasOutput('ApplicationSecurityGroupId', {
-      Export: { Name: 'ecommerce-dev-application-security-group-id' },
+      Export: { Name: 'acme-dev-application-security-group-id' },
     });
     template.hasOutput('DatabaseSecurityGroupId', {
-      Export: { Name: 'ecommerce-dev-database-security-group-id' },
+      Export: { Name: 'acme-dev-database-security-group-id' },
     });
   });
 

@@ -65,7 +65,7 @@ Small phase, deliberately pulled ahead of auth: bearer tokens must never travel 
 **Delivered:** Route 53 public hosted zone for the delegated subdomain (created, never looked up),
 ACM certificate for `api.<env-domain>` validated by DNS against that zone, HTTPS listener on 443
 (TLS 1.2 floor) forwarding to the existing target group, port 80 listener as a permanent redirect,
-alias `A` record to the ALB, and an `ecommerce-dns-<env>` stack between the database and the
+alias `A` record to the ALB, and an `acme-dns-<env>` stack between the database and the
 application. Prod fails validation without a domain; dev/uat still synthesise HTTP-only. No new IAM,
 no new security group rule (Phase 1 already opened 443).
 
