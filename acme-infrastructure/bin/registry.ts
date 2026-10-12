@@ -3,7 +3,7 @@ import 'source-map-support/register';
 
 import { App } from 'aws-cdk-lib';
 
-import { configuredAccountIds, getEnvironmentConfig } from '../lib/config';
+import { configuredAccountIds, devConfig, toolingAccountId } from '../lib/config';
 import { SharedRegistryStage } from '../lib/ecommerce-stage';
 import { RegistryLocation } from '../lib/stacks/ecr-stack';
 
@@ -12,21 +12,20 @@ import { RegistryLocation } from '../lib/stacks/ecr-stack';
  *
  *   npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy 'registry/**'
  *
- * Ownership follows the multi-team boundary: the registry is a platform resource that every
- * service pulls from, so it gets its own deployer rather than riding inside a service's app.
+ * Ownership follows the multi-team boundary: the registry is a tooling resource that every
+ * service pulls from, so it is owned and deployed by the platform team, not by a service's app
+ * and not by an environment. It lives in `ACME_TOOLING_ACCOUNT` (required) - until Organizations
+ * provisions `acme-tooling`, set it to the one real account. `ACME_REGISTRY_REGION` overrides the
+ * region; the platform's home region is the default.
+ *
  * Service deploys (`bin/ecommerce.ts`) only need the registry's LOCATION to build image ARNs -
  * they never deploy it themselves.
- *
- * The registry lives in `ACME_REGISTRY_ACCOUNT` / `ACME_REGISTRY_REGION`, defaulting to the dev
- * account today - the tooling-account migration is setting those two variables plus a redeploy
- * once `acme-tooling` exists.
  */
 const app = new App();
 
-const dev = getEnvironmentConfig('dev');
 const registry: RegistryLocation = {
-  account: process.env.ACME_REGISTRY_ACCOUNT ?? dev.account,
-  region: process.env.ACME_REGISTRY_REGION ?? dev.region,
+  account: toolingAccountId(),
+  region: process.env.ACME_REGISTRY_REGION ?? devConfig.region,
 };
 
 new SharedRegistryStage(app, 'registry', {

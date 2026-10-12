@@ -9,6 +9,7 @@ import { assertValidEnvironmentConfig } from './validation';
 
 export * from './types';
 export * from './validation';
+export { devConfig } from './dev';
 
 const CONFIG_BY_ENVIRONMENT: Record<EnvironmentName, EnvironmentConfig> = {
   dev: devConfig,
@@ -60,6 +61,23 @@ export function configuredAccountIds(): string[] {
   return ENVIRONMENT_NAMES.map(
     (name) => process.env[`ACME_${name.toUpperCase()}_ACCOUNT`],
   ).filter((account): account is string => account !== undefined && account !== '');
+}
+
+/**
+ * The account that hosts platform-owned shared resources: the shared registry today, the
+ * pipeline once `acme-tooling` exists. This is deliberately NOT an environment - shared
+ * resources get their own home rather than squatting in dev, so the ownership stays visible.
+ * Until Organizations provisions `acme-tooling`, point it at the one real account; nothing else
+ * has to change when the tooling account lands.
+ */
+export function toolingAccountId(): string {
+  const account = process.env.ACME_TOOLING_ACCOUNT;
+  if (!account) {
+    throw new Error(
+      'ACME_TOOLING_ACCOUNT is required - the shared registry and pipeline live in the tooling account, not an environment.',
+    );
+  }
+  return account;
 }
 
 /**

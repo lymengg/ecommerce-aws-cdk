@@ -1544,7 +1544,9 @@ The configured tag is `v0.1.0` (`application.imageTag`). It can be overridden pe
 editing source, via `-c imageTag=<tag>` or the `IMAGE_TAG` environment variable.
 
 ```bash
-# 1. Deploy the shared registry first, so the repository exists.
+# 1. Deploy the shared registry first, so the repository exists. The registry is tooling-owned:
+#    ACME_TOOLING_ACCOUNT is required (until `acme-tooling` exists, use the one real account id).
+export ACME_TOOLING_ACCOUNT=<account>
 npx cdk --app "npx ts-node --prefer-ts-exts bin/registry.ts" deploy acme-ecr
 
 # 2. Build the image and tag it with the registry URI and the immutable tag.
@@ -1796,6 +1798,12 @@ A missing `ECOMMERCE_<ENV>_DOMAIN` therefore fails the synth before anything is 
 Each environment reads its account from an environment variable — `ACME_DEV_ACCOUNT`,
 `ACME_UAT_ACCOUNT`, `ACME_PROD_ACCOUNT` — so account ids stay out of source control. The
 value is read when the CDK app starts, so it has to be set in the shell that runs `cdk`.
+
+Platform-owned resources read `ACME_TOOLING_ACCOUNT` instead: it is the home of the shared
+registry (and the pipeline, once `acme-tooling` exists), so `bin/registry.ts` requires it rather
+than silently falling back to an environment account. Service deploys (`bin/ecommerce.ts`) read
+it too when set, and otherwise assume the registry lives in the environment's own account —
+the single-account setup needs no extra configuration either way.
 
 PowerShell:
 

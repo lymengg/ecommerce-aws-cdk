@@ -15,11 +15,11 @@ const environment = resolveEnvironmentName(app);
 const config = getEnvironmentConfig(environment);
 
 // The service team's entry point deploys ONLY the environment's stacks. The shared registry is a
-// platform-owned resource - deployed once via `bin/registry.ts`, referenced here by location so
-// the stacks can build image ARNs. `ACME_REGISTRY_ACCOUNT` / `ACME_REGISTRY_REGION` point at
-// wherever the platform team hosts it (the dev account today, `acme-tooling` later).
+// platform-owned resource - deployed once via `bin/registry.ts` into ACME_TOOLING_ACCOUNT,
+// referenced here by location so the stacks can build image ARNs. The environment's own account
+// is the fallback so a single-account setup still deploys with zero extra configuration.
 const registry: RegistryLocation = {
-  account: process.env.ACME_REGISTRY_ACCOUNT ?? config.account,
+  account: process.env.ACME_TOOLING_ACCOUNT ?? config.account,
   region: process.env.ACME_REGISTRY_REGION ?? config.region,
 };
 
