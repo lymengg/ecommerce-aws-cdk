@@ -1,4 +1,4 @@
-import { Fn, Stack, StackProps } from 'aws-cdk-lib';
+import { Annotations, Fn, Stack, StackProps } from 'aws-cdk-lib';
 import { ISecurityGroup, IVpc, SecurityGroup, Vpc } from 'aws-cdk-lib/aws-ec2';
 import {
   ApplicationListener,
@@ -84,6 +84,18 @@ export class EcommerceSecurityStack extends Stack {
       privateSubnetIds: subnetIds(NETWORK_EXPORTS.privateSubnetIds),
       isolatedSubnetIds: subnetIds(NETWORK_EXPORTS.databaseSubnetIds),
     });
+
+    // Imported subnets carry no routeTableId, so each one earns a noSubnetRouteTableId warning -
+    // which `cdk synth --strict` turns into a build failure inside the pipeline. The service only
+    // needs the subnet ids for placement and never reads a route table off the import, so the
+    // warning is acknowledged per subnet rather than silencing strict mode.
+    for (const subnet of [
+      ...this.vpc.publicSubnets,
+      ...this.vpc.privateSubnets,
+      ...this.vpc.isolatedSubnets,
+    ]) {
+      Annotations.of(subnet).acknowledgeWarning('@aws-cdk/aws-ec2:noSubnetRouteTableId');
+    }
 
     // The shared ingress: chassis owned by the platform, imported here so the service's own rules
     // (accepting its traffic, hanging rules on its listener, aliasing records to it) land in this
