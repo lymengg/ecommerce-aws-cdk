@@ -122,7 +122,26 @@ export class PipelineStack extends Stack {
         ],
         primaryOutputDirectory: 'acme-infrastructure/cdk.out',
       }),
-      synthCodeBuildDefaults: { partialBuildSpec: RUNTIME_BUILD_SPEC(NODE_RUNTIME) },
+      synthCodeBuildDefaults: {
+        partialBuildSpec: RUNTIME_BUILD_SPEC(NODE_RUNTIME),
+        rolePolicy: [
+          // Context lookups (HostedZone.fromLookup in the us-east-1 auth-cert stack) run during
+          // synth and must assume the environment's bootstrap lookup role - the mechanism that
+          // keeps working when environments move to their own accounts.
+          new PolicyStatement({
+            effect: Effect.ALLOW,
+            actions: ['sts:AssumeRole'],
+            resources: ['arn:aws:iam::*:role/cdk-*-lookup-role-*'],
+          }),
+          // Same-account fallback: if the assume path is unavailable the provider calls Route 53
+          // with the build role's own credentials, so it needs the zone read too.
+          new PolicyStatement({
+            effect: Effect.ALLOW,
+            actions: ['route53:ListHostedZonesByName', 'route53:GetHostedZone'],
+            resources: ['*'],
+          }),
+        ],
+      },
       codeBuildDefaults: { partialBuildSpec: RUNTIME_BUILD_SPEC(NODE_RUNTIME) },
     });
 
