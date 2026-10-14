@@ -1,6 +1,6 @@
 import { CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
 import { Certificate, CertificateValidation, ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
-import { IHostedZone } from 'aws-cdk-lib/aws-route53';
+import { HostedZone } from 'aws-cdk-lib/aws-route53';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
@@ -9,14 +9,6 @@ import { applyPlatformTags } from '../tags';
 export interface AuthCertificateStackProps extends StackProps {
   /** Environment specific configuration. No environment value is hardcoded in this stack. */
   readonly config: EnvironmentConfig;
-
-  /**
-   * The hosted zone the certificate validates against. Consumed across a region boundary - the
-   * zone lives in the dns stack in the deployment region while this stack runs in `us-east-1` -
-   * so both stacks are created with `crossRegionReferences` and CDK hands the zone id over via an
-   * SSM parameter rather than a CloudFormation export, which cannot cross regions.
-   */
-  readonly zone: IHostedZone;
 }
 
 /**
@@ -30,7 +22,12 @@ export interface AuthCertificateStackProps extends StackProps {
  * use the other's.
  *
  * Route 53 is a global service, so the DNS validation records this stack writes into the shared
- * hosted zone work from `us-east-1` exactly as they would from the deployment region.
+ * hosted zone work from `us-east-1` exactly as they would from the deployment region. The zone is
+ * resolved by name at synthesis rather than received as a stack prop: CloudFormation exports are
+ * region-scoped, so the dns stack's `acme-<env>-hosted-zone-id` export cannot be imported in
+ * `us-east-1` at all, and an imported zone would inline a failing `Fn::ImportValue` here. The
+ * lookup produces a literal zone id in the template - nothing crosses the region boundary at
+ * deploy time.
  *
  * ```
  *   Route 53 hosted zone (global, owned by the dns stack)
@@ -50,7 +47,7 @@ export class AuthCertificateStack extends Stack {
   constructor(scope: Construct, id: string, props: AuthCertificateStackProps) {
     super(scope, id, props);
 
-    const { config, zone } = props;
+    const { config } = props;
     const { dns } = config;
 
     if (dns === undefined) {
@@ -65,6 +62,7 @@ export class AuthCertificateStack extends Stack {
     // A single-name certificate: the Cognito custom domain is exactly one host. No wildcard - a
     // `*.<zone>` certificate would cover this name too but would also authorise any other host an
     // attacker who obtained it could invent.
+    const zone = HostedZone.fromLookup(this, 'SharedZone', { domainName: dns.zoneName });
     this.certificate = new Certificate(this, 'Certificate', {
       domainName: this.authDomainName,
       validation: CertificateValidation.fromDns(zone),

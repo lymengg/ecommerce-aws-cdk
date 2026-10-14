@@ -1,6 +1,5 @@
-import { App, Stack } from 'aws-cdk-lib';
+import { App } from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
-import { HostedZone } from 'aws-cdk-lib/aws-route53';
 
 import { getEnvironmentConfig } from '../lib/config';
 import { DnsConfig, EnvironmentConfig, EnvironmentName } from '../lib/config/types';
@@ -26,25 +25,18 @@ interface BuiltStacks {
 }
 
 /**
- * Builds the auth certificate stack in one app, exactly as `bin/ecommerce.ts` does: in `us-east-1`,
- * with the hosted zone supplied as an imported object - the suite never looks a zone up, so it
- * does not depend on credentials or on `ECOMMERCE_<ENV>_DOMAIN` being set.
+ * Builds the auth certificate stack in one app, exactly as `bin/ecommerce.ts` does: in `us-east-1`.
+ * The stack resolves the shared zone by name at synthesis; with no context provider registered the
+ * lookup falls back to its dummy value, so the suite stays independent of credentials and of
+ * `ECOMMERCE_<ENV>_DOMAIN` being set.
  */
 function buildStacks(environment: EnvironmentName, dns: DnsConfig = TEST_DNS): BuiltStacks {
   const app = new App();
   const base = getEnvironmentConfig(environment);
   const config: EnvironmentConfig = { ...base, dns };
-  // Imports must be scoped inside a stack. A throwaway stack supplies the scope; the imported
-  // attributes are literal strings, so consuming them in another stack emits no cross-stack link.
-  const dependencies = new Stack(app, 'Dependencies', { env: { account: TEST_ACCOUNT, region: config.region } });
-  const zone = HostedZone.fromHostedZoneAttributes(dependencies, 'Zone', {
-    hostedZoneId: 'Z0000000000000000000TEST',
-    zoneName: dns.zoneName,
-  });
   const stack = new AuthCertificateStack(app, `test-auth-cert-${environment}`, {
     env: { account: TEST_ACCOUNT, region: 'us-east-1' },
     config,
-    zone,
   });
 
   return { template: Template.fromStack(stack), stack };
@@ -97,10 +89,12 @@ describe('AuthCertificateStack certificate', () => {
     const certificate = single(buildStacks('dev').template, 'AWS::CertificateManager::Certificate');
 
     // CloudFormation creates the validation record itself when HostedZoneId is supplied - no
-    // recordset resources appear in the template. Route 53 is global, so the zone id works from
-    // us-east-1 exactly as it would from the deployment region.
+    // recordset resources appear in the template. The zone is resolved by name at synthesis:
+    // against the real provider it is the account's zone id; in this suite it is the lookup's
+    // DUMMY placeholder. Route 53 is global, so a literal id works from us-east-1 where the
+    // dns stack's CloudFormation export could never reach.
     expect(certificate.properties.DomainValidationOptions).toEqual([
-      { DomainName: 'auth.dev.example.com', HostedZoneId: 'Z0000000000000000000TEST' },
+      { DomainName: 'auth.dev.example.com', HostedZoneId: 'DUMMY' },
     ]);
   });
 });

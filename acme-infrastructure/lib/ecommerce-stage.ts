@@ -163,14 +163,14 @@ export class EcommerceStage extends Stage {
     });
 
     // The certificate for the Cognito custom domain lives in `us-east-1`, the only region a
-    // Cognito-managed CloudFront distribution can read it from. Deploy order: dns ->
-    // auth-certificate -> auth-domain.
+    // Cognito-managed CloudFront distribution can read it from. It resolves the shared zone by
+    // name at synthesis - the dns stack's hosted-zone-id export cannot cross the region boundary.
+    // Deploy order: auth-certificate -> auth-domain.
     this.authCertificate = new AuthCertificateStack(this, `ecommerce-auth-cert-${environment}`, {
       env: { account: config.account, region: COGNITO_CUSTOM_DOMAIN_CERTIFICATE_REGION },
       crossRegionReferences: true,
       stackName: `ecommerce-auth-cert-${environment}`,
       config,
-      zone: this.security.zone,
       description: `E-commerce platform Cognito custom domain certificate (${environment})`,
     });
 
