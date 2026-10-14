@@ -50,10 +50,13 @@ if (process.env.ACME_DEV_ACCOUNT === undefined || devDomain === undefined || dev
 
 // Every ECOMMERCE_* (service config) and ACME_* (platform/account config) variable travels into
 // the synth build so the pipeline synthesises the same configuration the deployer configured
-// locally - including the dev NAT-gateway pause switch.
+// locally - including the dev NAT-gateway pause switch. GITHUB_CONNECTION_ARN travels too: this
+// file reads it again when the pipeline's own Synth step re-runs, and it is not a secret.
 const synthEnvironment: Record<string, string> = {};
 for (const [name, value] of Object.entries(process.env)) {
-  if ((name.startsWith('ECOMMERCE_') || name.startsWith('ACME_')) && value !== undefined) {
+  const forward =
+    name.startsWith('ECOMMERCE_') || name.startsWith('ACME_') || name === 'GITHUB_CONNECTION_ARN';
+  if (forward && value !== undefined) {
     synthEnvironment[name] = value;
   }
 }
