@@ -200,6 +200,14 @@ export interface DnsConfig {
    */
   readonly zoneName: string;
 
+  /**
+   * The hosted zone id when it is known (`ECOMMERCE_<ENV>_HOSTED_ZONE_ID`). Optional: consumers
+   * that need the zone at synthesis fall back to a Route 53 name lookup. Set it whenever two
+   * zones could share `zoneName` - for example during a zone migration, where a lookup is
+   * ambiguous by definition - or to keep synthesis independent of live AWS calls.
+   */
+  readonly hostedZoneId?: string;
+
   /** Leftmost label the API answers on inside the zone, for example `api` for `api.dev.example.com`. */
   readonly apiSubdomain: string;
 

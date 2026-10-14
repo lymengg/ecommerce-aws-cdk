@@ -1,6 +1,6 @@
 import { CfnOutput, Stack, StackProps } from 'aws-cdk-lib';
 import { Certificate, CertificateValidation, ICertificate } from 'aws-cdk-lib/aws-certificatemanager';
-import { HostedZone } from 'aws-cdk-lib/aws-route53';
+import { HostedZone, IHostedZone } from 'aws-cdk-lib/aws-route53';
 import { Construct } from 'constructs';
 
 import { EnvironmentConfig } from '../config/types';
@@ -62,7 +62,15 @@ export class AuthCertificateStack extends Stack {
     // A single-name certificate: the Cognito custom domain is exactly one host. No wildcard - a
     // `*.<zone>` certificate would cover this name too but would also authorise any other host an
     // attacker who obtained it could invent.
-    const zone = HostedZone.fromLookup(this, 'SharedZone', { domainName: dns.zoneName });
+    //
+    // `hostedZoneId` wins when configured: a name lookup fails outright while two zones share the
+    // name, which is exactly what a zone migration looks like.
+    const zone: IHostedZone = dns.hostedZoneId
+      ? HostedZone.fromHostedZoneAttributes(this, 'SharedZone', {
+          hostedZoneId: dns.hostedZoneId,
+          zoneName: dns.zoneName,
+        })
+      : HostedZone.fromLookup(this, 'SharedZone', { domainName: dns.zoneName });
     this.certificate = new Certificate(this, 'Certificate', {
       domainName: this.authDomainName,
       validation: CertificateValidation.fromDns(zone),
